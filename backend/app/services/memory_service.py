@@ -144,6 +144,12 @@ class MemoryService:
         if confidence is not None and not 0.0 <= confidence <= 1.0:
             raise ValueError("Confidence must be between 0 and 1.")
 
+        # Regenerate the embedding whenever memory content changes.
+        if content is not None and embedding is UNSET:
+            embedding = EmbeddingService().embed_text(
+                content.strip()
+            )
+
         if embedding is not UNSET and embedding is not None:
             if len(embedding) != 768:
                 raise ValueError(

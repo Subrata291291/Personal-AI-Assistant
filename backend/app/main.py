@@ -10,6 +10,7 @@ from app.api.v1.endpoints.messages import router as messages_router
 from app.api.v1.endpoints.chat import router as chat_router
 from app.api.v1.endpoints.oauth import router as oauth_router
 from fastapi.middleware.cors import CORSMiddleware
+from app.api.v1.endpoints.memory import router as memory_router
 
 setup_logging()
 
@@ -71,4 +72,10 @@ app.include_router(
     oauth_router,
     prefix=f"{settings.API_V1_PREFIX}/oauth",
     tags=["OAuth"],
+)
+
+app.include_router(
+    memory_router,
+    prefix=f"{settings.API_V1_PREFIX}/memories",
+    tags=["Memories"]
 )

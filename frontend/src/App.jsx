@@ -9,6 +9,7 @@ import Assistant from './pages/Assistant'
 import Dashboard from './pages/Dashboard'
 import DashboardLayout from './components/layout/DashboardLayout'
 import Conversations from './pages/Conversations'
+import MemoryCenter from './pages/MemoryCenter'
 
 import Login from './pages/Login'
 import Signup from './pages/Signup'
@@ -62,6 +63,7 @@ function App() {
             <Route index element={<Dashboard />} />
             <Route path="assistant" element={<Assistant />} />
             <Route path="conversations" element={<Conversations />} />
+            <Route path="memory" element={<MemoryCenter />} />
           </Route>
         </Route>
 
