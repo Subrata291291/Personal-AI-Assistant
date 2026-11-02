@@ -67,6 +67,16 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: Optional[SecretStr] = None
     GOOGLE_REDIRECT_URI: Optional[str] = None
 
+    # OAuth scopes (comma-separated)
+    GOOGLE_OAUTH_SCOPES: str = (
+        "openid,email,profile,"
+        "https://www.googleapis.com/auth/gmail.readonly"
+    )
+
+    # OAuth authorization settings
+    GOOGLE_OAUTH_ACCESS_TYPE: str = "offline"
+    GOOGLE_OAUTH_PROMPT: str = "consent"
+
     # Frontend and Backend
     FRONTEND_URL: str = "http://localhost:5173"
     BACKEND_URL: str = "http://localhost:8000"
@@ -87,6 +97,14 @@ class Settings(BaseSettings):
             if provider.strip()
         ]
 
+    @property
+    def google_oauth_scopes_list(self) -> list[str]:
+        """Convert Google OAuth scopes into a list."""
+        return [
+            scope.strip()
+            for scope in self.GOOGLE_OAUTH_SCOPES.split(",")
+            if scope.strip()
+        ]
 
 @lru_cache
 def get_settings() -> Settings:

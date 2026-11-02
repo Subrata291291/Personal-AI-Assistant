@@ -9,6 +9,7 @@ from app.db.models import (
     ConversationMessage,
     Memory,
     UserSettings,
+    UserConnection,
 )
 
 config = context.config
