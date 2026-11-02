@@ -8,7 +8,8 @@ from app.api.v1.endpoints.users import router as users_router
 from app.api.v1.endpoints.conversations import router as conversations_router
 from app.api.v1.endpoints.messages import router as messages_router
 from app.api.v1.endpoints.chat import router as chat_router
-
+from app.api.v1.endpoints.oauth import router as oauth_router
+from fastapi.middleware.cors import CORSMiddleware
 
 setup_logging()
 
@@ -23,6 +24,17 @@ app = FastAPI(
     ),
     version="1.0.0",
     debug=settings.DEBUG,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        settings.FRONTEND_URL,
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(
@@ -53,4 +65,10 @@ app.include_router(
     chat_router,
     prefix=f"{settings.API_V1_PREFIX}/chat",
     tags=["Chat"],
+)
+
+app.include_router(
+    oauth_router,
+    prefix=f"{settings.API_V1_PREFIX}/oauth",
+    tags=["OAuth"],
 )

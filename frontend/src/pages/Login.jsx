@@ -1,10 +1,11 @@
-
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { supabase } from '../lib/supabase'
 
 function Login() {
+  const navigate = useNavigate()
   const { signIn } = useAuth()
 
   const [email, setEmail] = useState('')
@@ -24,7 +25,7 @@ function Login() {
 
     try {
       await signIn({ email, password })
-      window.location.assign('/dashboard')
+      navigate('/dashboard', { replace: true })
     } catch (error) {
       const isInvalidCredentials =
         error.code === 'invalid_credentials' ||

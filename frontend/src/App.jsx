@@ -1,37 +1,50 @@
-
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
-
+import {
+  BrowserRouter,
+  Navigate,
+  Outlet,
+  Route,
+  Routes,
+} from 'react-router-dom'
+import Assistant from './pages/Assistant'
 import Dashboard from './pages/Dashboard'
+import DashboardLayout from './components/layout/DashboardLayout'
+import Conversations from './pages/Conversations'
+
 import Login from './pages/Login'
 import Signup from './pages/Signup'
+
 import { useAuth } from './context/AuthContext'
 
-function ProtectedRoute({ children }) {
-  const { user, loading } = useAuth()
+function ProtectedRoute() {
+  const { isAuthenticated, loading } = useAuth()
 
   if (loading) {
     return (
-      <div className="min-h-screen grid place-items-center bg-slate-950 text-slate-300">
+      <div className="grid min-h-screen place-items-center bg-[#0b0d14] text-slate-300">
         Loading your workspace...
       </div>
     )
   }
 
-  return user ? children : <Navigate to="/login" replace />
+  return isAuthenticated
+    ? <Outlet />
+    : <Navigate to="/login" replace />
 }
 
 function PublicRoute({ children }) {
-  const { user, loading } = useAuth()
+  const { isAuthenticated, loading } = useAuth()
 
   if (loading) {
     return (
-      <div className="min-h-screen grid place-items-center bg-slate-950 text-slate-300">
+      <div className="grid min-h-screen place-items-center bg-[#0b0d14] text-slate-300">
         Loading...
       </div>
     )
   }
 
-  return user ? <Navigate to="/dashboard" replace /> : children
+  return isAuthenticated
+    ? <Navigate to="/dashboard" replace />
+    : children
 }
 
 function App() {
@@ -40,15 +53,19 @@ function App() {
       <Routes>
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
 
-        <Route
-          path="/dashboard"
-          element={
-            <ProtectedRoute>
-              <Dashboard />
-            </ProtectedRoute>
-          }
-        />
+        {/* Protected dashboard routes */}
+        <Route element={<ProtectedRoute />}>
+          <Route
+            path="/dashboard"
+            element={<DashboardLayout />}
+          >
+            <Route index element={<Dashboard />} />
+            <Route path="assistant" element={<Assistant />} />
+            <Route path="conversations" element={<Conversations />} />
+          </Route>
+        </Route>
 
+        {/* Public authentication routes */}
         <Route
           path="/login"
           element={

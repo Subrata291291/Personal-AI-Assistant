@@ -50,7 +50,6 @@ class OAuthStateRepository:
 
     def consume_state(
         self,
-        user_id: UUID,
         provider: str,
         state_hash: str,
         now: datetime,
@@ -58,11 +57,11 @@ class OAuthStateRepository:
         """
         Atomically consume an unexpired, unused OAuth state.
 
-        Returns the consumed record only once.
+        The initiating user is recovered from the database record.
+        The callback does not need a Supabase access token.
 
         Returns None when:
         - State does not exist.
-        - User does not own the state.
         - Provider does not match.
         - State has expired.
         - State has already been consumed.
@@ -71,7 +70,6 @@ class OAuthStateRepository:
         statement = (
             update(OAuthState)
             .where(
-                OAuthState.user_id == user_id,
                 OAuthState.provider == provider.strip().lower(),
                 OAuthState.state_hash == state_hash,
                 OAuthState.expires_at > now,

@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 from app.core.security import encrypt_data, decrypt_data
 from app.repositories.oauth_state_repository import OAuthStateRepository
 
@@ -15,17 +17,19 @@ class OAuthStateService:
     """
     Manages secure OAuth state generation and validation.
 
-    Uses:
+    Security features:
     - Cryptographically secure random state
     - SHA-256 state hashing
     - PKCE S256 challenge generation
     - AES-256-GCM verifier encryption
-    - Expiration and one-time consumption
+    - State expiration
+    - Atomic one-time state consumption
     """
 
     STATE_EXPIRY_MINUTES = 10
 
-    def __init__(self, db):
+    def __init__(self, db: Session):
+        self.db = db
         self.repository = OAuthStateRepository(db)
 
     @staticmethod
@@ -42,12 +46,7 @@ class OAuthStateService:
 
     @staticmethod
     def _generate_code_verifier() -> str:
-        """
-        Generate a PKCE code verifier.
-
-        token_urlsafe(64) produces a verifier within
-        the RFC 7636 required 43-128 character range.
-        """
+        """Generate a PKCE code verifier."""
         return secrets.token_urlsafe(64)
 
     @staticmethod
@@ -91,18 +90,26 @@ class OAuthStateService:
         )
 
         now = datetime.now(timezone.utc)
+
         expires_at = now + timedelta(
             minutes=self.STATE_EXPIRY_MINUTES
         )
 
-        self.repository.create(
-            user_id=user_id,
-            provider=normalized_provider,
-            state_hash=state_hash,
-            code_verifier_encrypted=encrypted_verifier,
-            redirect_uri=redirect_uri.strip(),
-            expires_at=expires_at,
-        )
+        try:
+            self.repository.create(
+                user_id=user_id,
+                provider=normalized_provider,
+                state_hash=state_hash,
+                code_verifier_encrypted=encrypted_verifier,
+                redirect_uri=redirect_uri.strip(),
+                expires_at=expires_at,
+            )
+
+            self.db.commit()
+
+        except Exception:
+            self.db.rollback()
+            raise
 
         return {
             "state": original_state,
@@ -113,43 +120,77 @@ class OAuthStateService:
 
     def consume_state(
         self,
-        user_id: UUID,
         provider: str,
         state: str,
     ) -> dict[str, Any] | None:
         """
         Atomically consume an OAuth state and recover
-        its encrypted PKCE verifier.
+        its PKCE verifier and initiating user.
 
-        Returns None for invalid, expired or already-used state.
+        Invalid, expired or previously consumed states
+        return None.
         """
 
         if not state or not state.strip():
             return None
 
         normalized_provider = provider.strip().lower()
+
+        if not normalized_provider:
+            return None
+
         state_hash = self._hash_state(state)
+        now = datetime.now(timezone.utc)
+
+        try:
+            oauth_state = self.repository.consume_state(
+                provider=normalized_provider,
+                state_hash=state_hash,
+                now=now,
+            )
+
+            if oauth_state is None:
+                self.db.rollback()
+                return None
+
+            encrypted_verifier = oauth_state.code_verifier_encrypted
+            stored_user_id = oauth_state.user_id
+            stored_provider = oauth_state.provider
+            stored_redirect_uri = oauth_state.redirect_uri
+            consumed_at = oauth_state.consumed_at
+
+            # Commit before decryption to prevent state replay.
+            self.db.commit()
+
+        except Exception:
+            self.db.rollback()
+            raise
+
+        code_verifier = decrypt_data(encrypted_verifier)
+
+        return {
+            "user_id": stored_user_id,
+            "provider": stored_provider,
+            "code_verifier": code_verifier,
+            "redirect_uri": stored_redirect_uri,
+            "consumed_at": consumed_at,
+        }
+    
+
+    def delete_expired_states(self) -> int:
+        """Delete expired OAuth states."""
 
         now = datetime.now(timezone.utc)
 
-        oauth_state = self.repository.consume_state(
-            user_id=user_id,
-            provider=normalized_provider,
-            state_hash=state_hash,
-            now=now,
-        )
+        try:
+            deleted_count = self.repository.delete_expired(
+                now=now
+            )
 
-        if oauth_state is None:
-            return None
+            self.db.commit()
 
-        code_verifier = decrypt_data(
-            oauth_state.code_verifier_encrypted
-        )
+            return deleted_count
 
-        return {
-            "user_id": oauth_state.user_id,
-            "provider": oauth_state.provider,
-            "code_verifier": code_verifier,
-            "redirect_uri": oauth_state.redirect_uri,
-            "consumed_at": oauth_state.consumed_at,
-        }
+        except Exception:
+            self.db.rollback()
+            raise

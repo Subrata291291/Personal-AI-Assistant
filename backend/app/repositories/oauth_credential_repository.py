@@ -77,6 +77,40 @@ class OAuthCredentialRepository:
 
         return self.db.scalar(statement)
 
+
+    
+    def get_by_connection_for_update(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> OAuthCredential | None:
+        """
+        Retrieve and lock credentials only for an active Google connection
+        owned by the specified user.
+
+        Locks both credential and connection rows to prevent concurrent
+        token refresh and connection status changes during the transaction.
+        """
+
+        statement = (
+            select(OAuthCredential)
+            .join(
+                UserConnection,
+                UserConnection.id == OAuthCredential.connection_id,
+            )
+            .where(
+                OAuthCredential.user_id == user_id,
+                OAuthCredential.connection_id == connection_id,
+                UserConnection.user_id == user_id,
+                UserConnection.provider == "google",
+                UserConnection.status == "connected",
+            )
+            .with_for_update(of=OAuthCredential)
+        )
+
+        return self.db.scalar(statement)
+
+
     def update_tokens(
         self,
         user_id: UUID,

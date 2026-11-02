@@ -1,11 +1,13 @@
 
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { supabase } from '../lib/supabase'
 
 function Signup() {
   const { signUp } = useAuth()
+  const navigate = useNavigate()
 
   const [fullName, setFullName] = useState('')
   const [email, setEmail] = useState('')
@@ -40,7 +42,7 @@ function Signup() {
       })
 
       if (data.session) {
-        window.location.assign('/dashboard')
+        navigate('/dashboard', { replace: true })
         return
       }
 
