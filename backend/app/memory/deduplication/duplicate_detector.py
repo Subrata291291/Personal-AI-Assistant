@@ -1,7 +1,7 @@
 import uuid
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,7 @@ POSSIBLE_DUPLICATE_THRESHOLD = 0.80
 class DuplicateCandidate(BaseModel):
     memory_id: uuid.UUID
     memory_type: str
+    content: str
     similarity: float
 
 
@@ -28,7 +29,9 @@ class DuplicateCheckResult(BaseModel):
     is_duplicate: bool
     reason: str
 
-    candidates: list[DuplicateCandidate] = []
+    candidates: list[DuplicateCandidate] = Field(
+        default_factory=list
+    )
 
 
 class DuplicateDetector:
@@ -93,6 +96,7 @@ class DuplicateDetector:
                         DuplicateCandidate(
                             memory_id=memory.id,
                             memory_type=memory.memory_type,
+                            content=memory.content,
                             similarity=similarity,
                         )
                     ],
@@ -102,6 +106,7 @@ class DuplicateDetector:
                 DuplicateCandidate(
                     memory_id=memory.id,
                     memory_type=memory.memory_type,
+                    content=memory.content,
                     similarity=similarity,
                 )
             )

@@ -1,23 +1,191 @@
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { useOutletContext } from 'react-router-dom'
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
+
+import {
+  useSearchParams,
+  useOutletContext,
+} from 'react-router-dom'
+
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+
+import { useAuth } from '../context/AuthContext'
 import { conversationService } from '../services/conversationService.js'
 
+
 function Assistant() {
+  const { user } = useAuth()
+  const userId = user?.id
+
   const { isDark, muted, surface } = useOutletContext()
 
-  const [message, setMessage] = useState('')
-  const [messages, setMessages] = useState([])
-  const [conversationId, setConversationId] = useState(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedConversationId = searchParams.get('conversationId')
 
-  const [sending, setSending] = useState(false)
-  const [initializing, setInitializing] = useState(true)
+  const queryClient = useQueryClient()
+
+  const [message, setMessage] = useState('')
+  const [conversationId, setConversationId] = useState(null)
+  const [optimisticMessages, setOptimisticMessages] = useState([])
+
   const [error, setError] = useState('')
   const [providerInfo, setProviderInfo] = useState(null)
 
   const messagesEndRef = useRef(null)
   const pendingRequestRef = useRef(null)
   const sendingRef = useRef(false)
+
+  const hasRestoredRef = useRef(false)
+  const lastRequestedIdRef = useRef(undefined)
+  const newChatModeRef = useRef(false)
+
+  // --------------------------------------------------
+  // 1. Fetch and cache conversation list
+  // --------------------------------------------------
+
+  const conversationsQuery = useQuery({
+    queryKey: ['conversations', userId],
+
+    queryFn: () => conversationService.getConversations(),
+
+    enabled: Boolean(userId),
+  })
+
+  // --------------------------------------------------
+  // 2. Restore requested or latest conversation
+  // --------------------------------------------------
+
+  useEffect(() => {
+    if (!userId || conversationsQuery.isPending) return
+
+    if (conversationsQuery.isError) {
+      setError(
+        conversationsQuery.error?.message ||
+        'Unable to load your conversations.'
+      )
+      return
+    }
+
+    if (
+      hasRestoredRef.current &&
+      lastRequestedIdRef.current === requestedConversationId
+    ) {
+      return
+    }
+
+    lastRequestedIdRef.current = requestedConversationId
+
+    const conversations = conversationsQuery.data
+
+    if (!Array.isArray(conversations)) {
+      setError('Invalid conversations response.')
+      return
+    }
+
+    const activeConversations = conversations
+      .filter((item) => !item.is_archived)
+      .sort(
+        (a, b) =>
+          new Date(b.updated_at).getTime() -
+          new Date(a.updated_at).getTime()
+      )
+
+    if (requestedConversationId) {
+      newChatModeRef.current = false
+
+      const selected = activeConversations.find(
+        (item) => item.id === requestedConversationId
+      )
+
+      if (!selected) {
+        setConversationId(null)
+        setError('Conversation not found or unavailable.')
+      } else {
+        setConversationId(selected.id)
+        setError('')
+      }
+
+      hasRestoredRef.current = true
+      return
+    }
+
+    // Do not restore the latest conversation after New Chat.
+    if (newChatModeRef.current) {
+      hasRestoredRef.current = true
+      return
+    }
+
+    // Restore the latest conversation on initial page load.
+    if (!hasRestoredRef.current) {
+      const latestConversation = activeConversations[0] || null
+
+      setConversationId(latestConversation?.id || null)
+      setError('')
+      hasRestoredRef.current = true
+    }
+  }, [
+    userId,
+    requestedConversationId,
+    conversationsQuery.data,
+    conversationsQuery.isPending,
+    conversationsQuery.isError,
+    conversationsQuery.error,
+  ])
+
+  // --------------------------------------------------
+  // 3. Fetch and cache messages
+  // --------------------------------------------------
+
+  const messagesQuery = useQuery({
+    queryKey: [
+      'conversation-messages',
+      userId,
+      conversationId,
+    ],
+
+    queryFn: () =>
+      conversationService.getMessages(conversationId),
+
+    enabled: Boolean(userId && conversationId),
+  })
+
+  // Handle message loading errors.
+  useEffect(() => {
+    if (messagesQuery.isError) {
+      setError(
+        messagesQuery.error?.message ||
+        'Unable to load conversation messages.'
+      )
+    }
+  }, [
+    messagesQuery.isError,
+    messagesQuery.error,
+  ])
+
+  const messages = [
+    ...(messagesQuery.data || []),
+    ...optimisticMessages,
+  ]
+
+  const initializing =
+    !userId ||
+    conversationsQuery.isPending ||
+    (
+      Boolean(conversationId) &&
+      messagesQuery.isPending
+    )
+
+  // --------------------------------------------------
+  // 4. Scroll to latest message
+  // --------------------------------------------------
 
   const scrollToBottom = useCallback(() => {
     requestAnimationFrame(() => {
@@ -28,89 +196,93 @@ function Assistant() {
     })
   }, [])
 
-  // Restore the latest active conversation from the backend.
   useEffect(() => {
-    let active = true
+    if (messages.length > 0) {
+      scrollToBottom()
+    }
+  }, [messages.length, scrollToBottom])
 
-    async function restoreLatestConversation() {
-      setInitializing(true)
-      setError('')
+  // --------------------------------------------------
+  // 5. Send message mutation
+  // --------------------------------------------------
+
+  const sendMutation = useMutation({
+    mutationFn: async ({
+      content,
+      idempotencyKey,
+      existingConversationId,
+    }) => {
+      let activeConversationId = existingConversationId
+
+      // Create a conversation only for the first message.
+      if (!activeConversationId) {
+        const title =
+          content.length > 197
+            ? `${content.slice(0, 197)}...`
+            : content
+
+        const conversation =
+          await conversationService.createConversation(title)
+
+        activeConversationId = conversation.id
+      }
 
       try {
-        const conversations =
-          await conversationService.getConversations()
-
-        if (!Array.isArray(conversations)) {
-          throw new Error('Invalid conversations response.')
-        }
-
-        const activeConversations = conversations
-          .filter((item) => !item.is_archived)
-          .sort(
-            (a, b) =>
-              new Date(b.updated_at).getTime() -
-              new Date(a.updated_at).getTime()
+        const response =
+          await conversationService.sendChatMessage(
+            activeConversationId,
+            content,
+            idempotencyKey
           )
 
-        if (activeConversations.length === 0) {
-          if (active) {
-            setConversationId(null)
-            setMessages([])
-          }
-          return
+        if (
+          !response?.user_message ||
+          !response?.assistant_message ||
+          response.conversation_id !== activeConversationId
+        ) {
+          throw new Error(
+            'Unexpected response from the AI backend.'
+          )
         }
 
-        const latestConversation = activeConversations[0]
-
-        const conversationMessages =
-          await conversationService.getMessages(
-            latestConversation.id
-          )
-
-        if (!active) return
-
-        setConversationId(latestConversation.id)
-        setMessages(conversationMessages)
-        setProviderInfo(null)
-
-        requestAnimationFrame(() => {
-          messagesEndRef.current?.scrollIntoView({
-            behavior: 'auto',
-            block: 'end',
-          })
-        })
+        return {
+          response,
+          conversationId: activeConversationId,
+        }
       } catch (err) {
-        if (active) {
-          setError(
-            err.message ||
-            'Unable to restore your previous conversation.'
-          )
-        }
-      } finally {
-        if (active) {
-          setInitializing(false)
-        }
+        // Preserve the created conversation ID for retry.
+        err.activeConversationId = activeConversationId
+        throw err
       }
-    }
+    },
+  })
 
-    restoreLatestConversation()
+  const sending = sendMutation.isPending
 
-    return () => {
-      active = false
-    }
-  }, [])
+  // --------------------------------------------------
+  // 6. Start a new chat
+  // --------------------------------------------------
 
   function handleNewChat() {
     if (sendingRef.current || initializing) return
 
+    newChatModeRef.current = true
+    hasRestoredRef.current = true
+
+    setSearchParams({}, { replace: true })
+
     setConversationId(null)
-    setMessages([])
+    setOptimisticMessages([])
     setMessage('')
     setError('')
     setProviderInfo(null)
 
     pendingRequestRef.current = null
   }
+
+  // --------------------------------------------------
+  // 7. Submit message
+  // --------------------------------------------------
 
   async function handleSubmit(event) {
     event.preventDefault()
@@ -120,13 +292,11 @@ function Assistant() {
     if (!content || sendingRef.current || initializing) return
 
     sendingRef.current = true
-    setSending(true)
     setError('')
 
     const temporaryId = `pending-${crypto.randomUUID()}`
 
-    // Reuse the same idempotency key when retrying
-    // the same request after an uncertain result.
+    // Reuse the same idempotency key for the same retry.
     if (
       !pendingRequestRef.current ||
       pendingRequestRef.current.content !== content
@@ -139,7 +309,7 @@ function Assistant() {
 
     const idempotencyKey = pendingRequestRef.current.key
 
-    setMessages((current) => [
+    setOptimisticMessages((current) => [
       ...current,
       {
         id: temporaryId,
@@ -153,47 +323,31 @@ function Assistant() {
     scrollToBottom()
 
     try {
-      let activeConversationId = conversationId
+      const result = await sendMutation.mutateAsync({
+        content,
+        idempotencyKey,
+        existingConversationId: conversationId,
+      })
 
-      // Create a conversation only when its first message is sent.
-      if (!activeConversationId) {
-        const title =
-          content.length > 197
-            ? `${content.slice(0, 197)}...`
-            : content
+      const {
+        response,
+        conversationId: activeId,
+      } = result
 
-        const conversation =
-          await conversationService.createConversation(title)
+      setConversationId(activeId)
+      newChatModeRef.current = false
 
-        activeConversationId = conversation.id
+      // Immediately update the cached messages.
+      queryClient.setQueryData(
+        ['conversation-messages', userId, activeId],
+        (current = []) => [
+          ...current.filter((item) => item.id !== temporaryId),
+          response.user_message,
+          response.assistant_message,
+        ]
+      )
 
-        setConversationId(activeConversationId)
-      }
-
-      // Send the message through the authenticated LangGraph API.
-      const response =
-        await conversationService.sendChatMessage(
-          activeConversationId,
-          content,
-          idempotencyKey
-        )
-
-      if (
-        !response?.user_message ||
-        !response?.assistant_message ||
-        response.conversation_id !== activeConversationId
-      ) {
-        throw new Error(
-          'Unexpected response from the AI backend.'
-        )
-      }
-
-      // Replace the temporary user message with persisted records.
-      setMessages((current) => [
-        ...current.filter((item) => item.id !== temporaryId),
-        response.user_message,
-        response.assistant_message,
-      ])
+      setOptimisticMessages([])
 
       setProviderInfo({
         provider: response.provider,
@@ -202,9 +356,22 @@ function Assistant() {
 
       pendingRequestRef.current = null
 
+      // Refresh the conversation list in the background.
+      queryClient.invalidateQueries({
+        queryKey: ['conversations', userId],
+      })
+
       scrollToBottom()
     } catch (err) {
-      setMessages((current) =>
+      if (err.activeConversationId) {
+        setConversationId(err.activeConversationId)
+
+        queryClient.invalidateQueries({
+          queryKey: ['conversations', userId],
+        })
+      }
+
+      setOptimisticMessages((current) =>
         current.filter((item) => item.id !== temporaryId)
       )
 
@@ -217,9 +384,12 @@ function Assistant() {
       )
     } finally {
       sendingRef.current = false
-      setSending(false)
     }
   }
+
+  // --------------------------------------------------
+  // 8. Suggested prompts
+  // --------------------------------------------------
 
   const suggestions = [
     {
@@ -243,6 +413,10 @@ function Assistant() {
       prompt: 'Help me explore a new idea.',
     },
   ]
+
+  // --------------------------------------------------
+  // 9. UI
+  // --------------------------------------------------
 
   return (
     <div className="mx-auto flex min-h-[calc(100vh-150px)] w-full max-w-5xl flex-col">
@@ -298,9 +472,13 @@ function Assistant() {
             <p className={`mt-1 text-xs ${muted}`}>
               {initializing
                 ? 'Restoring your conversation...'
-                : conversationId
-                  ? 'Conversation restored'
-                  : 'Ready for a new conversation'}
+                : sending
+                  ? 'Processing your message...'
+                  : providerInfo
+                    ? `${providerInfo.provider} · ${providerInfo.model}`
+                    : conversationId
+                      ? 'Conversation restored'
+                      : 'Ready for a new conversation'}
             </p>
           </div>
 
@@ -403,6 +581,7 @@ function Assistant() {
         {error && (
           <div className="mx-4 mb-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-400 sm:mx-5">
             {error}
+
             <p className="mt-1 text-xs">
               Your message is still in the input. You can retry it.
             </p>

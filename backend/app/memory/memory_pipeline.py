@@ -1,19 +1,48 @@
+
 import uuid
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sqlalchemy.orm import Session
 
 from app.memory.classifier.memory_classifier import MemoryClassifier
 from app.memory.classifier.memory_policy import MemoryPolicy
 from app.memory.deduplication.duplicate_detector import DuplicateDetector
+from app.memory.deduplication.memory_conflict_resolver import (
+    MemoryConflictResolver,
+)
+from app.repositories.memory_review_repository import (
+    MemoryReviewRepository,
+)
 from app.services.memory_service import MemoryService
+from app.db.models.memory_review import MemoryReview
+
+
+MemoryStatus = Literal[
+    "stored",
+    "updated",
+    "rejected",
+    "duplicate",
+    "review_required",
+]
+
+
+class MemoryItemResult(BaseModel):
+    status: MemoryStatus
+    reason: str
+
+    memory_id: uuid.UUID | None = None
+    memory_type: str | None = None
+    content: str | None = None
+    importance: int | None = None
+    confidence: float | None = None
 
 
 class MemoryPipelineResult(BaseModel):
     status: Literal[
         "stored",
+        "updated",
         "rejected",
         "duplicate",
         "review_required",
@@ -21,9 +50,12 @@ class MemoryPipelineResult(BaseModel):
     ]
 
     reason: str
+
     memory_id: uuid.UUID | None = None
     memory_type: str | None = None
     confidence: float | None = None
+
+    items: list[MemoryItemResult] = Field(default_factory=list)
 
 
 class MemoryPipeline:
@@ -32,9 +64,42 @@ class MemoryPipeline:
 
         self.classifier = MemoryClassifier()
         self.policy = MemoryPolicy()
+        self.conflict_resolver = MemoryConflictResolver()
+
+        self.session = session
 
         self.memory_service = MemoryService(session)
         self.duplicate_detector = DuplicateDetector(session)
+        self.review_repository = MemoryReviewRepository(session)
+
+    def _create_pending_review(
+        self,
+        user_id: uuid.UUID,
+        existing_memory_id: uuid.UUID,
+        existing_content: str,
+        proposed_content: str,
+        reason: str,
+        confidence: float,
+    ) -> MemoryReview:
+
+        try:
+            review = self.review_repository.create_review(
+                user_id=user_id,
+                existing_memory_id=existing_memory_id,
+                existing_content=existing_content,
+                proposed_content=proposed_content,
+                reason=reason,
+                confidence=confidence,
+            )
+
+            self.session.commit()
+            self.session.refresh(review)
+
+            return review
+
+        except Exception:
+            self.session.rollback()
+            raise
 
     def process(
         self,
@@ -44,8 +109,7 @@ class MemoryPipeline:
         source_conversation_id: uuid.UUID | None = None,
     ) -> MemoryPipelineResult:
 
-        # Step 1: Check user memory preference.
-        # Fail closed: memory is disabled unless explicitly enabled.
+        # Step 1: Respect user memory preference.
         if not memory_enabled:
             return MemoryPipelineResult(
                 status="disabled",
@@ -58,67 +122,287 @@ class MemoryPipeline:
                 reason="Memory content cannot be empty.",
             )
 
-        # Step 2: Classify the content.
+        # Step 2: Extract memories.
         classification = self.classifier.classify(content)
 
-        # Step 3: Validate classification.
-        policy_decision = self.policy.evaluate(
-            content=content,
-            classification=classification,
-        )
-
-        if not policy_decision.allowed:
+        if not classification.memories:
             return MemoryPipelineResult(
                 status="rejected",
-                reason=policy_decision.reason,
-                confidence=classification.confidence,
+                reason="No meaningful memories were identified.",
             )
 
-        memory_type = policy_decision.memory_type
+        item_results: list[MemoryItemResult] = []
 
-        if memory_type is None:
-            return MemoryPipelineResult(
-                status="rejected",
-                reason="Memory type is unavailable.",
-                confidence=classification.confidence,
+        # Step 3: Process each extracted memory.
+        for extracted_memory in classification.memories:
+
+            memory_content = extracted_memory.content
+
+            # Step 3A: Policy validation.
+            policy_decision = self.policy.evaluate(
+                memory=extracted_memory,
             )
 
-        # Step 4: Check duplicates.
-        duplicate_result = self.duplicate_detector.check_duplicate(
-            user_id=user_id,
-            memory_type=memory_type,
-            content=content,
-        )
+            if not policy_decision.allowed:
+                item_results.append(
+                    MemoryItemResult(
+                        status="rejected",
+                        reason=policy_decision.reason,
+                        memory_type=extracted_memory.memory_type,
+                        content=memory_content,
+                        importance=extracted_memory.importance,
+                        confidence=extracted_memory.confidence,
+                    )
+                )
+                continue
 
-        if duplicate_result.status == "strong_duplicate":
-            return MemoryPipelineResult(
-                status="duplicate",
-                reason=duplicate_result.reason,
+            memory_type = policy_decision.memory_type
+
+            if memory_type is None or memory_content is None:
+                item_results.append(
+                    MemoryItemResult(
+                        status="rejected",
+                        reason="Memory type or content is unavailable.",
+                        confidence=extracted_memory.confidence,
+                    )
+                )
+                continue
+
+            # Step 3B: Find similar existing memories.
+            duplicate_result = self.duplicate_detector.check_duplicate(
+                user_id=user_id,
                 memory_type=memory_type,
-                confidence=classification.confidence,
+                content=memory_content,
             )
 
-        if duplicate_result.status == "possible_duplicate":
-            return MemoryPipelineResult(
-                status="review_required",
-                reason=duplicate_result.reason,
-                memory_type=memory_type,
-                confidence=classification.confidence,
+            # Step 3C: No candidate means CREATE.
+            if not duplicate_result.candidates:
+                memory = self.memory_service.create_memory(
+                    user_id=user_id,
+                    memory_type=memory_type,
+                    content=memory_content,
+                    importance=extracted_memory.importance,
+                    confidence=extracted_memory.confidence,
+                    source_conversation_id=source_conversation_id,
+                )
+
+                item_results.append(
+                    MemoryItemResult(
+                        status="stored",
+                        reason="New memory successfully stored.",
+                        memory_id=memory.id,
+                        memory_type=memory_type,
+                        content=memory.content,
+                        importance=memory.importance,
+                        confidence=memory.confidence,
+                    )
+                )
+                continue
+
+            # Step 3D: Compare against the best matching candidate.
+            candidate = max(
+                duplicate_result.candidates,
+                key=lambda item: item.similarity,
             )
 
-        # Step 5: Store new memory.
-        memory = self.memory_service.create_memory(
-            user_id=user_id,
-            memory_type=memory_type,
-            content=content,
-            confidence=classification.confidence,
-            source_conversation_id=source_conversation_id,
+            # Exact normalized duplicate: no LLM call required.
+            normalized_new = self.duplicate_detector.normalize_content(
+                memory_content
+            )
+
+            normalized_existing = self.duplicate_detector.normalize_content(
+                candidate.content
+            )
+
+            if normalized_new == normalized_existing:
+                item_results.append(
+                    MemoryItemResult(
+                        status="duplicate",
+                        reason="Exact duplicate memory detected.",
+                        memory_id=candidate.memory_id,
+                        memory_type=memory_type,
+                        content=candidate.content,
+                        importance=extracted_memory.importance,
+                        confidence=extracted_memory.confidence,
+                    )
+                )
+                continue
+
+            # Step 3E: Resolve semantic similarity or conflict.
+            decision = self.conflict_resolver.resolve(
+                new_memory=memory_content,
+                existing_memory=candidate.content,
+            )
+
+            if decision.action == "ignore":
+                item_results.append(
+                    MemoryItemResult(
+                        status="duplicate",
+                        reason=decision.reason,
+                        memory_id=candidate.memory_id,
+                        memory_type=memory_type,
+                        content=candidate.content,
+                        importance=extracted_memory.importance,
+                        confidence=decision.confidence,
+                    )
+                )
+                continue
+
+            if decision.action == "review":
+
+                review = self._create_pending_review(
+                    user_id=user_id,
+                    existing_memory_id=candidate.memory_id,
+                    existing_content=candidate.content,
+                    proposed_content=memory_content,
+                    reason=decision.reason,
+                    confidence=decision.confidence,
+                )
+
+                item_results.append(
+                    MemoryItemResult(
+                        status="review_required",
+                        reason=(
+                            f"{decision.reason} "
+                            f"Pending review ID: {review.id}"
+                        ),
+                        memory_id=candidate.memory_id,
+                        memory_type=memory_type,
+                        content=memory_content,
+                        importance=extracted_memory.importance,
+                        confidence=decision.confidence,
+                    )
+                )
+                continue
+
+            if decision.action == "update":
+                updated_content = decision.updated_content
+
+                if not updated_content:
+
+                    review = self._create_pending_review(
+                        user_id=user_id,
+                        existing_memory_id=candidate.memory_id,
+                        existing_content=candidate.content,
+                        proposed_content=memory_content,
+                        reason="Updated content is unavailable. Manual review is required.",
+                        confidence=decision.confidence,
+                    )
+
+                    item_results.append(
+                        MemoryItemResult(
+                            status="review_required",
+                            reason=(
+                                f"Updated content is unavailable. "
+                                f"Pending review ID: {review.id}"
+                            ),
+                            memory_id=candidate.memory_id,
+                            memory_type=memory_type,
+                            content=memory_content,
+                            importance=extracted_memory.importance,
+                            confidence=decision.confidence,
+                        )
+                    )
+                    continue
+
+                updated_memory = self.memory_service.update_memory(
+                    user_id=user_id,
+                    memory_id=candidate.memory_id,
+                    content=updated_content,
+                    importance=extracted_memory.importance,
+                    confidence=decision.confidence,
+                )
+
+                if updated_memory is None:
+                    item_results.append(
+                        MemoryItemResult(
+                            status="review_required",
+                            reason="Existing memory could not be updated.",
+                            memory_id=candidate.memory_id,
+                            memory_type=memory_type,
+                            confidence=decision.confidence,
+                        )
+                    )
+                    continue
+
+                item_results.append(
+                    MemoryItemResult(
+                        status="updated",
+                        reason=decision.reason,
+                        memory_id=updated_memory.id,
+                        memory_type=updated_memory.memory_type,
+                        content=updated_memory.content,
+                        importance=updated_memory.importance,
+                        confidence=updated_memory.confidence,
+                    )
+                )
+                continue
+
+            # Step 3F: CREATE when the resolver determines
+            # that both facts can coexist.
+            if decision.action == "create":
+                memory = self.memory_service.create_memory(
+                    user_id=user_id,
+                    memory_type=memory_type,
+                    content=memory_content,
+                    importance=extracted_memory.importance,
+                    confidence=extracted_memory.confidence,
+                    source_conversation_id=source_conversation_id,
+                )
+
+                item_results.append(
+                    MemoryItemResult(
+                        status="stored",
+                        reason=decision.reason,
+                        memory_id=memory.id,
+                        memory_type=memory_type,
+                        content=memory.content,
+                        importance=memory.importance,
+                        confidence=memory.confidence,
+                    )
+                )
+
+        # Step 4: Aggregate results.
+        statuses = [item.status for item in item_results]
+
+        if "stored" in statuses:
+            overall_status = "stored"
+            overall_reason = "One or more new memories were stored."
+
+        elif "updated" in statuses:
+            overall_status = "updated"
+            overall_reason = "One or more existing memories were updated."
+
+        elif "review_required" in statuses:
+            overall_status = "review_required"
+            overall_reason = "One or more memories require review."
+
+        elif statuses and all(
+            status == "duplicate" for status in statuses
+        ):
+            overall_status = "duplicate"
+            overall_reason = "All extracted memories already exist."
+
+        else:
+            overall_status = "rejected"
+            overall_reason = "No memories were stored or updated."
+
+        successful_items = [
+            item for item in item_results
+            if item.status in {"stored", "updated"}
+        ]
+
+        primary_item = (
+            successful_items[0]
+            if successful_items
+            else (item_results[0] if item_results else None)
         )
 
         return MemoryPipelineResult(
-            status="stored",
-            reason="Memory successfully stored.",
-            memory_id=memory.id,
-            memory_type=memory_type,
-            confidence=classification.confidence,
+            status=overall_status,
+            reason=overall_reason,
+            memory_id=primary_item.memory_id if primary_item else None,
+            memory_type=primary_item.memory_type if primary_item else None,
+            confidence=primary_item.confidence if primary_item else None,
+            items=item_results,
         )

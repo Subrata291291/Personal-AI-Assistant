@@ -1,7 +1,15 @@
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+
+import { useAuth } from '../context/AuthContext'
 import { conversationService } from '../services/conversationService.js'
+
 
 function formatDate(value) {
   if (!value) return 'Unknown date'
@@ -16,20 +24,21 @@ function formatDate(value) {
   }).format(date)
 }
 
+
 function Conversations() {
+  const { user } = useAuth()
+  const userId = user?.id
+
   const { isDark, muted, surface } = useOutletContext()
 
-  const [conversations, setConversations] = useState([])
-  const [messages, setMessages] = useState([])
+  const queryClient = useQueryClient()
+
   const [selectedId, setSelectedId] = useState(null)
 
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('active')
 
-  const [loading, setLoading] = useState(true)
-  const [messagesLoading, setMessagesLoading] = useState(false)
   const [error, setError] = useState('')
-  const [actionLoading, setActionLoading] = useState(false)
 
   const [newTitle, setNewTitle] = useState('')
   const [editingTitle, setEditingTitle] = useState('')
@@ -37,76 +46,208 @@ function Conversations() {
   const [isRenaming, setIsRenaming] = useState(false)
   const [deleteId, setDeleteId] = useState(null)
 
+  const conversationsKey = ['conversations', userId]
+
+  // --------------------------------------------------
+  // 1. Fetch and cache conversations
+  // --------------------------------------------------
+
+  const conversationsQuery = useQuery({
+    queryKey: conversationsKey,
+
+    queryFn: async () => {
+      const result = await conversationService.getConversations()
+
+      if (!Array.isArray(result)) {
+        throw new Error(
+          'Unexpected conversations response from server.'
+        )
+      }
+
+      return result
+    },
+
+    enabled: Boolean(userId),
+  })
+
+  const conversations = conversationsQuery.data || []
+
+  const loading = conversationsQuery.isPending
+
+  // --------------------------------------------------
+  // 2. Selected conversation
+  // --------------------------------------------------
+
   const selectedConversation = conversations.find(
     (conversation) => conversation.id === selectedId
   )
 
-  const loadConversations = useCallback(async () => {
-    setLoading(true)
-    setError('')
+  // --------------------------------------------------
+  // 3. Fetch and cache selected conversation messages
+  // --------------------------------------------------
 
-    try {
-      const result = await conversationService.getConversations()
+  const messagesQuery = useQuery({
+    queryKey: [
+      'conversation-messages',
+      userId,
+      selectedId,
+    ],
 
-      if (!Array.isArray(result)) {
-        throw new Error('Unexpected conversations response from server.')
-      }
+    queryFn: () =>
+      conversationService.getMessages(selectedId),
 
-      setConversations(result)
+    enabled: Boolean(userId && selectedId),
+  })
 
-      setSelectedId((currentId) => {
-        if (currentId && result.some((item) => item.id === currentId)) {
-          return currentId
-        }
+  const messages = messagesQuery.data || []
 
-        return null
+  const messagesLoading = messagesQuery.isPending
+
+  // --------------------------------------------------
+  // 4. Create conversation mutation
+  // --------------------------------------------------
+
+  const createMutation = useMutation({
+    mutationFn: (title) =>
+      conversationService.createConversation(title),
+
+    onSuccess: (created) => {
+      queryClient.setQueryData(
+        conversationsKey,
+        (current = []) => [
+          created,
+          ...current.filter((item) => item.id !== created.id),
+        ]
+      )
+
+      setSelectedId(created.id)
+      setFilter('active')
+      setNewTitle('')
+      setIsCreating(false)
+      setError('')
+
+      // Refresh the list in the background.
+      queryClient.invalidateQueries({
+        queryKey: conversationsKey,
       })
-    } catch (err) {
-      setError(err.message || 'Unable to load conversations.')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+    },
 
-  useEffect(() => {
-    loadConversations()
-  }, [loadConversations])
+    onError: (err) => {
+      setError(
+        err.message || 'Unable to create conversation.'
+      )
+    },
+  })
 
-  useEffect(() => {
-    if (!selectedId) {
-      setMessages([])
-      return
-    }
+  // --------------------------------------------------
+  // 5. Rename conversation mutation
+  // --------------------------------------------------
 
-    let active = true
+  const renameMutation = useMutation({
+    mutationFn: ({ id, title }) =>
+      conversationService.updateConversation(id, title),
 
-    async function loadMessages() {
-      setMessagesLoading(true)
-      setMessages([])
+    onSuccess: (updated) => {
+      queryClient.setQueryData(
+        conversationsKey,
+        (current = []) =>
+          current.map((item) =>
+            item.id === updated.id ? updated : item
+          )
+      )
 
-      try {
-        const result = await conversationService.getMessages(selectedId)
+      setIsRenaming(false)
+      setEditingTitle('')
+      setError('')
+    },
 
-        if (active) {
-          setMessages(result)
-        }
-      } catch (err) {
-        if (active) {
-          setError(err.message || 'Unable to load messages.')
-        }
-      } finally {
-        if (active) {
-          setMessagesLoading(false)
-        }
+    onError: (err) => {
+      setError(
+        err.message || 'Unable to rename conversation.'
+      )
+    },
+  })
+
+  // --------------------------------------------------
+  // 6. Archive conversation mutation
+  // --------------------------------------------------
+
+  const archiveMutation = useMutation({
+    mutationFn: (id) =>
+      conversationService.archiveConversation(id),
+
+    onSuccess: (updated) => {
+      queryClient.setQueryData(
+        conversationsKey,
+        (current = []) =>
+          current.map((item) =>
+            item.id === updated.id ? updated : item
+          )
+      )
+
+      setSelectedId(null)
+      setError('')
+    },
+
+    onError: (err) => {
+      setError(
+        err.message || 'Unable to archive conversation.'
+      )
+    },
+  })
+
+  // --------------------------------------------------
+  // 7. Delete conversation mutation
+  // --------------------------------------------------
+
+  const deleteMutation = useMutation({
+    mutationFn: (id) =>
+      conversationService.deleteConversation(id),
+
+    onSuccess: (_, deletedId) => {
+      queryClient.setQueryData(
+        conversationsKey,
+        (current = []) =>
+          current.filter((item) => item.id !== deletedId)
+      )
+
+      // Remove deleted conversation's cached messages.
+      queryClient.removeQueries({
+        queryKey: [
+          'conversation-messages',
+          userId,
+          deletedId,
+        ],
+      })
+
+      if (selectedId === deletedId) {
+        setSelectedId(null)
       }
-    }
 
-    loadMessages()
+      setDeleteId(null)
+      setError('')
+    },
 
-    return () => {
-      active = false
-    }
-  }, [selectedId])
+    onError: (err) => {
+      setError(
+        err.message || 'Unable to delete conversation.'
+      )
+    },
+  })
+
+  // --------------------------------------------------
+  // 8. Combined action loading state
+  // --------------------------------------------------
+
+  const actionLoading =
+    createMutation.isPending ||
+    renameMutation.isPending ||
+    archiveMutation.isPending ||
+    deleteMutation.isPending
+
+  // --------------------------------------------------
+  // 9. Search and filters
+  // --------------------------------------------------
 
   const filteredConversations = useMemo(() => {
     const query = search.trim().toLowerCase()
@@ -119,11 +260,15 @@ function Conversations() {
 
       const matchesSearch =
         !query ||
-        conversation.title.toLowerCase().includes(query)
+        (conversation.title || '').toLowerCase().includes(query)
 
       return matchesFilter && matchesSearch
     })
   }, [conversations, filter, search])
+
+  // --------------------------------------------------
+  // 10. Create handler
+  // --------------------------------------------------
 
   async function handleCreate(event) {
     event.preventDefault()
@@ -132,23 +277,14 @@ function Conversations() {
 
     if (!title || actionLoading) return
 
-    setActionLoading(true)
     setError('')
 
-    try {
-      const created = await conversationService.createConversation(title)
-
-      setConversations((current) => [created, ...current])
-      setSelectedId(created.id)
-      setFilter('active')
-      setNewTitle('')
-      setIsCreating(false)
-    } catch (err) {
-      setError(err.message || 'Unable to create conversation.')
-    } finally {
-      setActionLoading(false)
-    }
+    await createMutation.mutateAsync(title).catch(() => {})
   }
+
+  // --------------------------------------------------
+  // 11. Rename handler
+  // --------------------------------------------------
 
   async function handleRename(event) {
     event.preventDefault()
@@ -157,82 +293,55 @@ function Conversations() {
 
     if (!title || !selectedId || actionLoading) return
 
-    setActionLoading(true)
     setError('')
 
-    try {
-      const updated = await conversationService.updateConversation(
-        selectedId,
-        title
-      )
-
-      setConversations((current) =>
-        current.map((item) =>
-          item.id === updated.id ? updated : item
-        )
-      )
-
-      setIsRenaming(false)
-    } catch (err) {
-      setError(err.message || 'Unable to rename conversation.')
-    } finally {
-      setActionLoading(false)
-    }
+    await renameMutation.mutateAsync({
+      id: selectedId,
+      title,
+    }).catch(() => {})
   }
+
+  // --------------------------------------------------
+  // 12. Archive handler
+  // --------------------------------------------------
 
   async function handleArchive() {
     if (!selectedConversation || actionLoading) return
 
-    setActionLoading(true)
     setError('')
 
-    try {
-      const updated = await conversationService.archiveConversation(selectedId)
-
-      setConversations((current) =>
-        current.map((item) =>
-          item.id === updated.id ? updated : item
-        )
-      )
-
-      setSelectedId(null)
-    } catch (err) {
-      setError(err.message || 'Unable to archive conversation.')
-    } finally {
-      setActionLoading(false)
-    }
+    await archiveMutation.mutateAsync(
+      selectedId
+    ).catch(() => {})
   }
+
+  // --------------------------------------------------
+  // 13. Delete handler
+  // --------------------------------------------------
 
   async function handleDelete() {
     if (!deleteId || actionLoading) return
 
-    setActionLoading(true)
     setError('')
 
-    try {
-      await conversationService.deleteConversation(deleteId)
-
-      setConversations((current) =>
-        current.filter((item) => item.id !== deleteId)
-      )
-
-      if (selectedId === deleteId) {
-        setSelectedId(null)
-      }
-
-      setDeleteId(null)
-    } catch (err) {
-      setError(err.message || 'Unable to delete conversation.')
-    } finally {
-      setActionLoading(false)
-    }
+    await deleteMutation.mutateAsync(
+      deleteId
+    ).catch(() => {})
   }
+
+  // --------------------------------------------------
+  // 14. Input styling
+  // --------------------------------------------------
 
   const inputClass = `w-full rounded-xl border px-4 py-3 text-sm outline-none focus:border-violet-500 ${
     isDark
       ? 'border-[#303448] bg-[#171a27] text-white'
       : 'border-slate-200 bg-white text-slate-800'
   }`
+
+  // --------------------------------------------------
+  // 15. UI
+  // --------------------------------------------------
 
   return (
     <div className="mx-auto w-full max-w-6xl">
@@ -263,10 +372,29 @@ function Conversations() {
       </div>
 
       {/* Error */}
-      {error && (
+      {(error || conversationsQuery.isError || messagesQuery.isError) && (
         <div className="mb-5 flex items-center justify-between gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-400">
-          <span>{error}</span>
-          <button onClick={() => setError('')} aria-label="Dismiss error">
+          <span>
+            {error ||
+              conversationsQuery.error?.message ||
+              messagesQuery.error?.message ||
+              'Something went wrong.'}
+          </span>
+
+          <button
+            onClick={() => {
+              setError('')
+
+              if (conversationsQuery.isError) {
+                conversationsQuery.refetch()
+              }
+
+              if (messagesQuery.isError) {
+                messagesQuery.refetch()
+              }
+            }}
+            aria-label="Dismiss error"
+          >
             ×
           </button>
         </div>
@@ -298,7 +426,7 @@ function Conversations() {
               disabled={!newTitle.trim() || actionLoading}
               className="rounded-xl bg-violet-600 px-5 py-3 text-sm font-semibold text-white disabled:opacity-50"
             >
-              {actionLoading ? 'Creating...' : 'Create'}
+              {createMutation.isPending ? 'Creating...' : 'Create'}
             </button>
 
             <button
@@ -366,6 +494,17 @@ function Conversations() {
             <div className={`p-10 text-center text-sm ${muted}`}>
               Loading conversations...
             </div>
+          ) : conversationsQuery.isError ? (
+            <div className="p-10 text-center text-sm text-red-400">
+              Unable to load conversations.
+              <button
+                type="button"
+                onClick={() => conversationsQuery.refetch()}
+                className="mt-3 block w-full text-violet-400"
+              >
+                Try again
+              </button>
+            </div>
           ) : filteredConversations.length === 0 ? (
             <div className={`p-10 text-center text-sm ${muted}`}>
               {search
@@ -389,7 +528,11 @@ function Conversations() {
                 >
                   <button
                     type="button"
-                    onClick={() => setSelectedId(conversation.id)}
+                    onClick={() => {
+                      setSelectedId(conversation.id)
+                      setError('')
+                      setIsRenaming(false)
+                    }}
                     className="flex min-w-0 flex-1 items-start gap-3 text-left"
                   >
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-500/10 text-lg text-violet-400">
@@ -441,9 +584,11 @@ function Conversations() {
           {!selectedConversation ? (
             <div className={`flex flex-1 flex-col items-center justify-center p-8 text-center ${muted}`}>
               <div className="mb-4 text-4xl text-violet-400">◈</div>
+
               <h3 className="text-sm font-semibold">
                 Select a conversation
               </h3>
+
               <p className="mt-2 text-xs">
                 Select a conversation to load its messages.
               </p>
@@ -460,13 +605,15 @@ function Conversations() {
                     className={inputClass}
                     required
                   />
+
                   <button
                     type="submit"
                     disabled={!editingTitle.trim() || actionLoading}
                     className="rounded-lg bg-violet-600 px-3 text-sm text-white"
                   >
-                    Save
+                    {renameMutation.isPending ? 'Saving...' : 'Save'}
                   </button>
+
                   <button
                     type="button"
                     onClick={() => setIsRenaming(false)}
@@ -504,7 +651,7 @@ function Conversations() {
                         disabled={actionLoading}
                         className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-400 disabled:opacity-50"
                       >
-                        Archive
+                        {archiveMutation.isPending ? 'Archiving...' : 'Archive'}
                       </button>
                     )}
                   </div>
@@ -522,6 +669,17 @@ function Conversations() {
                   <p className={`text-xs ${muted}`}>
                     Loading messages...
                   </p>
+                ) : messagesQuery.isError ? (
+                  <div className="text-xs text-red-400">
+                    Unable to load messages.
+                    <button
+                      type="button"
+                      onClick={() => messagesQuery.refetch()}
+                      className="ml-2 text-violet-400"
+                    >
+                      Retry
+                    </button>
+                  </div>
                 ) : messages.length === 0 ? (
                   <p className={`text-xs ${muted}`}>
                     No messages in this conversation yet.
@@ -581,6 +739,7 @@ function Conversations() {
               <button
                 type="button"
                 onClick={() => setDeleteId(null)}
+                disabled={actionLoading}
                 className={`rounded-xl px-4 py-2.5 text-sm font-semibold ${
                   isDark
                     ? 'bg-[#292d3d] text-slate-300'
@@ -596,7 +755,7 @@ function Conversations() {
                 disabled={actionLoading}
                 className="rounded-xl bg-red-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-red-600 disabled:opacity-50"
               >
-                {actionLoading ? 'Deleting...' : 'Delete'}
+                {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
               </button>
             </div>
           </div>

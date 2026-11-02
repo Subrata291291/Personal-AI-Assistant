@@ -5,6 +5,8 @@ import {
   Route,
   Routes,
 } from 'react-router-dom'
+import { QueryClientProvider } from '@tanstack/react-query'
+import { queryClient } from './lib/queryClient'
 import Assistant from './pages/Assistant'
 import Dashboard from './pages/Dashboard'
 import DashboardLayout from './components/layout/DashboardLayout'
@@ -50,45 +52,47 @@ function PublicRoute({ children }) {
 
 function App() {
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<Navigate to="/dashboard" replace />} />
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={<Navigate to="/dashboard" replace />} />
 
-        {/* Protected dashboard routes */}
-        <Route element={<ProtectedRoute />}>
-          <Route
-            path="/dashboard"
-            element={<DashboardLayout />}
-          >
-            <Route index element={<Dashboard />} />
-            <Route path="assistant" element={<Assistant />} />
-            <Route path="conversations" element={<Conversations />} />
-            <Route path="memory" element={<MemoryCenter />} />
+          {/* Protected dashboard routes */}
+          <Route element={<ProtectedRoute />}>
+            <Route
+              path="/dashboard"
+              element={<DashboardLayout />}
+            >
+              <Route index element={<Dashboard />} />
+              <Route path="assistant" element={<Assistant />} />
+              <Route path="conversations" element={<Conversations />} />
+              <Route path="memory" element={<MemoryCenter />} />
+            </Route>
           </Route>
-        </Route>
 
-        {/* Public authentication routes */}
-        <Route
-          path="/login"
-          element={
-            <PublicRoute>
-              <Login />
-            </PublicRoute>
-          }
-        />
+          {/* Public authentication routes */}
+          <Route
+            path="/login"
+            element={
+              <PublicRoute>
+                <Login />
+              </PublicRoute>
+            }
+          />
 
-        <Route
-          path="/signup"
-          element={
-            <PublicRoute>
-              <Signup />
-            </PublicRoute>
-          }
-        />
+          <Route
+            path="/signup"
+            element={
+              <PublicRoute>
+                <Signup />
+              </PublicRoute>
+            }
+          />
 
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </BrowserRouter>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </BrowserRouter>
+    </QueryClientProvider>
   )
 }
 

@@ -8,6 +8,7 @@ from app.db.models import (
     Conversation,
     ConversationMessage,
     Memory,
+    MemoryReview,
     UserSettings,
     UserConnection,
 )

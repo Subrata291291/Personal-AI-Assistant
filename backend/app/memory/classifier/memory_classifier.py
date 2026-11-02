@@ -1,9 +1,8 @@
-import json
-import logging
 
+import logging
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from app.llm.router import llm_router
 from app.llm.schemas import LLMRequest, LLMMessage
@@ -20,14 +19,23 @@ MemoryType = Literal[
 ]
 
 
-class MemoryClassification(BaseModel):
-    """
-    Structured output returned by the AI memory classifier.
-    """
+class ExtractedMemory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
     should_store: bool
 
     memory_type: MemoryType | None = None
+
+    content: str | None = Field(
+        default=None,
+        max_length=1000,
+    )
+
+    importance: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+    )
 
     confidence: float = Field(
         ge=0.0,
@@ -39,118 +47,138 @@ class MemoryClassification(BaseModel):
     contains_sensitive_information: bool = False
 
 
+class MemoryClassification(BaseModel):
+    """
+    Structured collection of memories extracted from one user message.
+    """
+
+    memories: list[ExtractedMemory] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+
+
 class MemoryClassifier:
     """
-    Classifies user information into persistent memory categories.
+    Extracts meaningful user-specific memories from natural conversation.
 
-    Uses the shared LLM router and its configured provider fallback.
+    Uses the shared LLM router and configured provider fallback.
     Does not directly save anything to the database.
     """
 
     SYSTEM_PROMPT = """
-You are an AI Memory Classification Engine.
+You are an intelligent Personal AI Assistant Memory Extraction Engine.
 
-Your task is to decide whether a user's information
-should be stored as persistent memory.
+Your responsibility is to identify meaningful information about
+the user from their natural conversation.
 
-Available memory categories:
+The user should NOT need to explicitly say:
+"Remember this", "Save this", or "Store this".
+
+Understand the meaning of normal conversation and extract
+important information automatically.
+
+AVAILABLE MEMORY TYPES:
 
 1. long_term
-Stable personal facts, preferences, goals and interests.
+Stable personal preferences, interests, goals and characteristics.
 
 Examples:
 - I prefer explanations in Bengali.
-- I work as a frontend developer.
-- I prefer travelling with my family.
+- I prefer Python over JavaScript.
+- I enjoy travelling with my family.
 
 2. episodic
 Specific events, experiences, activities and decisions.
 
 Examples:
-- Yesterday I attended an AI interview.
-- I visited Kolkata last week.
-- I completed a project yesterday.
+- I attended an AI interview yesterday.
+- I completed my project last week.
+- I visited Kolkata last month.
 
 3. semantic
-Facts, knowledge and meaningful relationships.
+User-specific facts, professional information, ongoing projects,
+technical stacks and meaningful relationships.
 
 Examples:
-- Kolkata is the capital of West Bengal.
-- Python is a programming language.
-- PostgreSQL is a relational database.
+- I work as a frontend developer.
+- My project uses FastAPI and PostgreSQL.
+- My backend uses LangGraph.
+- I have five years of development experience.
 
 4. procedural
-Recurring workflows, habits and instructions
-about how tasks should be performed.
+Recurring workflows, habits and instructions.
 
 Examples:
 - Always explain technical lessons step by step.
-- I activate my virtual environment before installing packages.
+- I prefer using PowerShell for Python development.
 - I review my emails every morning.
 
-Rules:
+EXTRACTION RULES:
 
-- Do not store greetings or ordinary conversation.
-- Do not store temporary questions as permanent memories.
-- Do not invent personal facts.
-- Do not confuse a question with a user preference.
-- If information is not suitable for persistent memory,
-  set should_store to false and memory_type to null.
-- If information contains sensitive personal information,
-  set contains_sensitive_information to true.
+- Extract multiple independent memories when appropriate.
+- Extract only information genuinely supported by the user's message.
+- Do not invent facts or assumptions.
+- Do not store ordinary questions, greetings, jokes or small talk.
+- Do not store general knowledge merely because the user asks about it.
+- Do not interpret hypothetical examples as personal facts.
+- Do not interpret quoted or pasted text as the user's own facts
+  unless the user clearly adopts those facts.
+- Do not store temporary information as permanent preferences.
+- Extract concise, standalone, meaningful memory statements.
+- Preserve important context and temporal qualifiers.
+- Never add facts that the user did not provide.
+
+IMPORTANCE:
+
+1-3: Minor or low-value information.
+4-6: Useful contextual information.
+7-8: Important personal facts, professional information and goals.
+9-10: Highly important stable preferences or ongoing objectives.
+
+SENSITIVE INFORMATION:
+
+- Identify sensitive personal information.
+- Set contains_sensitive_information to true when applicable.
 - Sensitive information must not be automatically stored.
-- Select exactly one category when should_store is true.
-- Return valid JSON only.
-- Do not use Markdown code fences.
+- Never attempt to extract passwords, authentication tokens,
+  API keys, financial credentials or security secrets.
 
-Required JSON structure:
+WHEN NOTHING IS WORTH REMEMBERING:
+
+Return an empty memories array.
+
+OUTPUT:
+
+Return valid JSON only.
+Do not use Markdown code fences.
+
+Required structure:
 
 {
-    "should_store": true,
-    "memory_type": "long_term",
-    "confidence": 0.95,
-    "reason": "A stable user preference.",
-    "contains_sensitive_information": false
+  "memories": [
+    {
+      "should_store": true,
+      "memory_type": "long_term",
+      "content": "User prefers explanations in Bengali.",
+      "importance": 9,
+      "confidence": 0.98,
+      "reason": "A stable communication preference.",
+      "contains_sensitive_information": false
+    }
+  ]
 }
 
-MEMORY CLASSIFICATION RULES:
+If no meaningful memory exists:
 
-1. LONG_TERM:
-Stable personal preferences, interests, goals, and user characteristics.
-Example: "I prefer Bengali explanations."
-
-2. EPISODIC:
-Specific events, experiences, activities, or decisions associated
-with a particular time or occasion.
-Example: "Yesterday, I attended an AI interview."
-
-3. SEMANTIC:
-User-specific factual knowledge, current project details,
-technical stack, professional facts, and relationships.
-These facts do not need to describe a specific event.
-Example: "My current project uses FastAPI and PostgreSQL."
-Example: "My backend uses LangGraph."
-Example: "My application uses Supabase for authentication."
-
-4. PROCEDURAL:
-Recurring habits, routines, and methods describing how the user
-performs tasks.
-Example: "I review my emails every morning."
-
-IMPORTANT DISTINCTION:
-
-- A fact about an ongoing project belongs to SEMANTIC.
-- An event describing something that happened at a particular
-  time belongs to EPISODIC.
-- Do not classify every project-related statement as EPISODIC.
-- Prefer SEMANTIC for stable or ongoing factual information.
-- Classify based on the meaning of the statement, not merely
-  the presence of words such as "project", "yesterday", or "current".
+{
+  "memories": []
+}
 """
 
     def classify(self, text: str) -> MemoryClassification:
         """
-        Classify a text into a persistent memory category.
+        Extract and classify multiple memories from a user message.
         """
 
         if not text or not text.strip():
@@ -168,7 +196,7 @@ IMPORTANT DISTINCTION:
                 ),
             ],
             temperature=0.0,
-            max_tokens=300,
+            max_tokens=1200,
         )
 
         response = llm_router.generate(request)
@@ -180,36 +208,53 @@ IMPORTANT DISTINCTION:
 
         except Exception as error:
             logger.error(
-                "Memory classification response validation failed | "
+                "Memory extraction validation failed | "
                 "provider=%s | model=%s",
                 response.provider,
                 response.model,
             )
 
             raise ValueError(
-                "AI returned an invalid memory classification."
+                "AI returned an invalid memory extraction response."
             ) from error
 
-        # Sensitive information must never be automatically stored.
-        if result.contains_sensitive_information:
-            result.should_store = False
-            result.memory_type = None
+        # Apply deterministic validation after LLM extraction.
+        safe_memories = []
 
-        # A non-storable result cannot have a persistent category.
-        if not result.should_store:
-            result.memory_type = None
+        for memory in result.memories:
 
-        if result.should_store and result.memory_type is None:
-            raise ValueError(
-                "A storable memory must have a memory type."
-            )
+            if memory.contains_sensitive_information:
+                logger.info(
+                    "Sensitive memory candidate rejected."
+                )
+                continue
+
+            if not memory.should_store:
+                continue
+
+            if not memory.memory_type:
+                logger.warning(
+                    "Memory candidate rejected: missing memory type."
+                )
+                continue
+
+            if not memory.content or not memory.content.strip():
+                logger.warning(
+                    "Memory candidate rejected: empty content."
+                )
+                continue
+
+            memory.content = memory.content.strip()
+
+            safe_memories.append(memory)
+
+        result.memories = safe_memories
 
         logger.info(
-            "Memory classified | type=%s | should_store=%s | "
-            "confidence=%.2f | provider=%s",
-            result.memory_type,
-            result.should_store,
-            result.confidence,
+            "Memory extraction completed | candidates=%s | "
+            "accepted=%s | provider=%s",
+            len(result.memories),
+            len(safe_memories),
             response.provider,
         )
 

@@ -1,5 +1,5 @@
-
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { api } from '../../lib/api.js'
 import {
   NavLink,
   Outlet,
@@ -33,6 +33,9 @@ const navigation = [
 ]
 
 function DashboardLayout() {
+  const [pendingReviewCount, setPendingReviewCount] = useState(0)
+  const [notificationOpen, setNotificationOpen] = useState(false)
+  const [notificationLoading, setNotificationLoading] = useState(true)
   const { user, signOut } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
@@ -45,6 +48,36 @@ function DashboardLayout() {
   const [profileError, setProfileError] = useState('')
 
   const isDark = theme === 'dark'
+
+  useEffect(() => {
+    let active = true
+
+    async function loadNotifications() {
+      try {
+        const reviews = await api.get(
+          '/api/v1/memory-reviews?status_filter=pending&limit=100&offset=0'
+        )
+
+        if (active) {
+          setPendingReviewCount(
+            Array.isArray(reviews) ? reviews.length : 0
+          )
+        }
+      } catch (error) {
+        console.error('Unable to load notifications:', error)
+      } finally {
+        if (active) {
+          setNotificationLoading(false)
+        }
+      }
+    }
+
+    loadNotifications()
+
+    return () => {
+      active = false
+    }
+  }, [])
 
   const metadata = user?.user_metadata || {}
 
@@ -109,6 +142,12 @@ function DashboardLayout() {
   function navigateTo(path) {
     closeMenus()
     navigate(path)
+  }
+
+  function openMemoryNotifications() {
+    setNotificationOpen(false)
+    closeMenus()
+    navigate('/dashboard/memory')
   }
 
   return (
@@ -388,15 +427,110 @@ function DashboardLayout() {
               {isDark ? '☀' : '☾'}
             </button>
 
-            {/* Notifications placeholder */}
-            <button
-              type="button"
-              aria-label="Notifications"
-              title="Notifications"
-              className={`relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border text-lg sm:h-11 sm:w-11 ${surface} ${hoverSurface}`}
-            >
-              ♧
-            </button>
+            {/* Notifications */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setNotificationOpen((current) => !current)}
+                aria-label="Notifications"
+                aria-expanded={notificationOpen}
+                title="Notifications"
+                className={`relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border text-lg sm:h-11 sm:w-11 ${surface} ${hoverSurface}`}
+              >
+                ♧
+
+                {!notificationLoading && pendingReviewCount > 0 && (
+                  <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white">
+                    {pendingReviewCount > 99 ? '99+' : pendingReviewCount}
+                  </span>
+                )}
+              </button>
+
+              {notificationOpen && (
+                <>
+                  <button
+                    type="button"
+                    aria-label="Close notifications"
+                    onClick={() => setNotificationOpen(false)}
+                    className="fixed inset-0 z-40 cursor-default"
+                  />
+
+                  <div
+                    className={`absolute right-0 top-full z-50 mt-3 w-[min(340px,calc(100vw-2rem))] overflow-hidden rounded-2xl border shadow-2xl ${
+                      isDark
+                        ? 'border-[#303448] bg-[#191c29]'
+                        : 'border-slate-200 bg-white'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between border-b border-inherit p-4">
+                      <h3 className="font-semibold">
+                        Notifications
+                      </h3>
+
+                      <span className="rounded-full bg-amber-500/15 px-2.5 py-1 text-xs font-semibold text-amber-500">
+                        {pendingReviewCount} Pending
+                      </span>
+                    </div>
+
+                    <div className="p-4">
+                      {notificationLoading ? (
+                        <p className={`text-sm ${muted}`}>
+                          Loading notifications...
+                        </p>
+                      ) : pendingReviewCount > 0 ? (
+                        <button
+                          type="button"
+                          onClick={openMemoryNotifications}
+                          className={`flex w-full items-start gap-3 rounded-xl p-3 text-left transition ${hoverSurface}`}
+                        >
+                          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 text-xl text-amber-500">
+                            ◈
+                          </span>
+
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-sm font-semibold">
+                              Memory reviews require attention
+                            </span>
+
+                            <span className={`mt-1 block text-xs leading-5 ${muted}`}>
+                              You have {pendingReviewCount} pending AI memory suggestions.
+                            </span>
+
+                            <span className="mt-2 block text-xs font-semibold text-violet-400">
+                              Review now →
+                            </span>
+                          </span>
+                        </button>
+                      ) : (
+                        <div className="py-5 text-center">
+                          <span className="text-3xl text-emerald-500">
+                            ✓
+                          </span>
+
+                          <p className="mt-2 text-sm font-semibold">
+                            You're all caught up!
+                          </p>
+
+                          <p className={`mt-1 text-xs ${muted}`}>
+                            No pending notifications right now.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    {pendingReviewCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={openMemoryNotifications}
+                        className={`w-full border-t border-inherit p-3 text-center text-sm font-semibold text-violet-400 ${hoverSurface}`}
+                      >
+                        View all memory reviews →
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         </header>
 

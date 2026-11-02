@@ -1,9 +1,10 @@
+
 from typing import Literal
 
 from pydantic import BaseModel
 
 from app.memory.classifier.memory_classifier import (
-    MemoryClassification,
+    ExtractedMemory,
 )
 
 
@@ -20,6 +21,7 @@ MIN_CONFIDENCE = 0.80
 class MemoryPolicyDecision(BaseModel):
     allowed: bool
     reason: str
+
     memory_type: Literal[
         "long_term",
         "episodic",
@@ -29,6 +31,10 @@ class MemoryPolicyDecision(BaseModel):
 
 
 class MemoryPolicy:
+    """
+    Validates each extracted memory independently
+    before it can be saved.
+    """
 
     def __init__(
         self,
@@ -43,47 +49,53 @@ class MemoryPolicy:
 
     def evaluate(
         self,
-        content: str,
-        classification: MemoryClassification,
+        memory: ExtractedMemory,
     ) -> MemoryPolicyDecision:
 
-        # Rule 1: Validate content.
-        if not content or not content.strip():
-            return MemoryPolicyDecision(
-                allowed=False,
-                reason="Empty memory content.",
-            )
-
-        # Rule 2: Respect the classifier's decision.
-        if not classification.should_store:
+        # Rule 1: Validate storage decision.
+        if not memory.should_store:
             return MemoryPolicyDecision(
                 allowed=False,
                 reason="Classifier decided not to store.",
             )
 
-        # Rule 3: Reject sensitive information.
-        if classification.contains_sensitive_information:
+        # Rule 2: Reject sensitive information.
+        if memory.contains_sensitive_information:
             return MemoryPolicyDecision(
                 allowed=False,
                 reason="Sensitive information detected.",
             )
 
-        # Rule 4: Check confidence.
-        if classification.confidence < self.min_confidence:
+        # Rule 3: Validate extracted content.
+        if not memory.content or not memory.content.strip():
+            return MemoryPolicyDecision(
+                allowed=False,
+                reason="Empty memory content.",
+            )
+
+        # Rule 4: Validate confidence.
+        if memory.confidence < self.min_confidence:
             return MemoryPolicyDecision(
                 allowed=False,
                 reason="Classification confidence is too low.",
             )
 
         # Rule 5: Validate memory category.
-        if classification.memory_type not in ALLOWED_MEMORY_TYPES:
+        if memory.memory_type not in ALLOWED_MEMORY_TYPES:
             return MemoryPolicyDecision(
                 allowed=False,
                 reason="Invalid memory category.",
             )
 
+        # Rule 6: Validate importance.
+        if not 1 <= memory.importance <= 10:
+            return MemoryPolicyDecision(
+                allowed=False,
+                reason="Invalid memory importance.",
+            )
+
         return MemoryPolicyDecision(
             allowed=True,
             reason="Memory passed policy validation.",
-            memory_type=classification.memory_type,
+            memory_type=memory.memory_type,
         )

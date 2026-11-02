@@ -5,6 +5,7 @@ from app.db.models.user_settings import UserSettings
 from app.db.models.user_connection import UserConnection
 from app.db.models.oauth_credential import OAuthCredential
 from app.db.models.oauth_state import OAuthState
+from app.db.models.memory_review import MemoryReview
 
 __all__ = [
     "Conversation",
@@ -14,4 +15,5 @@ __all__ = [
     "UserConnection",
     "OAuthCredential",
     "OAuthState",
+    "MemoryReview",
 ]
