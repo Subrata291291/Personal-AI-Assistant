@@ -1,0 +1,42 @@
+﻿# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+logs/
+
+# IDE and editor
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Frontend dependencies and builds
+node_modules/
+frontend/dist/
+
+# Test and coverage artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+.access_token.tmp
