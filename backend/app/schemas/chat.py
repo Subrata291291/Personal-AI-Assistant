@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, ConfigDict
 class ChatRequest(BaseModel):
     conversation_id: UUID
     content: str = Field(min_length=1, max_length=20000)
+    gmail_connection_id: UUID | None = None
 
 
 class ChatMessageResponse(BaseModel):

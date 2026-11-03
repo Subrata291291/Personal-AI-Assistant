@@ -2,11 +2,13 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react'
 
 import {
+  Link,
   useSearchParams,
   useOutletContext,
 } from 'react-router-dom'
@@ -18,8 +20,13 @@ import {
 } from '@tanstack/react-query'
 
 import { useAuth } from '../context/AuthContext'
+import EmailDraftCard from '../components/EmailDraftCard.jsx'
+import { gmailService } from '../services/gmailService.js'
 import { conversationService } from '../services/conversationService.js'
 
+function gmailSelectionStorageKey(userId) {
+  return `gmail-assistant-selected-account-${userId}`
+}
 
 function Assistant() {
   const { user } = useAuth()
@@ -33,6 +40,12 @@ function Assistant() {
   const queryClient = useQueryClient()
 
   const [message, setMessage] = useState('')
+  const [gmailSelection, setGmailSelection] = useState(() => ({
+    userId,
+    connectionId: userId
+      ? sessionStorage.getItem(gmailSelectionStorageKey(userId)) || ''
+      : '',
+  }))
   const [conversationId, setConversationId] = useState(null)
   const [optimisticMessages, setOptimisticMessages] = useState([])
 
@@ -46,6 +59,51 @@ function Assistant() {
   const hasRestoredRef = useRef(false)
   const lastRequestedIdRef = useRef(undefined)
   const newChatModeRef = useRef(false)
+
+  const gmailConnectionsQuery = useQuery({
+    queryKey: ['gmail-connections', userId],
+    queryFn: () => gmailService.getConnections(),
+    enabled: Boolean(userId),
+    staleTime: 5 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    refetchOnWindowFocus: false,
+  })
+
+  const gmailConnections = useMemo(
+    () =>
+      (gmailConnectionsQuery.data || []).filter(
+        (connection) =>
+          connection.provider === 'google' &&
+          connection.status === 'connected',
+      ),
+    [gmailConnectionsQuery.data],
+  )
+
+  const requestedGmailConnectionId =
+    gmailSelection.userId === userId
+      ? gmailSelection.connectionId
+      : ''
+  const selectedGmailConnection = gmailConnections.find(
+    (connection) => connection.id === requestedGmailConnectionId,
+  )
+  const selectedGmailConnectionId =
+    selectedGmailConnection?.id || ''
+
+  function handleGmailConnectionChange(event) {
+    const nextConnectionId = event.target.value
+    setGmailSelection({
+      userId,
+      connectionId: nextConnectionId,
+    })
+    if (!userId) return
+
+    const key = gmailSelectionStorageKey(userId)
+    if (nextConnectionId) {
+      sessionStorage.setItem(key, nextConnectionId)
+    } else {
+      sessionStorage.removeItem(key)
+    }
+  }
 
   // --------------------------------------------------
   // 1. Fetch and cache conversation list
@@ -211,6 +269,7 @@ function Assistant() {
       content,
       idempotencyKey,
       existingConversationId,
+      selectedConnectionId,
     }) => {
       let activeConversationId = existingConversationId
 
@@ -232,7 +291,8 @@ function Assistant() {
           await conversationService.sendChatMessage(
             activeConversationId,
             content,
-            idempotencyKey
+            idempotencyKey,
+            selectedConnectionId || null,
           )
 
         if (
@@ -299,11 +359,13 @@ function Assistant() {
     // Reuse the same idempotency key for the same retry.
     if (
       !pendingRequestRef.current ||
-      pendingRequestRef.current.content !== content
+      pendingRequestRef.current.content !== content ||
+      pendingRequestRef.current.connectionId !== selectedGmailConnectionId
     ) {
       pendingRequestRef.current = {
         content,
         key: crypto.randomUUID(),
+        connectionId: selectedGmailConnectionId,
       }
     }
 
@@ -327,6 +389,7 @@ function Assistant() {
         content,
         idempotencyKey,
         existingConversationId: conversationId,
+        selectedConnectionId: selectedGmailConnectionId,
       })
 
       const {
@@ -548,7 +611,7 @@ function Assistant() {
                 }`}
               >
                 <div
-                  className={`max-w-[90%] rounded-2xl px-4 py-3 text-sm leading-7 sm:max-w-[75%] ${
+                  className={`w-full max-w-[90%] rounded-2xl px-4 py-3 text-sm leading-7 sm:max-w-[85%] ${
                     item.role === 'user'
                       ? 'rounded-br-sm bg-gradient-to-r from-violet-600 to-indigo-600 text-white'
                       : isDark
@@ -559,6 +622,28 @@ function Assistant() {
                   <div className="whitespace-pre-wrap break-words">
                     {item.content}
                   </div>
+                  {item.role === 'assistant' &&
+                    item.metadata?.email_draft && (
+                      <EmailDraftCard
+                        message={item}
+                        isDark={isDark}
+                        onUpdated={(updatedMessage) => {
+                          queryClient.setQueryData(
+                            [
+                              'conversation-messages',
+                              userId,
+                              item.conversation_id,
+                            ],
+                            (current = []) =>
+                              current.map((currentMessage) =>
+                                currentMessage.id === updatedMessage.id
+                                  ? updatedMessage
+                                  : currentMessage,
+                              ),
+                          )
+                        }}
+                      />
+                    )}
                 </div>
               </div>
             ))
@@ -592,6 +677,62 @@ function Assistant() {
         <div className={`border-t p-4 sm:p-5 ${
           isDark ? 'border-[#252838]' : 'border-slate-200'
         }`}>
+          <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <label className="flex min-w-0 flex-1 items-center gap-3">
+              <span className="shrink-0 text-xs font-semibold">
+                Gmail account
+              </span>
+              <select
+                value={selectedGmailConnectionId}
+                onChange={handleGmailConnectionChange}
+                disabled={
+                  sending ||
+                  initializing ||
+                  gmailConnectionsQuery.isLoading ||
+                  gmailConnections.length === 0
+                }
+                aria-label="Select Gmail account for the assistant"
+                className={`min-w-0 max-w-full rounded-lg border px-3 py-2 text-xs outline-none transition focus:border-violet-500 disabled:opacity-60 sm:max-w-sm ${
+                  isDark
+                    ? 'border-[#303448] bg-[#171a27] text-slate-200'
+                    : 'border-slate-200 bg-white text-slate-700'
+                }`}
+              >
+                <option value="">
+                  {gmailConnectionsQuery.isLoading
+                    ? 'Loading connected accounts...'
+                    : 'Select an account to use Gmail'}
+                </option>
+                {gmailConnections.map((connection) => (
+                  <option key={connection.id} value={connection.id}>
+                    {connection.email || 'Google account'}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            {gmailConnectionsQuery.isError ? (
+              <button
+                type="button"
+                onClick={() => gmailConnectionsQuery.refetch()}
+                className="self-start text-xs font-semibold text-rose-400 hover:text-rose-300 sm:self-auto"
+              >
+                Could not load accounts · Retry
+              </button>
+            ) : gmailConnections.length === 0 &&
+              !gmailConnectionsQuery.isLoading ? (
+              <Link
+                to="/dashboard/connectors"
+                className="self-start text-xs font-semibold text-violet-400 hover:text-violet-300 sm:self-auto"
+              >
+                Connect Gmail in Connectors →
+              </Link>
+            ) : (
+              <span className={`text-xs ${muted}`}>
+                Select an account before asking about Gmail.
+              </span>
+            )}
+          </div>
           <form onSubmit={handleSubmit}>
             <div className={`flex items-end gap-2 rounded-2xl border p-2 ${
               isDark

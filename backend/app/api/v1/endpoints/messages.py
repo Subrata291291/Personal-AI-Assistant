@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from supabase import Client
 
 from app.api.deps import CurrentUser, get_current_supabase_client
+from app.schemas.email_draft import EmailDraftUpdate
 from app.schemas.message import MessageCreate, MessageResponse
 from app.services.message_service import MessageService
 
@@ -84,3 +85,38 @@ def get_messages(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         )
+
+
+@router.patch(
+    "/{message_id}/draft",
+    response_model=MessageResponse,
+)
+def update_email_draft(
+    conversation_id: UUID,
+    message_id: UUID,
+    payload: EmailDraftUpdate,
+    user: CurrentUser,
+    service: MessageServiceDependency,
+):
+    try:
+        updated = service.update_email_draft(
+            user_id=UUID(str(user["id"])),
+            conversation_id=conversation_id,
+            message_id=message_id,
+            email_draft=(
+                payload.email_draft.model_dump(mode="json")
+                if payload.email_draft is not None
+                else None
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Draft preview not found.",
+        )
+    return updated

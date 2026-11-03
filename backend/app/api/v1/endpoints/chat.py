@@ -80,6 +80,7 @@ def chat(
             conversation_id=payload.conversation_id,
             content=payload.content,
             idempotency_key=idempotency_key,
+            gmail_connection_id=payload.gmail_connection_id,
         )
 
     except LookupError:

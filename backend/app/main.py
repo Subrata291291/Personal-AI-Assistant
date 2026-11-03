@@ -12,6 +12,7 @@ from app.api.v1.endpoints.oauth import router as oauth_router
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.endpoints.memory import router as memory_router
 from app.api.v1.endpoints.memory_reviews import router as memory_reviews_router
+from app.api.v1.endpoints.gmail import router as gmail_router
 
 setup_logging()
 
@@ -85,4 +86,10 @@ app.include_router(
     memory_reviews_router,
     prefix=f"{settings.API_V1_PREFIX}/memory-reviews",
     tags=["Memory Reviews"],
+)
+
+app.include_router(
+    gmail_router,
+    prefix=f"{settings.API_V1_PREFIX}/gmail",
+    tags=["Gmail"],
 )

@@ -12,6 +12,9 @@ import Dashboard from './pages/Dashboard'
 import DashboardLayout from './components/layout/DashboardLayout'
 import Conversations from './pages/Conversations'
 import MemoryCenter from './pages/MemoryCenter'
+import Connectors from './pages/Connectors'
+import Gmail from './pages/Gmail'
+import Settings from './pages/Settings'
 
 import Login from './pages/Login'
 import Signup from './pages/Signup'
@@ -67,6 +70,9 @@ function App() {
               <Route path="assistant" element={<Assistant />} />
               <Route path="conversations" element={<Conversations />} />
               <Route path="memory" element={<MemoryCenter />} />
+              <Route path="connectors" element={<Connectors />} />
+              <Route path="gmail" element={<Gmail />} />
+              <Route path="settings" element={<Settings />} />
             </Route>
           </Route>
 

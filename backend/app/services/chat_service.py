@@ -1,6 +1,7 @@
 
 import hashlib
 import json
+import re
 from threading import Event, Thread
 from typing import Any
 from uuid import UUID, uuid4
@@ -34,6 +35,7 @@ class ChatService:
     LEASE_SECONDS = 600
     HEARTBEAT_INTERVAL = 60
     HEARTBEAT_JOIN_TIMEOUT = 10
+    GMAIL_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
 
     def __init__(
         self,
@@ -54,6 +56,7 @@ class ChatService:
     def _generate_request_hash(
         conversation_id: UUID,
         content: str,
+        gmail_connection_id: UUID | None = None,
     ) -> str:
         """Generate a deterministic SHA-256 fingerprint."""
 
@@ -61,6 +64,8 @@ class ChatService:
             "conversation_id": str(conversation_id),
             "content": content.strip(),
         }
+        if gmail_connection_id is not None:
+            payload["gmail_connection_id"] = str(gmail_connection_id)
 
         canonical_payload = json.dumps(
             payload,
@@ -71,6 +76,57 @@ class ChatService:
         return hashlib.sha256(
             canonical_payload.encode("utf-8")
         ).hexdigest()
+
+    @classmethod
+    def _available_gmail_sources(
+        cls,
+        history: list[dict[str, Any]],
+        connection_id: UUID | None,
+    ) -> dict[str, Any] | None:
+        if connection_id is None:
+            return None
+
+        for message in reversed(history):
+            if message.get("role") != "assistant":
+                continue
+            metadata = message.get("metadata")
+            sources = metadata.get("gmail_sources") if isinstance(metadata, dict) else None
+            if (
+                not isinstance(sources, dict)
+                or sources.get("connection_id") != str(connection_id)
+                or not isinstance(sources.get("messages"), list)
+            ):
+                continue
+
+            safe_messages = []
+            for source in sources["messages"][:10]:
+                if not isinstance(source, dict):
+                    continue
+                message_id = source.get("message_id", "")
+                thread_id = source.get("thread_id", "")
+                if (
+                    not isinstance(message_id, str)
+                    or not isinstance(thread_id, str)
+                    or (
+                        not cls.GMAIL_MESSAGE_ID_PATTERN.fullmatch(message_id)
+                        and not cls.GMAIL_MESSAGE_ID_PATTERN.fullmatch(thread_id)
+                    )
+                ):
+                    continue
+                safe_messages.append({
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "sender": str(source.get("sender") or "")[:320],
+                    "recipient": str(source.get("recipient") or "")[:500],
+                    "cc": str(source.get("cc") or "")[:500],
+                    "subject": str(source.get("subject") or "")[:500],
+                })
+            if safe_messages:
+                return {
+                    "connection_id": str(connection_id),
+                    "messages": safe_messages,
+                }
+        return None
 
     def _get_completed_response(
         self,
@@ -281,6 +337,7 @@ class ChatService:
         conversation_id: UUID,
         content: str,
         idempotency_key: UUID,
+        gmail_connection_id: UUID | None = None,
     ) -> dict[str, Any]:
         """Process an idempotent chat request using LangGraph."""
 
@@ -300,6 +357,7 @@ class ChatService:
         request_hash = self._generate_request_hash(
             conversation_id=conversation_id,
             content=normalized_content,
+            gmail_connection_id=gmail_connection_id,
         )
 
         # 3. Create or retrieve the idempotent request.
@@ -439,6 +497,10 @@ class ChatService:
                 conversation_id=conversation_id,
                 limit=100,
             )
+            available_gmail_sources = self._available_gmail_sources(
+                history,
+                gmail_connection_id,
+            )
 
             previous_messages = [
                 {
@@ -473,6 +535,10 @@ class ChatService:
                 "model": "",
                 "messages": previous_messages,
             }
+            if available_gmail_sources:
+                initial_state["available_gmail_sources"] = (
+                    available_gmail_sources
+                )
 
             thread_config = {
                 "configurable": {
@@ -497,6 +563,14 @@ class ChatService:
                 result = chat_graph.invoke(
                     initial_state,
                     config=thread_config,
+                    context={
+                        "user_id": str(user_id),
+                        "gmail_connection_id": (
+                            str(gmail_connection_id)
+                            if gmail_connection_id
+                            else None
+                        ),
+                    },
                 )
             finally:
                 # Always stop heartbeat when graph execution ends,
@@ -551,16 +625,25 @@ class ChatService:
 
             if assistant_message is None:
                 try:
+                    assistant_metadata = {
+                        "provider": result["provider"],
+                        "model": result["model"],
+                    }
+                    if result.get("email_draft"):
+                        assistant_metadata["email_draft"] = (
+                            result["email_draft"]
+                        )
+                    if result.get("gmail_sources"):
+                        assistant_metadata["gmail_sources"] = (
+                            result["gmail_sources"]
+                        )
                     assistant_message = (
                         self.message_service.create_request_message(
                             conversation_id=conversation_id,
                             chat_request_id=request_id,
                             role="assistant",
                             content=assistant_content,
-                            metadata={
-                                "provider": result["provider"],
-                                "model": result["model"],
-                            },
+                            metadata=assistant_metadata,
                         )
                     )
                 except Exception:

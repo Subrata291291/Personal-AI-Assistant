@@ -137,6 +137,30 @@ export function AuthProvider({ children }) {
     if (error) throw error
   }
 
+  async function updateProfile({ fullName }) {
+    const { data, error } = await supabase.auth.updateUser({
+      data: {
+        full_name: fullName,
+      },
+    })
+
+    if (error) throw error
+
+    setUser(data.user)
+    return data.user
+  }
+
+  async function updatePassword(password) {
+    const { data, error } = await supabase.auth.updateUser({
+      password,
+    })
+
+    if (error) throw error
+
+    setUser(data.user)
+    return data.user
+  }
+
   const isEmailVerified = isVerifiedUser(user)
 
   const value = {
@@ -146,6 +170,8 @@ export function AuthProvider({ children }) {
     signUp,
     signIn,
     signOut,
+    updateProfile,
+    updatePassword,
     isEmailVerified,
     isAuthenticated: Boolean(user && isEmailVerified),
   }

@@ -82,3 +82,48 @@ class UserConnectionService:
         except Exception:
             self.db.rollback()
             raise
+
+
+    def list_connections(
+        self,
+        user_id: UUID,
+    ) -> list[dict]:
+
+        connections = self.repository.list_by_user(
+            user_id=user_id,
+        )
+
+        return [
+            {
+                "id": connection.id,
+                "provider": connection.provider,
+                "email": connection.email,
+                "status": connection.status,
+                "connected_at": connection.connected_at,
+                "created_at": connection.created_at,
+            }
+            for connection in connections
+        ]
+
+    def disconnect_account(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> bool:
+
+        try:
+            deleted = self.repository.delete_by_id(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+
+            if not deleted:
+                return False
+
+            self.db.commit()
+
+            return True
+
+        except Exception:
+            self.db.rollback()
+            raise

@@ -7,6 +7,11 @@ class ChatMessage(TypedDict):
     content: str
 
 
+class ChatContext(TypedDict):
+    user_id: str
+    gmail_connection_id: str | None
+
+
 class ChatState(TypedDict):
 
     user_id: str
@@ -27,3 +32,11 @@ class ChatState(TypedDict):
     retrieved_memories: NotRequired[list[dict[str, Any]]]
 
     memory_context: NotRequired[str]
+
+    gmail_plan: NotRequired[dict[str, Any]]
+
+    available_gmail_sources: NotRequired[dict[str, Any]]
+
+    gmail_sources: NotRequired[dict[str, Any]]
+
+    email_draft: NotRequired[dict[str, Any]]

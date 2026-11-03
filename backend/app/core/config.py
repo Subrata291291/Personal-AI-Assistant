@@ -70,7 +70,10 @@ class Settings(BaseSettings):
     # OAuth scopes (comma-separated)
     GOOGLE_OAUTH_SCOPES: str = (
         "openid,email,profile,"
-        "https://www.googleapis.com/auth/gmail.readonly"
+        "https://www.googleapis.com/auth/gmail.readonly,"
+        "https://www.googleapis.com/auth/gmail.send,"
+        "https://www.googleapis.com/auth/gmail.modify,"
+        "https://mail.google.com/"
     )
 
     # OAuth authorization settings

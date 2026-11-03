@@ -27,37 +27,45 @@ async function getAccessToken() {
 }
 
 async function request(path, options = {}) {
+  const { responseType, ...fetchOptions } = options
+
   const accessToken = await getAccessToken()
 
-  const headers = new Headers(options.headers || {})
+  const headers = new Headers(fetchOptions.headers || {})
 
   headers.set('Authorization', `Bearer ${accessToken}`)
-  headers.set('Accept', 'application/json')
 
-  if (options.body !== undefined && !(options.body instanceof FormData)) {
+  if (responseType !== 'blob') {
+    headers.set('Accept', 'application/json')
+  }
+
+  if (
+    fetchOptions.body !== undefined &&
+    !(fetchOptions.body instanceof FormData)
+  ) {
     headers.set('Content-Type', 'application/json')
   }
 
   const response = await fetch(
     `${API_BASE_URL.replace(/\/+$/, '')}${path}`,
     {
-      ...options,
+      ...fetchOptions,
       headers,
     }
   )
 
-  // HTTP 204 means success with no response body.
   if (response.status === 204) {
     return null
   }
 
   const contentType = response.headers.get('content-type') || ''
 
-  const responseData = contentType.includes('application/json')
-    ? await response.json()
-    : await response.text()
-
+  // Handle API errors before processing binary responses.
   if (!response.ok) {
+    const responseData = contentType.includes('application/json')
+      ? await response.json()
+      : await response.text()
+
     const message =
       typeof responseData === 'object' && responseData !== null
         ? responseData.detail || responseData.message
@@ -68,6 +76,15 @@ async function request(path, options = {}) {
     )
   }
 
+  // Return binary response for file downloads.
+  if (responseType === 'blob') {
+    return response.blob()
+  }
+
+  const responseData = contentType.includes('application/json')
+    ? await response.json()
+    : await response.text()
+
   return responseData
 }
 
@@ -75,6 +92,13 @@ export const api = {
   get(path) {
     return request(path, {
       method: 'GET',
+    })
+  },
+
+  getBlob(path) {
+    return request(path, {
+      method: 'GET',
+      responseType: 'blob',
     })
   },
 

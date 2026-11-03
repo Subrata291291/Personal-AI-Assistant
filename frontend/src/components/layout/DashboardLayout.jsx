@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import AppIcon from '../AppIcon'
 import { api } from '../../lib/api.js'
 import {
   NavLink,
@@ -12,22 +14,23 @@ const navigation = [
   {
     section: 'WORKSPACE',
     items: [
-      { name: 'Dashboard', path: '/dashboard', icon: '▦', end: true },
-      { name: 'AI Assistant', path: '/dashboard/assistant', icon: '✧' },
-      { name: 'Conversations', path: '/dashboard/conversations', icon: '☷' },
+      { name: 'Dashboard', path: '/dashboard', icon: 'dashboard', end: true },
+      { name: 'AI Assistant', path: '/dashboard/assistant', icon: 'assistant' },
+      { name: 'Conversations', path: '/dashboard/conversations', icon: 'conversations' },
     ],
   },
   {
     section: 'PERSONAL',
     items: [
-      { name: 'Memory Center', path: '/dashboard/memory', icon: '◈' },
-      { name: 'Tasks & Reminders', path: '/dashboard/tasks', icon: '✓' },
+      { name: 'Memory Center', path: '/dashboard/memory', icon: 'memory' },
+      { name: 'Tasks & Reminders', path: '/dashboard/tasks', icon: 'tasks' },
     ],
   },
   {
     section: 'INTEGRATIONS',
     items: [
-      { name: 'Connectors', path: '/dashboard/connectors', icon: '⌘' },
+      { name: 'Connectors', path: '/dashboard/connectors', icon: 'connectors' },
+      { name: 'Gmail', path: '/dashboard/gmail', icon: 'gmail' },
     ],
   },
 ]
@@ -37,10 +40,13 @@ function DashboardLayout() {
   const [notificationOpen, setNotificationOpen] = useState(false)
   const [notificationLoading, setNotificationLoading] = useState(true)
   const { user, signOut } = useAuth()
+  const queryClient = useQueryClient()
   const navigate = useNavigate()
   const location = useLocation()
 
-  const [theme, setTheme] = useState('dark')
+  const [theme, setTheme] = useState(() =>
+    localStorage.getItem('dashboard-theme') === 'light' ? 'light' : 'dark'
+  )
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [profileOpen, setProfileOpen] = useState(false)
   const [search, setSearch] = useState('')
@@ -48,6 +54,22 @@ function DashboardLayout() {
   const [profileError, setProfileError] = useState('')
 
   const isDark = theme === 'dark'
+  const connectionsQuery = useQuery({
+    queryKey: ['oauth-connections', user?.id],
+    queryFn: () => api.get('/api/v1/oauth/connections'),
+    enabled: Boolean(user?.id),
+    staleTime: 5 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    refetchOnWindowFocus: false,
+  })
+
+  const connectedAccountCount = (
+    connectionsQuery.data?.connections || []
+  ).filter((connection) => connection.status === 'connected').length
+
+  useEffect(() => {
+    localStorage.setItem('dashboard-theme', theme)
+  }, [theme])
 
   useEffect(() => {
     let active = true
@@ -132,6 +154,17 @@ function DashboardLayout() {
 
     try {
       await signOut()
+
+      // Clear all cached user data after successful logout.
+      queryClient.clear()
+
+      // Clear user-specific Gmail account selection.
+      if (user?.id) {
+        sessionStorage.removeItem(
+          `gmail-selected-account-${user.id}`,
+        )
+      }
+
       navigate('/login', { replace: true })
     } catch (error) {
       setProfileError(error.message || 'Unable to log out.')
@@ -180,7 +213,7 @@ function DashboardLayout() {
         <div className="flex h-[76px] shrink-0 items-center justify-between gap-3 border-b border-inherit px-5">
           <div className="flex min-w-0 items-center gap-3">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500 to-indigo-600 text-xl text-white shadow-lg shadow-indigo-500/20">
-              ✧
+              <AppIcon name="assistant" className="h-5 w-5" />
             </div>
 
             <div className="min-w-0">
@@ -197,9 +230,9 @@ function DashboardLayout() {
             type="button"
             onClick={() => setMobileMenuOpen(false)}
             aria-label="Close sidebar"
-            className={`rounded-lg p-2 text-lg md:hidden ${hoverSurface}`}
+            className={`rounded-lg p-2 md:hidden ${hoverSurface}`}
           >
-            ✕
+            <AppIcon name="close" className="h-5 w-5" />
           </button>
         </div>
 
@@ -210,7 +243,7 @@ function DashboardLayout() {
             onClick={() => navigateTo('/dashboard/assistant')}
             className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 px-3 py-3.5 text-sm font-semibold text-white shadow-lg shadow-indigo-500/10 transition hover:brightness-110"
           >
-            <span className="text-xl">＋</span>
+            <AppIcon name="plus" className="h-5 w-5" />
             New conversation
           </button>
         </div>
@@ -238,18 +271,18 @@ function DashboardLayout() {
                       }`
                     }
                   >
-                    <span className="w-5 shrink-0 text-center text-xl">
-                      {item.icon}
+                    <span className="flex w-5 shrink-0 justify-center">
+                      <AppIcon name={item.icon} className="h-5 w-5" />
                     </span>
                     <span className="flex-1">{item.name}</span>
 
-                    {item.name === 'Connectors' && (
+                    {item.name === 'Connectors' && !connectionsQuery.isError && (
                       <span
                         className={`rounded-full px-2 py-0.5 text-xs ${
                           isDark ? 'bg-[#292d3c]' : 'bg-slate-200'
                         }`}
                       >
-                        4
+                        {connectionsQuery.isLoading ? '…' : connectedAccountCount}
                       </span>
                     )}
                   </NavLink>
@@ -270,113 +303,17 @@ function DashboardLayout() {
             onClick={() => navigateTo('/dashboard/settings')}
             className={`flex w-full items-center gap-3 rounded-xl px-3 py-3.5 text-sm ${hoverSurface} ${muted}`}
           >
-            <span className="w-5 text-center text-xl">⚙</span>
+            <AppIcon name="settings" className="h-5 w-5" />
             Settings
           </button>
-
-          {/* Profile */}
-          <div className="relative mt-3">
-            <button
-              type="button"
-              onClick={() => setProfileOpen((current) => !current)}
-              aria-expanded={profileOpen}
-              aria-label="Open profile menu"
-              className={`flex w-full items-center gap-3 rounded-xl border border-transparent p-2.5 text-left transition ${hoverSurface} ${
-                profileOpen ? 'border-violet-500/30' : ''
-              }`}
-            >
-              {avatarUrl ? (
-                <img
-                  src={avatarUrl}
-                  alt={fullName}
-                  referrerPolicy="no-referrer"
-                  className="h-11 w-11 shrink-0 rounded-full object-cover"
-                />
-              ) : (
-                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 text-base font-bold text-white">
-                  {initials || 'U'}
-                </div>
-              )}
-
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-semibold">
-                  {fullName}
-                </div>
-                <div className={`mt-1 truncate text-xs ${muted}`}>
-                  {email}
-                </div>
-              </div>
-
-              <span className={`text-base ${muted}`}>
-                {profileOpen ? '⌃' : '⌄'}
-              </span>
-            </button>
-
-            {profileOpen && (
-              <div
-                className={`absolute bottom-full left-0 z-50 mb-3 w-full min-w-[235px] rounded-xl border p-2 shadow-2xl ${
-                  isDark
-                    ? 'border-[#303448] bg-[#191c29]'
-                    : 'border-slate-200 bg-white'
-                }`}
-              >
-                <div className="px-3 py-3">
-                  <div className="truncate text-sm font-semibold">
-                    {fullName}
-                  </div>
-                  <div className={`mt-1 break-all text-xs ${muted}`}>
-                    {email}
-                  </div>
-                </div>
-
-                <div className={`my-1 border-t ${isDark ? 'border-[#303448]' : 'border-slate-200'}`} />
-
-                <button
-                  type="button"
-                  onClick={() => navigateTo('/dashboard/settings')}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-3 text-sm ${muted} ${hoverSurface}`}
-                >
-                  <span>♙</span>
-                  My Profile
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => navigateTo('/dashboard/settings')}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-3 text-sm ${muted} ${hoverSurface}`}
-                >
-                  <span>⚙</span>
-                  Account Settings
-                </button>
-
-                <div className={`my-1 border-t ${isDark ? 'border-[#303448]' : 'border-slate-200'}`} />
-
-                {profileError && (
-                  <div className="px-3 py-2 text-sm text-rose-500">
-                    {profileError}
-                  </div>
-                )}
-
-                <button
-                  type="button"
-                  onClick={handleLogout}
-                  disabled={logoutLoading}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-sm text-rose-500 transition hover:bg-rose-500/10 disabled:opacity-50"
-                >
-                  <span>↪</span>
-                  {logoutLoading ? 'Signing out...' : 'Sign out'}
-                </button>
-              </div>
-            )}
-          </div>
         </div>
       </aside>
 
       {/* Main */}
-      <main className="min-h-screen min-w-0 md:ml-64">
+      <main className="min-h-screen min-w-0 pt-[68px] md:ml-64 lg:pt-[76px]">
         {/* Header */}
         <header
-          className={`sticky top-0 z-30 flex min-h-[68px] items-center justify-between gap-3 border-b px-4 py-3 sm:px-6 lg:min-h-[76px] lg:px-8 ${
+          className={`fixed left-0 right-0 top-0 z-30 flex min-h-[68px] items-center justify-between gap-3 border-b px-4 py-3 sm:px-6 md:left-64 lg:min-h-[76px] lg:px-8 ${
             isDark
               ? 'border-[#252838] bg-[#0b0d14]/95'
               : 'border-slate-200 bg-white/95'
@@ -389,7 +326,7 @@ function DashboardLayout() {
               aria-label="Open navigation menu"
               className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border text-lg md:hidden ${surface} ${hoverSurface}`}
             >
-              ☰
+              <AppIcon name="conversations" className="h-5 w-5" />
             </button>
 
             <div className="min-w-0 truncate text-xs sm:text-sm">
@@ -404,7 +341,9 @@ function DashboardLayout() {
             <label
               className={`hidden w-56 items-center gap-2 rounded-xl border px-3 py-2.5 lg:flex xl:w-72 ${inputSurface}`}
             >
-              <span className={muted}>⌕</span>
+              <span className={muted}>
+                <AppIcon name="search" className="h-4 w-4" />
+              </span>
               <input
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
@@ -424,7 +363,7 @@ function DashboardLayout() {
               aria-label="Toggle theme"
               className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border text-lg sm:h-11 sm:w-11 ${surface} ${hoverSurface}`}
             >
-              {isDark ? '☀' : '☾'}
+              <AppIcon name={isDark ? 'sun' : 'moon'} className="h-5 w-5" />
             </button>
 
             {/* Notifications */}
@@ -437,7 +376,7 @@ function DashboardLayout() {
                 title="Notifications"
                 className={`relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border text-lg sm:h-11 sm:w-11 ${surface} ${hoverSurface}`}
               >
-                ♧
+                <AppIcon name="bell" className="h-5 w-5" />
 
                 {!notificationLoading && pendingReviewCount > 0 && (
                   <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white">
@@ -484,7 +423,7 @@ function DashboardLayout() {
                           className={`flex w-full items-start gap-3 rounded-xl p-3 text-left transition ${hoverSurface}`}
                         >
                           <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 text-xl text-amber-500">
-                            ◈
+                            <AppIcon name="memory" className="h-5 w-5" />
                           </span>
 
                           <span className="min-w-0 flex-1">
@@ -504,7 +443,7 @@ function DashboardLayout() {
                       ) : (
                         <div className="py-5 text-center">
                           <span className="text-3xl text-emerald-500">
-                            ✓
+                            <AppIcon name="check" className="h-7 w-7" />
                           </span>
 
                           <p className="mt-2 text-sm font-semibold">
@@ -531,6 +470,89 @@ function DashboardLayout() {
                 </>
               )}
             </div>
+
+            {/* Profile */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setProfileOpen((current) => !current)}
+                aria-expanded={profileOpen}
+                aria-label="Open profile menu"
+                className={`flex h-10 items-center gap-2 rounded-xl border px-2 transition sm:h-11 sm:gap-3 sm:px-3 ${surface} ${hoverSurface}`}
+              >
+                {avatarUrl ? (
+                  <img
+                    src={avatarUrl}
+                    alt={fullName}
+                    referrerPolicy="no-referrer"
+                    className="h-8 w-8 shrink-0 rounded-full object-cover"
+                  />
+                ) : (
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 text-xs font-bold text-white">
+                    {initials || 'U'}
+                  </div>
+                )}
+                <span className="hidden max-w-32 truncate text-sm font-semibold sm:block">
+                  {fullName}
+                </span>
+                <span className={`ml-1 ${muted}`}>
+                  <AppIcon
+                    name={profileOpen ? 'chevron-up' : 'chevron-down'}
+                    className="h-4 w-4"
+                  />
+                </span>
+              </button>
+
+              {profileOpen && (
+                <>
+                  <button
+                    type="button"
+                    aria-label="Close profile menu"
+                    onClick={() => setProfileOpen(false)}
+                    className="fixed inset-0 z-40 cursor-default"
+                  />
+                  <div
+                    className={`absolute right-0 top-full z-50 mt-3 w-[min(280px,calc(100vw-2rem))] rounded-xl border p-2 shadow-2xl ${
+                      isDark
+                        ? 'border-[#303448] bg-[#191c29]'
+                        : 'border-slate-200 bg-white'
+                    }`}
+                  >
+                    <div className="px-3 py-3">
+                      <div className="truncate text-sm font-semibold">
+                        {fullName}
+                      </div>
+                      <div className={`mt-1 break-all text-xs ${muted}`}>
+                        {email}
+                      </div>
+                    </div>
+                    <div className={`my-1 border-t ${isDark ? 'border-[#303448]' : 'border-slate-200'}`} />
+                    <button
+                      type="button"
+                      onClick={() => navigateTo('/dashboard/settings')}
+                      className={`flex w-full items-center gap-3 rounded-lg px-3 py-3 text-sm ${muted} ${hoverSurface}`}
+                    >
+                      <AppIcon name="settings" className="h-4 w-4" />
+                      Settings
+                    </button>
+                    {profileError && (
+                      <div className="px-3 py-2 text-sm text-rose-500">
+                        {profileError}
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleLogout}
+                      disabled={logoutLoading}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-sm text-rose-500 transition hover:bg-rose-500/10 disabled:opacity-50"
+                    >
+                      <AppIcon name="logout" className="h-4 w-4" />
+                      {logoutLoading ? 'Signing out...' : 'Sign out'}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         </header>
 
@@ -541,6 +563,7 @@ function DashboardLayout() {
               theme,
               isDark,
               setTheme,
+              user,
               muted,
               surface,
               hoverSurface,

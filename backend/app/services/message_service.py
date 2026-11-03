@@ -233,6 +233,70 @@ class MessageService:
         return result.data[0] if result.data else None
 
 
+    def update_email_draft(
+        self,
+        user_id: UUID,
+        conversation_id: UUID,
+        message_id: UUID,
+        email_draft: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Update or discard a draft preview on the user's assistant message."""
+        if not self.verify_conversation_ownership(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        ):
+            return None
+
+        current_result = (
+            self.supabase
+            .table("pa_conversation_messages")
+            .select("*")
+            .eq("id", str(message_id))
+            .eq("conversation_id", str(conversation_id))
+            .eq("role", "assistant")
+            .limit(1)
+            .execute()
+        )
+        if not current_result.data:
+            return None
+
+        current_message = current_result.data[0]
+        metadata = current_message.get("metadata") or {}
+        if not isinstance(metadata, dict) or "email_draft" not in metadata:
+            return None
+
+        updated_metadata = dict(metadata)
+        if email_draft is None:
+            updated_metadata.pop("email_draft", None)
+        else:
+            existing_draft = metadata.get("email_draft")
+            if not isinstance(existing_draft, dict) or any(
+                email_draft.get(field) != existing_draft.get(field)
+                for field in (
+                    "draft_type",
+                    "source_message_id",
+                    "source_thread_id",
+                )
+            ):
+                raise ValueError(
+                    "Draft type and source email cannot be changed."
+                )
+            updated_metadata["email_draft"] = email_draft
+
+        updated_result = (
+            self.supabase
+            .table("pa_conversation_messages")
+            .update({"metadata": updated_metadata})
+            .eq("id", str(message_id))
+            .eq("conversation_id", str(conversation_id))
+            .eq("role", "assistant")
+            .select("*")
+            .limit(1)
+            .execute()
+        )
+        return updated_result.data[0] if updated_result.data else None
+
+
     def delete_message(
         self,
         user_id: UUID,

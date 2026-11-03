@@ -4,30 +4,31 @@ import { useNavigate, useOutletContext } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { api } from '../lib/api.js'
 import { conversationService } from '../services/conversationService.js'
+import AppIcon from '../components/AppIcon'
 
 const connectors = [
   {
     name: 'Gmail',
     detail: 'Email integration',
-    icon: '✉',
+    icon: 'gmail',
     color: 'red',
   },
   {
     name: 'Google Calendar',
     detail: 'Events and schedule',
-    icon: '▦',
+    icon: 'calendar',
     color: 'blue',
   },
   {
     name: 'Google Drive',
     detail: 'Files and documents',
-    icon: '▰',
+    icon: 'drive',
     color: 'green',
   },
   {
     name: 'Google Contacts',
     detail: 'People and contacts',
-    icon: '♙',
+    icon: 'contacts',
     color: 'yellow',
   },
 ]
@@ -38,14 +39,14 @@ const overviewCards = [
     value: 'Ready',
     description: 'Your assistant is standing by',
     note: 'System available',
-    icon: '✧',
+    icon: 'assistant',
     color: 'text-violet-400',
   },
   {
     label: 'LONG-TERM MEMORY',
     description: 'Saved personal memories',
     note: 'Memory settings control saving',
-    icon: '◈',
+    icon: 'memory',
     color: 'text-blue-400',
     dynamic: 'memories',
   },
@@ -54,7 +55,7 @@ const overviewCards = [
     value: '0 / 4',
     description: 'Available integrations',
     note: 'Connect your favourite tools',
-    icon: '⌘',
+    icon: 'connectors',
     color: 'text-emerald-400',
   },
   {
@@ -62,7 +63,7 @@ const overviewCards = [
     value: '—',
     description: 'Personal tasks and reminders',
     note: 'Your productivity space',
-    icon: '✓',
+    icon: 'tasks',
     color: 'text-orange-400',
   },
 ]
@@ -114,6 +115,23 @@ function Dashboard() {
     useOutletContext()
 
   const userId = user?.id
+
+  const { data: connectionsData, isLoading: connectionsLoading, isError: connectionsError } = useQuery({
+    queryKey: ['oauth-connections', userId],
+    queryFn: () => api.get('/api/v1/oauth/connections'),
+    enabled: Boolean(userId),
+    staleTime: 5 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    refetchOnWindowFocus: false,
+  })
+
+  const googleConnections = (connectionsData?.connections || []).filter(
+    (connection) =>
+      connection.provider === 'google' &&
+      connection.status === 'connected',
+  )
+
+  const isGmailConnected = googleConnections.length > 0
 
   const metadata = user?.user_metadata || {}
 
@@ -229,7 +247,7 @@ function Dashboard() {
               {firstName}.
             </span>{' '}
 
-            ✦
+            <AppIcon name="assistant" className="inline h-5 w-5 align-[-3px] text-violet-400" />
 
           </h1>
 
@@ -244,7 +262,9 @@ function Dashboard() {
           onClick={() => navigate('/dashboard/assistant')}
           className="flex w-full items-center justify-center gap-3 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 px-5 py-3.5 text-sm font-semibold text-white shadow-lg shadow-indigo-500/20 transition hover:brightness-110 sm:w-auto"
         >
-          ✧ Start a conversation <span>→</span>
+          <AppIcon name="assistant" className="h-5 w-5" />
+          Start a conversation
+          <AppIcon name="arrow-right" className="h-4 w-4" />
         </button>
 
       </section>
@@ -264,6 +284,14 @@ function Dashboard() {
                 : longTermMemoryCount
           }
 
+          if (card.label === 'CONNECTED APPS') {
+            value = connectionsLoading
+              ? '...'
+              : connectionsError
+                ? '—'
+                : `${isGmailConnected ? 1 : 0} / ${connectors.length}`
+          }
+
           return (
             <div
               key={card.label}
@@ -272,8 +300,8 @@ function Dashboard() {
 
               <div className="flex items-center justify-between gap-2">
 
-                <span className={`text-2xl ${card.color}`}>
-                  {card.icon}
+                <span className={card.color}>
+                  <AppIcon name={card.icon} className="h-6 w-6" />
                 </span>
 
                 <span className={`text-xs font-bold tracking-wide sm:tracking-[1.2px] ${muted}`}>
@@ -317,8 +345,8 @@ function Dashboard() {
 
           <div className="flex items-center justify-between gap-3">
 
-            <span className="text-2xl text-amber-400">
-              ◈
+            <span className="text-amber-400">
+              <AppIcon name="memory" className="h-6 w-6" />
             </span>
 
             <span className={`text-xs font-bold tracking-wide ${muted}`}>
@@ -403,7 +431,7 @@ function Dashboard() {
               >
 
                 <div
-                  className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-lg sm:h-11 sm:w-11 sm:text-xl ${
+                  className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl sm:h-11 sm:w-11 ${
                     connector.color === 'red'
                       ? 'bg-red-500/10 text-red-400'
                       : connector.color === 'blue'
@@ -413,7 +441,7 @@ function Dashboard() {
                           : 'bg-yellow-500/10 text-yellow-400'
                   }`}
                 >
-                  {connector.icon}
+                  <AppIcon name={connector.icon} className="h-5 w-5" />
                 </div>
 
                 <div className="min-w-0 flex-1">
@@ -423,19 +451,31 @@ function Dashboard() {
                   </div>
 
                   <div className={`mt-1 truncate text-xs ${muted}`}>
-                    {connector.detail}
+                    {connector.name === 'Gmail' && isGmailConnected
+                      ? `${googleConnections.length} Google account${googleConnections.length === 1 ? '' : 's'} connected`
+                      : connector.detail}
                   </div>
 
                 </div>
 
                 <span
                   className={`shrink-0 rounded-full px-2 py-1 text-[10px] sm:px-3 sm:text-xs ${
-                    isDark
-                      ? 'bg-[#292d3c] text-slate-400'
-                      : 'bg-slate-100 text-slate-500'
+                    connector.name === 'Gmail' && isGmailConnected
+                      ? 'bg-emerald-500/10 text-emerald-500'
+                      : isDark
+                        ? 'bg-[#292d3c] text-slate-400'
+                        : 'bg-slate-100 text-slate-500'
                   }`}
                 >
-                  Coming soon
+                  {connector.name === 'Gmail'
+                    ? connectionsLoading
+                      ? 'Checking...'
+                      : connectionsError
+                        ? 'Unavailable'
+                        : isGmailConnected
+                          ? 'Connected'
+                          : 'Not connected'
+                    : 'Coming soon'}
                 </span>
 
               </div>
@@ -548,8 +588,8 @@ function Dashboard() {
       {/* Assistant Banner */}
       <section className="flex flex-col items-start gap-4 rounded-2xl border border-violet-500/20 bg-gradient-to-r from-violet-600/15 to-indigo-600/10 p-5 sm:flex-row sm:items-center sm:gap-5 sm:p-6">
 
-        <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-violet-500/20 text-2xl text-violet-400 sm:h-14 sm:w-14">
-          ✧
+        <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-violet-500/20 text-violet-400 sm:h-14 sm:w-14">
+          <AppIcon name="assistant" className="h-6 w-6" />
         </div>
 
         <div className="min-w-0 flex-1">

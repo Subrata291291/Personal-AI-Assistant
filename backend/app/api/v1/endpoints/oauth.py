@@ -14,7 +14,7 @@ from app.services.google_oauth_callback_service import (
     GoogleOAuthCallbackService,
 )
 from app.services.oauth_state_service import OAuthStateService
-
+from app.services.user_connection_service import UserConnectionService
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -29,7 +29,7 @@ def _frontend_connector_url(status_value: str) -> str:
         "google": status_value,
     })
 
-    return f"{frontend_url}/connectors?{query}"
+    return f"{frontend_url}/dashboard/connectors?{query}"
 
 
 @router.post("/google/connect")
@@ -170,3 +170,90 @@ async def google_callback(
             url=_frontend_connector_url("error"),
             status_code=status.HTTP_303_SEE_OTHER,
         )
+
+
+@router.get("/connections")
+def list_google_connections(
+    current_user: CurrentUser,
+    db: Session = Depends(get_db),
+):
+    """
+    List external account connections for the authenticated user.
+    """
+
+    try:
+        user_id = UUID(str(current_user["id"]))
+
+        service = UserConnectionService(db)
+
+        connections = service.list_connections(
+            user_id=user_id,
+        )
+
+        return {
+            "connections": connections,
+            "total": len(connections),
+        }
+
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unable to identify the authenticated user.",
+        ) from exc
+
+    except Exception as exc:
+        logger.exception("Unable to retrieve user connections.")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to retrieve connections.",
+        ) from exc
+
+
+@router.delete("/connections/{connection_id}")
+def disconnect_account(
+    connection_id: UUID,
+    current_user: CurrentUser,
+    db: Session = Depends(get_db),
+):
+    """
+    Disconnect an external account owned by the authenticated user.
+    """
+
+    try:
+        user_id = UUID(str(current_user["id"]))
+
+        service = UserConnectionService(db)
+
+        deleted = service.disconnect_account(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Connection not found.",
+            )
+
+        return {
+            "message": "Account disconnected successfully.",
+            "connection_id": str(connection_id),
+        }
+
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unable to identify the authenticated user.",
+        ) from exc
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception("Unable to disconnect account.")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to disconnect account.",
+        ) from exc

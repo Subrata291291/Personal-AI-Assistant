@@ -55,6 +55,13 @@ export const conversationService = {
     )
   },
 
+  async updateEmailDraft(conversationId, messageId, emailDraft) {
+    return api.patch(
+      `${BASE_PATH}/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/draft`,
+      { email_draft: emailDraft },
+    )
+  },
+
   // Create a user message directly.
   // Use this only when a standalone message insert is required.
   async createMessage(conversationId, content) {
@@ -65,12 +72,18 @@ export const conversationService = {
   },
 
   // Send a message through the LangGraph chat workflow.
-  async sendChatMessage(conversationId, content, idempotencyKey) {
+  async sendChatMessage(
+    conversationId,
+    content,
+    idempotencyKey,
+    gmailConnectionId = null,
+  ) {
     return api.post(
       CHAT_PATH,
       {
         conversation_id: conversationId,
         content,
+        gmail_connection_id: gmailConnectionId,
       },
       {
         'Idempotency-Key': idempotencyKey,

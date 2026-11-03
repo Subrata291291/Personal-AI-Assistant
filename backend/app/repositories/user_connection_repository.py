@@ -93,3 +93,36 @@ class UserConnectionRepository:
         )
 
         return self.db.scalar(statement)
+
+
+    def list_by_user(
+        self,
+        user_id: UUID,
+    ) -> list[UserConnection]:
+
+        statement = (
+            select(UserConnection)
+            .where(UserConnection.user_id == user_id)
+            .order_by(UserConnection.created_at.desc())
+        )
+
+        return list(self.db.scalars(statement).all())
+
+    def delete_by_id(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> bool:
+
+        connection = self.get_by_id(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+
+        if connection is None:
+            return False
+
+        self.db.delete(connection)
+        self.db.flush()
+
+        return True
