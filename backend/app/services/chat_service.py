@@ -134,6 +134,20 @@ class ChatService:
                 }
         return None
 
+    @staticmethod
+    def _has_available_email_draft(
+        history: list[dict[str, Any]],
+    ) -> bool:
+        return any(
+            message.get("role") == "assistant"
+            and isinstance(message.get("metadata"), dict)
+            and isinstance(
+                message["metadata"].get("email_draft"),
+                dict,
+            )
+            for message in history
+        )
+
     def _get_completed_response(
         self,
         user_id: UUID,
@@ -552,6 +566,8 @@ class ChatService:
                 initial_state["available_gmail_sources"] = (
                     available_gmail_sources
                 )
+            if self._has_available_email_draft(history):
+                initial_state["available_email_draft"] = True
 
             thread_config = {
                 "configurable": {

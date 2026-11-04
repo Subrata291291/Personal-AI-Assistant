@@ -43,10 +43,12 @@ function Assistant() {
   const [optimisticMessages, setOptimisticMessages] = useState([])
 
   const [error, setError] = useState('')
+  const [gmailSendNotice, setGmailSendNotice] = useState('')
   const [providerInfo, setProviderInfo] = useState(null)
 
   const messagesEndRef = useRef(null)
   const pendingRequestRef = useRef(null)
+  const notifiedSendProposalRef = useRef(null)
   const sendingRef = useRef(false)
 
   const hasRestoredRef = useRef(false)
@@ -221,6 +223,41 @@ function Assistant() {
       })
     })
   }, [])
+
+  function updateApprovalMessage(item, updatedMessage) {
+    queryClient.setQueryData(
+      [
+        'conversation-messages',
+        userId,
+        item.conversation_id,
+      ],
+      (current = []) => current.map((currentMessage) =>
+        currentMessage.id === updatedMessage.id
+          ? updatedMessage
+          : currentMessage,
+      ),
+    )
+    const proposal = updatedMessage.metadata?.action_approval
+    if (
+      proposal?.action_type === 'gmail.send' &&
+      proposal.status === 'completed' &&
+      notifiedSendProposalRef.current !== proposal.proposal_id
+    ) {
+      notifiedSendProposalRef.current = proposal.proposal_id
+      setGmailSendNotice('Email sent successfully.')
+      for (const folder of ['sent', 'all']) {
+        queryClient.invalidateQueries({
+          queryKey: [
+            'gmail-messages',
+            userId,
+            proposal.connection_id,
+            folder,
+          ],
+          refetchType: 'all',
+        })
+      }
+    }
+  }
 
   useEffect(() => {
     if (messages.length > 0) {
@@ -648,21 +685,9 @@ function Assistant() {
                       <ActionApprovalCard
                         message={item}
                         isDark={isDark}
-                        onUpdated={(updatedMessage) => {
-                          queryClient.setQueryData(
-                            [
-                              'conversation-messages',
-                              userId,
-                              item.conversation_id,
-                            ],
-                            (current = []) =>
-                              current.map((currentMessage) =>
-                                currentMessage.id === updatedMessage.id
-                                  ? updatedMessage
-                                  : currentMessage,
-                              ),
-                          )
-                        }}
+                        onUpdated={(updatedMessage) =>
+                          updateApprovalMessage(item, updatedMessage)
+                        }
                       />
                     )}
                 </div>
@@ -691,6 +716,14 @@ function Assistant() {
             <p className="mt-1 text-xs">
               Your message is still in the input. You can retry it.
             </p>
+          </div>
+        )}
+        {gmailSendNotice && (
+          <div
+            role="status"
+            className="mx-4 mb-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-500 sm:mx-5"
+          >
+            {gmailSendNotice}
           </div>
         )}
 

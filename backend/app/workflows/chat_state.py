@@ -44,6 +44,8 @@ class ChatState(TypedDict):
 
     available_gmail_sources: NotRequired[dict[str, Any]]
 
+    available_email_draft: NotRequired[bool]
+
     gmail_sources: NotRequired[dict[str, Any]]
 
     email_draft: NotRequired[dict[str, Any]]

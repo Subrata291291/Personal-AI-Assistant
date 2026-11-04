@@ -17,8 +17,15 @@ vi.mock('../services/conversationService.js', () => ({
   },
 }))
 
+vi.mock('../services/actionApprovalService.js', () => ({
+  actionApprovalService: {
+    createProposal: vi.fn(),
+  },
+}))
+
 import EmailDraftCard from './EmailDraftCard.jsx'
 import { conversationService } from '../services/conversationService.js'
+import { actionApprovalService } from '../services/actionApprovalService.js'
 
 const operationId = 'c5b40d3a-68b7-4e16-bc56-0f38c2ea58b9'
 const originalDraft = {
@@ -126,6 +133,7 @@ describe('EmailDraftCard Gmail save', () => {
     await waitFor(() => {
       expect(conversationService.saveEmailDraftToGmail).toHaveBeenCalledTimes(1)
     })
+
     expect(conversationService.saveEmailDraftToGmail).toHaveBeenCalledWith(
       'conversation-1',
       'message-1',
@@ -286,5 +294,76 @@ describe('EmailDraftCard Gmail save', () => {
         operationId,
       )
     })
+  })
+
+  it('creates an approved gmail.send proposal without sending directly', async () => {
+    const proposal = {
+      proposal_id: 'proposal-1',
+      action_type: 'gmail.send',
+      status: 'pending',
+      parameters: {
+        to: ['subrata291291@gmail.com'],
+        cc: [],
+        bcc: [],
+        subject: 'Initial subject',
+        body: 'Initial body',
+      },
+    }
+    actionApprovalService.createProposal.mockResolvedValue({ proposal })
+    const onUpdated = vi.fn()
+    render(
+      <QueryClientProvider client={new QueryClient({
+        defaultOptions: { mutations: { retry: false } },
+      })}>
+        <MemoryRouter>
+          <EmailDraftCard
+            message={createMessage()}
+            isDark={false}
+            connectionId="connection-1"
+            onUpdated={onUpdated}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send Email' }))
+
+    await waitFor(() => {
+      expect(actionApprovalService.createProposal).toHaveBeenCalledWith({
+        conversation_id: 'conversation-1',
+        source_message_id: 'message-1',
+        connection_id: 'connection-1',
+        action_type: 'gmail.send',
+        parameters: {
+          to: ['subrata291291@gmail.com'],
+          cc: [],
+          bcc: [],
+          subject: 'Initial subject',
+          body: 'Initial body',
+        },
+      })
+    })
+    expect(onUpdated).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        action_approval: proposal,
+      }),
+    }))
+    expect(await screen.findByText(
+      'Review the proposal below, then approve and explicitly execute the send.',
+    )).toBeInTheDocument()
+  })
+
+  it('requires a valid To recipient before creating a send proposal', async () => {
+    renderCard()
+
+    fireEvent.change(screen.getByLabelText('To'), {
+      target: { value: 'not-an-email' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send Email' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Check the email addresses before sending.',
+    )
+    expect(actionApprovalService.createProposal).not.toHaveBeenCalled()
   })
 })

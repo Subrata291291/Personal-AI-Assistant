@@ -3,6 +3,10 @@ import { useMutation } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 
 import { conversationService } from '../services/conversationService.js'
+import { actionApprovalService } from '../services/actionApprovalService.js'
+
+const EMAIL_ADDRESS_PATTERN =
+  /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
 function normalizeRecipient(recipient) {
   if (typeof recipient === 'string') {
@@ -123,6 +127,7 @@ function EmailDraftCard({
   const [draft, setDraft] = useState(initialDraft)
   const [error, setError] = useState('')
   const [saveNotice, setSaveNotice] = useState('')
+  const [sendNotice, setSendNotice] = useState('')
   const [saveBlockedLocally, setSaveBlockedLocally] = useState(false)
   const [metadataWarning, setMetadataWarning] = useState(
     malformedDraft(rawDraft)
@@ -131,6 +136,7 @@ function EmailDraftCard({
   )
   const requestInProgress = useRef(false)
   const gmailSaveInProgress = useRef(false)
+  const sendProposalInProgress = useRef(false)
   const [saveOperationId, setSaveOperationId] = useState(null)
   const autoRecoveryKey = useRef('')
 
@@ -280,6 +286,7 @@ function EmailDraftCard({
           gmail_draft_save: next,
         },
       })
+
     },
     onError: (statusError) => {
       const detail =
@@ -305,6 +312,65 @@ function EmailDraftCard({
           ? statusError.message
           : 'Gmail could not inspect the save operation. Its outcome remains uncertain; do not retry.',
       )
+    },
+  })
+  const sendProposalMutation = useMutation({
+    mutationFn: () => {
+      const recipients = {}
+      for (const field of ['to', 'cc', 'bcc']) {
+        recipients[field] = draft[field].map((recipient) =>
+          normalizeRecipient(recipient)?.email,
+        ).filter(Boolean)
+      }
+      const allRecipients = [
+        ...recipients.to,
+        ...recipients.cc,
+        ...recipients.bcc,
+      ]
+      if (!recipients.to.length) {
+        throw new Error('Add at least one recipient in To before sending.')
+      }
+      if (allRecipients.some((address) => !EMAIL_ADDRESS_PATTERN.test(address))) {
+        throw new Error('Check the email addresses before sending.')
+      }
+      if (new Set(allRecipients.map((address) => address.toLowerCase())).size !==
+        allRecipients.length) {
+        throw new Error('A recipient cannot appear more than once.')
+      }
+      if (!draft.subject.trim() || !draft.body.trim()) {
+        throw new Error('Add a subject and message before sending.')
+      }
+
+      return actionApprovalService.createProposal({
+        conversation_id: message.conversation_id,
+        source_message_id: message.id,
+        connection_id: connectionId,
+        action_type: 'gmail.send',
+        parameters: {
+          ...recipients,
+          subject: draft.subject,
+          body: draft.body,
+        },
+      })
+    },
+    onSuccess: (response) => {
+      sendProposalInProgress.current = false
+      setSendNotice(
+        'Review the proposal below, then approve and explicitly execute the send.',
+      )
+      setError('')
+      onUpdated({
+        ...message,
+        metadata: {
+          ...message.metadata,
+          email_draft: draftCopy(draft),
+          action_approval: response.proposal,
+        },
+      })
+    },
+    onError: (sendError) => {
+      sendProposalInProgress.current = false
+      setError(sendError?.message || 'Unable to prepare the Gmail send approval.')
     },
   })
   const checkSaveStatus = saveStatusMutation.mutate
@@ -424,6 +490,25 @@ function EmailDraftCard({
     })
   }
 
+  function requestSendApproval() {
+    const activeProposal = metadata.action_approval
+    if (
+      !connectionId ||
+      sendProposalInProgress.current ||
+      sendProposalMutation.isPending ||
+      (
+        activeProposal &&
+        !['rejected', 'expired', 'failed'].includes(activeProposal.status)
+      )
+    ) {
+      return
+    }
+    sendProposalInProgress.current = true
+    setError('')
+    setSendNotice('')
+    sendProposalMutation.mutate()
+  }
+
   const draftTypeLabel = {
     new: 'New email',
     reply: 'Reply',
@@ -533,6 +618,11 @@ function EmailDraftCard({
             }`}
           >
             {saveNotice}
+          </p>
+        )}
+        {sendNotice && (
+          <p role="status" className="text-xs text-emerald-500">
+            {sendNotice}
           </p>
         )}
         {saveRecord.state === 'saved' && saveRecord.saved_result?.draft_id && (
@@ -666,6 +756,29 @@ function EmailDraftCard({
                     : currentIsSaved
                       ? 'Saved to Gmail Drafts'
                       : 'Save to Gmail Drafts'}
+              </button>
+            )}
+            {connectionId && (
+              <button
+                type="button"
+                onClick={requestSendApproval}
+                disabled={
+                  disabled ||
+                  sendProposalMutation.isPending ||
+                  Boolean(
+                    metadata.action_approval &&
+                    !['rejected', 'expired', 'failed'].includes(
+                      metadata.action_approval.status,
+                    ),
+                  )
+                }
+                className="rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {sendProposalMutation.isPending
+                  ? 'Preparing approval...'
+                  : metadata.action_approval?.status === 'completed'
+                    ? 'Email sent'
+                    : 'Send Email'}
               </button>
             )}
           </div>

@@ -241,7 +241,7 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
             The send was claimed. If the worker was interrupted, recovery will mark it uncertain; it will not be sent again automatically.
           </p>
         )}
-        {visibleStatus === 'executing' && (
+        {['executing', 'execution_uncertain'].includes(visibleStatus) && (
           <div className="flex justify-end">
             <button
               type="button"

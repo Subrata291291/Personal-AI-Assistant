@@ -11,6 +11,8 @@ from pydantic import (
     model_validator,
 )
 
+from app.schemas.email_draft import normalize_email_address
+
 
 class GmailPlanBase(BaseModel):
     model_config = ConfigDict(
@@ -56,8 +58,16 @@ class ApprovalWorkflowPlan(GmailPlanBase):
 
 
 class DraftEmailPlan(GmailPlanBase):
-    intent: Literal["draft_email"]
-    draft_type: Literal["new", "reply", "reply_all", "forward"]
+    intent: Literal[
+        "draft_email",
+        "gmail_compose",
+        "gmail_save_draft",
+        "gmail_send",
+        "gmail_reply",
+        "gmail_reply_all",
+        "gmail_forward",
+    ]
+    draft_type: Literal["new", "reply", "reply_all", "forward"] = "new"
     source_message_id: str | None = Field(
         default=None,
         min_length=1,
@@ -70,10 +80,59 @@ class DraftEmailPlan(GmailPlanBase):
         max_length=255,
         pattern=r"^[A-Za-z0-9_-]+$",
     )
+    to: list[str] = Field(default_factory=list, max_length=20)
+    cc: list[str] = Field(default_factory=list, max_length=20)
+    bcc: list[str] = Field(default_factory=list, max_length=20)
+    subject: str | None = Field(default=None, max_length=500)
+    purpose: str | None = Field(default=None, max_length=2000)
+    content_requirements: list[str] = Field(default_factory=list, max_length=20)
+    tone: str | None = Field(default=None, max_length=100)
+    requested_action: Literal["compose", "save_draft", "send"] = "compose"
+
+    @field_validator("to", "cc", "bcc")
+    @classmethod
+    def validate_recipients(cls, value: list[str]) -> list[str]:
+        normalized = [normalize_email_address(address) for address in value]
+        if any(address is None for address in normalized):
+            raise ValueError("A compose recipient email address is invalid.")
+        return [address for address in normalized if address is not None]
+
+
+class GmailReadPlan(GmailPlanBase):
+    intent: Literal["gmail_read"]
+    message_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    thread_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+
+    @model_validator(mode="after")
+    def require_one_source(self) -> "GmailReadPlan":
+        if bool(self.message_id) == bool(self.thread_id):
+            raise ValueError("Provide exactly one Gmail message or thread ID.")
+        return self
+
+
+class GmailUnavailableActionPlan(GmailPlanBase):
+    intent: Literal["gmail_archive", "gmail_delete"]
+    message_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    query: str | None = Field(default=None, min_length=1, max_length=500)
 
 
 class SearchEmailsPlan(GmailPlanBase):
-    intent: Literal["search_emails"]
+    intent: Literal["search_emails", "gmail_search"]
     query: str | None = Field(default=None, min_length=1, max_length=500)
     sender: str | None = Field(default=None, min_length=1, max_length=320)
     subject: str | None = Field(default=None, min_length=1, max_length=200)
@@ -221,6 +280,8 @@ AssistantIntent: TypeAlias = Annotated[
     | MeetingDiscoveryPlan
     | ApprovalWorkflowPlan
     | DraftEmailPlan
+    | GmailReadPlan
+    | GmailUnavailableActionPlan
     | SearchEmailsPlan
     | SummarizeImportantPlan
     | SummarizeUrgentPlan
