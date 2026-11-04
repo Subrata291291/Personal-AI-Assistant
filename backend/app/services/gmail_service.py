@@ -1,6 +1,8 @@
 import json
 import re
+import asyncio
 from email.utils import getaddresses
+from email.utils import formataddr
 from typing import Any
 from uuid import UUID
 
@@ -9,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.integrations.google.api_client import GoogleAPIClient
 from app.integrations.google.email_parser import GmailEmailParser
+from app.integrations.google.exceptions import GoogleAPIError
 from app.repositories.oauth_credential_repository import (
     OAuthCredentialRepository,
 )
@@ -21,6 +24,7 @@ from app.repositories.user_connection_repository import (
 from app.integrations.google.attachment_handler import (
     GmailAttachmentHandler,
 )
+from app.schemas.email_draft import EmailDraftPreview
 
 class GmailService:
     """
@@ -45,6 +49,7 @@ class GmailService:
     REQUIRED_PERMANENT_DELETE_SCOPE = "https://mail.google.com/"
 
     MAX_LIST_RESULTS = 50
+    MAX_CONCURRENT_READS = 5
     MAX_THREAD_MESSAGES = 10
     MAX_THREAD_RESPONSE_BYTES = 2_000_000
     MAX_THREAD_BODY_CHARS = 3_000
@@ -109,6 +114,7 @@ class GmailService:
         connection_id: UUID,
         endpoint: str,
         params: dict[str, Any] | None = None,
+        http_client: Any | None = None,
     ) -> dict[str, Any]:
 
         # A dedicated session isolates OAuth token commits.
@@ -122,6 +128,7 @@ class GmailService:
                 method="GET",
                 url=f"{self.GMAIL_API_BASE}/{endpoint}",
                 params=params,
+                http_client=http_client,
             )
         finally:
             api_db.close()
@@ -225,35 +232,37 @@ class GmailService:
         )
 
         messages = result.get("messages", [])
-        summaries = []
+        semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_READS)
 
-        # Gmail messages.list returns IDs, not full email metadata.
-        for item in messages:
+        async def fetch_metadata(
+            item: dict[str, Any],
+            http_client: Any,
+        ) -> dict[str, Any] | None:
             message_id = item.get("id")
-
             if not message_id:
-                continue
+                return None
 
-            metadata = await self._google_get(
-                user_id=user_id,
-                connection_id=connection_id,
-                endpoint=f"messages/{message_id}",
-                params={
-                    "format": "metadata",
-                    "metadataHeaders": [
-                        "From",
-                        "To",
-                        "Subject",
-                        "Date",
-                    ],
-                },
-            )
+            async with semaphore:
+                metadata = await self._google_get(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    endpoint=f"messages/{message_id}",
+                    params={
+                        "format": "metadata",
+                        "metadataHeaders": [
+                            "From",
+                            "To",
+                            "Subject",
+                            "Date",
+                        ],
+                    },
+                    http_client=http_client,
+                )
 
             headers = GmailEmailParser.extract_headers(
                 metadata.get("payload", {})
             )
-
-            summaries.append({
+            return {
                 "id": metadata.get("id"),
                 "thread_id": metadata.get("threadId"),
                 "snippet": metadata.get("snippet", ""),
@@ -262,7 +271,17 @@ class GmailService:
                 "subject": headers.get("subject"),
                 "date": headers.get("date"),
                 "labels": metadata.get("labelIds", []),
-            })
+            }
+
+        async with self.api_client.session() as http_client:
+            fetched = await asyncio.gather(
+                *(
+                    fetch_metadata(item, http_client)
+                    for item in messages
+                    if isinstance(item, dict)
+                )
+            )
+        summaries = [item for item in fetched if item is not None]
 
         return {
             "messages": summaries,
@@ -278,6 +297,9 @@ class GmailService:
         user_id: UUID,
         connection_id: UUID,
         message_id: str,
+        http_client: Any | None = None,
+        include_html: bool = True,
+        max_body_chars: int | None = None,
     ) -> dict[str, Any]:
 
         if not isinstance(message_id, str) or not re.fullmatch(
@@ -287,6 +309,62 @@ class GmailService:
             raise ValueError("Invalid Gmail message ID.")
 
         self._validate_connection(user_id, connection_id)
+        return await self._get_message(
+            user_id,
+            connection_id,
+            message_id,
+            http_client,
+            include_html,
+            max_body_chars,
+        )
+
+    async def get_messages_for_summary(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        message_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        if len(message_ids) > 10:
+            raise ValueError("At most 10 messages can be summarized at once.")
+        if not message_ids:
+            return []
+
+        self._validate_connection(user_id, connection_id)
+        semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_READS)
+
+        async def fetch(message_id: str, http_client: Any):
+            async with semaphore:
+                return await self._get_message(
+                    user_id,
+                    connection_id,
+                    message_id,
+                    http_client,
+                    include_html=False,
+                    max_body_chars=self.MAX_THREAD_BODY_CHARS,
+                )
+
+        async with self.api_client.session() as http_client:
+            return await asyncio.gather(
+                *(
+                    fetch(message_id, http_client)
+                    for message_id in message_ids
+                )
+            )
+
+    async def _get_message(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        message_id: str,
+        http_client: Any | None,
+        include_html: bool,
+        max_body_chars: int | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(message_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]+",
+            message_id,
+        ):
+            raise ValueError("Invalid Gmail message ID.")
 
         result = await self._google_get(
             user_id=user_id,
@@ -295,9 +373,14 @@ class GmailService:
             params={
                 "format": "full",
             },
+            http_client=http_client,
         )
 
-        return GmailEmailParser.parse_message(result)
+        return GmailEmailParser.parse_message(
+            result,
+            include_html=include_html,
+            max_body_chars=max_body_chars,
+        )
 
     async def get_thread(
         self,
@@ -305,6 +388,7 @@ class GmailService:
         connection_id: UUID,
         thread_id: str,
         max_messages: int = 10,
+        include_html: bool = True,
     ) -> dict[str, Any]:
         if not isinstance(thread_id, str) or not re.fullmatch(
             r"[A-Za-z0-9_-]{1,255}",
@@ -351,7 +435,11 @@ class GmailService:
         for raw_message in raw_messages[:max_messages]:
             if not isinstance(raw_message, dict):
                 continue
-            message = GmailEmailParser.parse_message(raw_message)
+            message = GmailEmailParser.parse_message(
+                raw_message,
+                include_html=include_html,
+                max_body_chars=self.MAX_THREAD_BODY_CHARS,
+            )
             body = message.get("body", {})
             for body_key in ("plain_text", "html"):
                 value = body.get(body_key)
@@ -469,6 +557,220 @@ class GmailService:
             "label_ids": result.get("labelIds", []),
             "status": "sent",
         }
+
+    def validate_draft_access(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> Any:
+        return self._validate_connection(
+            user_id=user_id,
+            connection_id=connection_id,
+            required_scope=self.REQUIRED_MODIFY_SCOPE,
+        )
+
+    async def create_draft(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        draft: EmailDraftPreview,
+        operation_id: UUID,
+    ) -> dict[str, Any]:
+        self._validate_connection(
+            user_id=user_id,
+            connection_id=connection_id,
+            required_scope=self.REQUIRED_MODIFY_SCOPE,
+        )
+
+        in_reply_to = None
+        references = None
+        thread_id = None
+        if draft.draft_type != "new":
+            source_message: dict[str, Any] | None = None
+            if draft.source_message_id:
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,255}", draft.source_message_id):
+                    raise ValueError("Invalid source Gmail message ID.")
+                raw_message = await self._google_get(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    endpoint=f"messages/{draft.source_message_id}",
+                    params={"format": "full"},
+                )
+                source_message = GmailEmailParser.parse_message(raw_message)
+            elif draft.source_thread_id:
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,255}", draft.source_thread_id):
+                    raise ValueError("Invalid source Gmail thread ID.")
+                raw_thread = await self._google_get(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    endpoint=f"threads/{draft.source_thread_id}",
+                    params={"format": "full"},
+                )
+                thread_messages = raw_thread.get("messages", [])
+                if not isinstance(thread_messages, list) or not thread_messages:
+                    raise ValueError("Source Gmail thread was not found.")
+                source_message = GmailEmailParser.parse_message(
+                    thread_messages[-1]
+                )
+
+            if source_message is None:
+                raise ValueError(
+                    "Reply and forward drafts require a source Gmail message."
+                )
+
+            actual_thread_id = source_message.get("thread_id")
+            if (
+                draft.source_thread_id
+                and actual_thread_id != draft.source_thread_id
+            ):
+                raise ValueError(
+                    "Source email does not belong to the selected Gmail thread."
+                )
+
+            if draft.draft_type in {"reply", "reply_all"}:
+                headers = source_message.get("headers", {})
+                in_reply_to = headers.get("message-id")
+                if not in_reply_to:
+                    raise ValueError(
+                        "Source email does not contain a replyable Message-ID."
+                    )
+                reference_values = [
+                    item
+                    for item in (headers.get("references") or "").split()
+                    if item
+                ]
+                if in_reply_to not in reference_values:
+                    reference_values.append(in_reply_to)
+                references = " ".join(reference_values)
+                thread_id = actual_thread_id
+
+        raw_message = GmailMessageBuilder.build(
+            to=[
+                formataddr((recipient.name or "", recipient.email))
+                for recipient in draft.to
+            ],
+            cc=[
+                formataddr((recipient.name or "", recipient.email))
+                for recipient in draft.cc
+            ],
+            bcc=[
+                formataddr((recipient.name or "", recipient.email))
+                for recipient in draft.bcc
+            ],
+            subject=draft.subject,
+            body=draft.body,
+            in_reply_to=in_reply_to,
+            references=references,
+            require_recipient=False,
+            draft_operation_id=str(operation_id),
+        )
+        message_payload: dict[str, str] = {"raw": raw_message}
+        if thread_id:
+            message_payload["threadId"] = thread_id
+
+        try:
+            result = await self._google_post(
+                user_id=user_id,
+                connection_id=connection_id,
+                endpoint="drafts",
+                json_data={"message": message_payload},
+            )
+        except GoogleAPIError as exc:
+            if 200 <= exc.status_code < 300:
+                raise GoogleAPIError(
+                    status_code=502,
+                    message=(
+                        "Gmail may have created the draft, but its response "
+                        "could not be confirmed."
+                    ),
+                    retryable=False,
+                ) from exc
+            raise
+        message_result = result.get("message") or {}
+        draft_id = result.get("id")
+        if not isinstance(draft_id, str) or not draft_id:
+            raise GoogleAPIError(
+                status_code=502,
+                message="Gmail did not confirm the created draft ID.",
+                retryable=False,
+            )
+
+        return {
+            "draft_id": draft_id,
+            "message_id": message_result.get("id"),
+            "thread_id": message_result.get("threadId") or thread_id,
+        }
+
+    async def find_draft_by_operation_id(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        operation_id: UUID,
+    ) -> dict[str, Any]:
+        self._validate_connection(
+            user_id=user_id,
+            connection_id=connection_id,
+            required_scope=self.REQUIRED_MODIFY_SCOPE,
+        )
+        page_token: str | None = None
+        pages_scanned = 0
+        while pages_scanned < 5:
+            params: dict[str, Any] = {"maxResults": 100}
+            if page_token:
+                params["pageToken"] = page_token
+            page = await self._google_get(
+                user_id=user_id,
+                connection_id=connection_id,
+                endpoint="drafts",
+                params=params,
+            )
+            pages_scanned += 1
+            drafts = page.get("drafts", [])
+            if not isinstance(drafts, list):
+                raise ValueError("Gmail returned an invalid draft list.")
+            for item in drafts:
+                if not isinstance(item, dict):
+                    continue
+                draft_id = item.get("id")
+                if not isinstance(draft_id, str) or not re.fullmatch(
+                    r"[A-Za-z0-9_-]{1,255}",
+                    draft_id,
+                ):
+                    continue
+                details = await self._google_get(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    endpoint=f"drafts/{draft_id}",
+                    params={"format": "full"},
+                )
+                message = details.get("message") or {}
+                payload = message.get("payload") or {}
+                headers = payload.get("headers") or []
+                if not isinstance(headers, list):
+                    continue
+                operation_matches = any(
+                    isinstance(header, dict)
+                    and str(header.get("name", "")).casefold()
+                    == "x-personal-ai-draft-operation-id"
+                    and header.get("value") == str(operation_id)
+                    for header in headers
+                )
+                if operation_matches:
+                    return {
+                        "draft": {
+                            "draft_id": draft_id,
+                            "message_id": message.get("id"),
+                            "thread_id": message.get("threadId"),
+                        },
+                        "complete_scan": True,
+                    }
+            page_token = page.get("nextPageToken")
+            if page_token is not None and not isinstance(page_token, str):
+                raise ValueError("Gmail returned an invalid draft page token.")
+            if not page_token:
+                return {"complete_scan": True, "draft": None}
+
+        return {"complete_scan": False, "draft": None}
 
     async def trash_message(
         self,

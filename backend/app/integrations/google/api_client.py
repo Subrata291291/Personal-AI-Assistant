@@ -1,4 +1,7 @@
 import asyncio
+import logging
+from contextlib import asynccontextmanager
+from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -7,8 +10,12 @@ import httpx
 from sqlalchemy import exc
 from sqlalchemy.orm import Session
 
+from app.core.request_metrics import record_timing, request_id
 from app.integrations.google.exceptions import GoogleAPIError
 from app.services.oauth_credential_service import OAuthCredentialService
+
+
+logger = logging.getLogger(__name__)
 
 
 class GoogleAPIClient:
@@ -42,6 +49,25 @@ class GoogleAPIClient:
 
     def __init__(self):
         self.timeout = self.REQUEST_TIMEOUT
+
+    @asynccontextmanager
+    async def session(self):
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            follow_redirects=False,
+        ) as client:
+            yield client
+
+    @asynccontextmanager
+    async def _client_context(self, client: httpx.AsyncClient | None):
+        if client is not None:
+            yield client
+            return
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            follow_redirects=False,
+        ) as owned_client:
+            yield owned_client
 
     def _validate_url(self, url: str) -> None:
 
@@ -78,13 +104,31 @@ class GoogleAPIClient:
         for attempt in range(self.MAX_RETRIES + 1):
 
             try:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    json=json_data,
-                )
+                started_at = perf_counter()
+                response = None
+                try:
+                    response = await client.request(
+                        method=method,
+                        url=url,
+                        headers=headers,
+                        params=params,
+                        json=json_data,
+                    )
+                finally:
+                    duration_ms = (perf_counter() - started_at) * 1000
+                    record_timing("gmail_api", duration_ms)
+                    logger.info(
+                        "google_api_request_completed | request_id=%s "
+                        "| method=%s | duration_ms=%.2f | status=%s",
+                        request_id(),
+                        method,
+                        duration_ms,
+                        (
+                            response.status_code
+                            if response is not None
+                            else "network_error"
+                        ),
+                    )
 
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
 
@@ -170,6 +214,7 @@ class GoogleAPIClient:
         url: str,
         params: dict[str, Any] | None = None,
         json_data: dict[str, Any] | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
 
         self._validate_url(url)
@@ -205,10 +250,7 @@ class GoogleAPIClient:
             "Accept": "application/json",
         }
 
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            follow_redirects=False,
-        ) as client:
+        async with self._client_context(http_client) as client:
 
             try:
                 # Step 2: Execute the original request.

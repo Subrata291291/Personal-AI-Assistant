@@ -150,6 +150,17 @@ export function AuthProvider({ children }) {
     return data.user
   }
 
+  async function updateUserMetadata(metadata) {
+    const { data, error } = await supabase.auth.updateUser({
+      data: metadata,
+    })
+
+    if (error) throw error
+
+    setUser(data.user)
+    return data.user
+  }
+
   async function updatePassword(password) {
     const { data, error } = await supabase.auth.updateUser({
       password,
@@ -171,6 +182,7 @@ export function AuthProvider({ children }) {
     signIn,
     signOut,
     updateProfile,
+    updateUserMetadata,
     updatePassword,
     isEmailVerified,
     isAuthenticated: Boolean(user && isEmailVerified),

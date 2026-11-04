@@ -1,11 +1,13 @@
 
 from collections.abc import Generator
+from time import perf_counter
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
+from app.core.request_metrics import record_timing
 
 
 def build_database_url():
@@ -44,6 +46,32 @@ engine = create_engine(
     pool_recycle=1800,
     echo=False,
 )
+
+
+@event.listens_for(engine, "before_cursor_execute")
+def _start_query_timer(
+    _conn,
+    _cursor,
+    _statement,
+    _parameters,
+    context,
+    _executemany,
+):
+    context._assistant_query_started_at = perf_counter()
+
+
+@event.listens_for(engine, "after_cursor_execute")
+def _record_query_duration(
+    _conn,
+    _cursor,
+    _statement,
+    _parameters,
+    context,
+    _executemany,
+):
+    started_at = getattr(context, "_assistant_query_started_at", None)
+    if started_at is not None:
+        record_timing("database", (perf_counter() - started_at) * 1000)
 
 
 # ==========================================

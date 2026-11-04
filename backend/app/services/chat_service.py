@@ -5,6 +5,8 @@ import re
 from threading import Event, Thread
 from typing import Any
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
+from app.core.error_logging import log_exception_traceback
 from app.memory.memory_pipeline import MemoryPipeline
 from app.services.user_settings_service import UserSettingsService
 import logging
@@ -57,6 +59,7 @@ class ChatService:
         conversation_id: UUID,
         content: str,
         gmail_connection_id: UUID | None = None,
+        user_timezone: str = "UTC",
     ) -> str:
         """Generate a deterministic SHA-256 fingerprint."""
 
@@ -64,6 +67,8 @@ class ChatService:
             "conversation_id": str(conversation_id),
             "content": content.strip(),
         }
+        if user_timezone != "UTC":
+            payload["user_timezone"] = user_timezone
         if gmail_connection_id is not None:
             payload["gmail_connection_id"] = str(gmail_connection_id)
 
@@ -120,6 +125,7 @@ class ChatService:
                     "recipient": str(source.get("recipient") or "")[:500],
                     "cc": str(source.get("cc") or "")[:500],
                     "subject": str(source.get("subject") or "")[:500],
+                    "date": str(source.get("date") or "")[:100],
                 })
             if safe_messages:
                 return {
@@ -338,6 +344,7 @@ class ChatService:
         content: str,
         idempotency_key: UUID,
         gmail_connection_id: UUID | None = None,
+        user_timezone: str = "UTC",
     ) -> dict[str, Any]:
         """Process an idempotent chat request using LangGraph."""
 
@@ -345,6 +352,10 @@ class ChatService:
             raise ValueError("Message content cannot be empty.")
 
         normalized_content = content.strip()
+        try:
+            ZoneInfo(user_timezone)
+        except (ValueError, KeyError) as exc:
+            raise ValueError("A valid IANA timezone is required.") from exc
 
         # 1. Verify conversation ownership.
         if not self.message_service.verify_conversation_ownership(
@@ -358,6 +369,7 @@ class ChatService:
             conversation_id=conversation_id,
             content=normalized_content,
             gmail_connection_id=gmail_connection_id,
+            user_timezone=user_timezone,
         )
 
         # 3. Create or retrieve the idempotent request.
@@ -534,6 +546,7 @@ class ChatService:
                 "provider": "",
                 "model": "",
                 "messages": previous_messages,
+                "user_timezone": user_timezone,
             }
             if available_gmail_sources:
                 initial_state["available_gmail_sources"] = (
@@ -570,6 +583,7 @@ class ChatService:
                             if gmail_connection_id
                             else None
                         ),
+                        "user_timezone": user_timezone,
                     },
                 )
             finally:
@@ -633,9 +647,17 @@ class ChatService:
                         assistant_metadata["email_draft"] = (
                             result["email_draft"]
                         )
+                    if result.get("email_draft_connection_id"):
+                        assistant_metadata["email_draft_connection_id"] = (
+                            result["email_draft_connection_id"]
+                        )
                     if result.get("gmail_sources"):
                         assistant_metadata["gmail_sources"] = (
                             result["gmail_sources"]
+                        )
+                    if result.get("response_metadata"):
+                        assistant_metadata["response_completion"] = (
+                            result["response_metadata"]
                         )
                     assistant_message = (
                         self.message_service.create_request_message(
@@ -692,12 +714,19 @@ class ChatService:
 
         except Exception:
             # Only the active worker can mark the request failed.
-            self.request_repository.update_status(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                idempotency_key=idempotency_key,
-                worker_id=worker_id,
-                status="failed",
-                error_message="Chat execution failed.",
-            )
+            try:
+                self.request_repository.update_status(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    idempotency_key=idempotency_key,
+                    worker_id=worker_id,
+                    status="failed",
+                    error_message="Chat execution failed.",
+                )
+            except Exception as exc:
+                log_exception_traceback(
+                    logger,
+                    "Could not persist the failed chat request status.",
+                    exc,
+                )
             raise

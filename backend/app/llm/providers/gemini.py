@@ -6,7 +6,12 @@ from google.genai import types
 
 from app.core.config import settings
 from app.llm.providers.base import BaseLLMProvider
-from app.llm.schemas import LLMRequest, LLMResponse, LLMUsage
+from app.llm.schemas import (
+    LLMRequest,
+    LLMResponse,
+    LLMUsage,
+    provider_output_token_limit,
+)
 
 
 class GeminiProvider(BaseLLMProvider):
@@ -60,7 +65,10 @@ class GeminiProvider(BaseLLMProvider):
             contents=contents,
             config=types.GenerateContentConfig(
                 temperature=request.temperature,
-                max_output_tokens=request.max_tokens,
+                max_output_tokens=provider_output_token_limit(
+                    request.max_tokens,
+                    settings.GEMINI_MAX_OUTPUT_TOKENS,
+                ),
                 system_instruction=system_instruction,
             ),
         )

@@ -11,9 +11,11 @@ import { useOutletContext } from 'react-router-dom'
 import { api } from '../lib/api.js'
 import { gmailService } from '../services/gmailService.js'
 import { useAuth } from '../context/AuthContext'
+import { sanitizeEmailHtml } from '../utils/sanitizeEmailHtml.js'
 
 const CACHE_TIME = 5 * 60 * 1000
 const GC_TIME = 30 * 60 * 1000
+const EMPTY_CONNECTIONS = []
 
 const FOLDERS = [
   { id: 'inbox', label: 'Inbox', icon: '📥' },
@@ -112,6 +114,7 @@ export default function Gmail() {
 
   const [searchInput, setSearchInput] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
+  const searchTimerRef = useRef(null)
 
   const [selectedMessageId, setSelectedMessageId] = useState(null)
   const [composeMode, setComposeMode] = useState('compose')
@@ -132,6 +135,11 @@ export default function Gmail() {
   const [trashNotice, setTrashNotice] = useState(null)
   const [messageActionConfirmation, setMessageActionConfirmation] = useState(null)
   const trashRequestInFlight = useRef(false)
+
+  useEffect(
+    () => () => window.clearTimeout(searchTimerRef.current),
+    [],
+  )
 
   const colors = {
     card: isDark
@@ -171,20 +179,21 @@ export default function Gmail() {
 
   // Connected Google accounts
   const connectionsQuery = useQuery({
-    queryKey: ['gmail-connections', userId],
+    queryKey: ['oauth-connections', userId],
 
-    queryFn: () => gmailService.getConnections(),
+    queryFn: () => api.get('/api/v1/oauth/connections'),
 
     enabled: Boolean(userId),
 
     staleTime: CACHE_TIME,
     gcTime: GC_TIME,
 
-    refetchOnMount: false,
-    refetchOnWindowFocus: false,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
   })
 
-  const connections = connectionsQuery.data || []
+  const connections =
+    connectionsQuery.data?.connections ?? EMPTY_CONNECTIONS
 
   const googleConnections = useMemo(
     () =>
@@ -614,8 +623,8 @@ export default function Gmail() {
     staleTime: CACHE_TIME,
     gcTime: GC_TIME,
 
-    refetchOnMount: false,
-    refetchOnWindowFocus: false,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
   })
 
   const messages = useMemo(
@@ -648,17 +657,28 @@ export default function Gmail() {
     staleTime: CACHE_TIME,
     gcTime: GC_TIME,
 
-    refetchOnMount: false,
-    refetchOnWindowFocus: false,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
   })
 
   function handleSearch(event) {
     event.preventDefault()
+    window.clearTimeout(searchTimerRef.current)
     setSearchQuery(searchInput.trim())
     setTrashNotice(null)
   }
 
+  function handleSearchInputChange(value) {
+    setSearchInput(value)
+    window.clearTimeout(searchTimerRef.current)
+    searchTimerRef.current = window.setTimeout(
+      () => setSearchQuery(value.trim()),
+      350,
+    )
+  }
+
   function clearSearch() {
+    window.clearTimeout(searchTimerRef.current)
     setSearchInput('')
     setSearchQuery('')
     setTrashNotice(null)
@@ -953,7 +973,7 @@ export default function Gmail() {
 
            <meta
              http-equiv="Content-Security-Policy"
-             content="default-src 'none'; img-src https: data: cid:; style-src 'unsafe-inline' https:; font-src https: data:; script-src 'none'; form-action 'none';"
+             content="default-src 'none'; img-src https: data: cid:; style-src 'unsafe-inline' https:; font-src https: data:; script-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';"
            />
 
            <meta
@@ -1018,7 +1038,7 @@ export default function Gmail() {
            </style>
          </head>
 
-         <body>${emailBody.html}</body>
+         <body>${sanitizeEmailHtml(emailBody.html)}</body>
        </html>`
     : ''
 
@@ -1275,7 +1295,7 @@ export default function Gmail() {
                 <input
                   value={searchInput}
                   onChange={(event) =>
-                    setSearchInput(event.target.value)
+                    handleSearchInputChange(event.target.value)
                   }
                   disabled={!connectionId}
                   placeholder={`Search in ${activeFolderInfo?.label || 'Gmail'}...`}
@@ -2142,7 +2162,7 @@ export default function Gmail() {
                     {showHtmlBody && hasHtml ? (
                       <iframe
                         title="Email HTML content"
-                        sandbox=""
+                        sandbox="allow-popups allow-popups-to-escape-sandbox"
                         referrerPolicy="no-referrer"
                         srcDoc={safeHtmlDocument}
                         className="h-[65vh] min-h-[350px] w-full border-0 bg-white"

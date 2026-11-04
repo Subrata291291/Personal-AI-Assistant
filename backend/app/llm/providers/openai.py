@@ -5,7 +5,12 @@ from openai import OpenAI
 
 from app.core.config import settings
 from app.llm.providers.base import BaseLLMProvider
-from app.llm.schemas import LLMRequest, LLMResponse, LLMUsage
+from app.llm.schemas import (
+    LLMRequest,
+    LLMResponse,
+    LLMUsage,
+    provider_output_token_limit,
+)
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -40,7 +45,10 @@ class OpenAIProvider(BaseLLMProvider):
                 for message in request.messages
             ],
             temperature=request.temperature,
-            max_tokens=request.max_tokens,
+            max_tokens=provider_output_token_limit(
+                request.max_tokens,
+                settings.OPENAI_MAX_OUTPUT_TOKENS,
+            ),
         )
 
         latency_ms = (time.perf_counter() - start_time) * 1000

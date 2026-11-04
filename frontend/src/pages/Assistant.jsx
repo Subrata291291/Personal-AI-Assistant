@@ -21,12 +21,11 @@ import {
 
 import { useAuth } from '../context/AuthContext'
 import EmailDraftCard from '../components/EmailDraftCard.jsx'
-import { gmailService } from '../services/gmailService.js'
+import ActionApprovalCard from '../components/ActionApprovalCard.jsx'
+import { resolveAssistantGmailConnection } from '../services/gmailAccountSelection.js'
 import { conversationService } from '../services/conversationService.js'
-
-function gmailSelectionStorageKey(userId) {
-  return `gmail-assistant-selected-account-${userId}`
-}
+import { api } from '../lib/api.js'
+import AssistantMarkdown from '../components/AssistantMarkdown.jsx'
 
 function Assistant() {
   const { user } = useAuth()
@@ -40,12 +39,6 @@ function Assistant() {
   const queryClient = useQueryClient()
 
   const [message, setMessage] = useState('')
-  const [gmailSelection, setGmailSelection] = useState(() => ({
-    userId,
-    connectionId: userId
-      ? sessionStorage.getItem(gmailSelectionStorageKey(userId)) || ''
-      : '',
-  }))
   const [conversationId, setConversationId] = useState(null)
   const [optimisticMessages, setOptimisticMessages] = useState([])
 
@@ -61,49 +54,24 @@ function Assistant() {
   const newChatModeRef = useRef(false)
 
   const gmailConnectionsQuery = useQuery({
-    queryKey: ['gmail-connections', userId],
-    queryFn: () => gmailService.getConnections(),
+    queryKey: ['oauth-connections', userId],
+    queryFn: () => api.get('/api/v1/oauth/connections'),
     enabled: Boolean(userId),
     staleTime: 5 * 60 * 1000,
     gcTime: 30 * 60 * 1000,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: true,
   })
 
-  const gmailConnections = useMemo(
-    () =>
-      (gmailConnectionsQuery.data || []).filter(
-        (connection) =>
-          connection.provider === 'google' &&
-          connection.status === 'connected',
-      ),
-    [gmailConnectionsQuery.data],
+  const defaultGmailConnectionId =
+    user?.user_metadata?.default_gmail_connection_id
+  const selectedGmailConnection = useMemo(
+    () => resolveAssistantGmailConnection(
+      gmailConnectionsQuery.data?.connections || [],
+      defaultGmailConnectionId,
+    ),
+    [gmailConnectionsQuery.data, defaultGmailConnectionId],
   )
-
-  const requestedGmailConnectionId =
-    gmailSelection.userId === userId
-      ? gmailSelection.connectionId
-      : ''
-  const selectedGmailConnection = gmailConnections.find(
-    (connection) => connection.id === requestedGmailConnectionId,
-  )
-  const selectedGmailConnectionId =
-    selectedGmailConnection?.id || ''
-
-  function handleGmailConnectionChange(event) {
-    const nextConnectionId = event.target.value
-    setGmailSelection({
-      userId,
-      connectionId: nextConnectionId,
-    })
-    if (!userId) return
-
-    const key = gmailSelectionStorageKey(userId)
-    if (nextConnectionId) {
-      sessionStorage.setItem(key, nextConnectionId)
-    } else {
-      sessionStorage.removeItem(key)
-    }
-  }
+  const selectedGmailConnectionId = selectedGmailConnection?.id || ''
 
   // --------------------------------------------------
   // 1. Fetch and cache conversation list
@@ -270,6 +238,7 @@ function Assistant() {
       idempotencyKey,
       existingConversationId,
       selectedConnectionId,
+      userTimezone,
     }) => {
       let activeConversationId = existingConversationId
 
@@ -293,6 +262,7 @@ function Assistant() {
             content,
             idempotencyKey,
             selectedConnectionId || null,
+            userTimezone,
           )
 
         if (
@@ -355,17 +325,21 @@ function Assistant() {
     setError('')
 
     const temporaryId = `pending-${crypto.randomUUID()}`
+    const userTimezone =
+      Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 
     // Reuse the same idempotency key for the same retry.
     if (
       !pendingRequestRef.current ||
       pendingRequestRef.current.content !== content ||
-      pendingRequestRef.current.connectionId !== selectedGmailConnectionId
+      pendingRequestRef.current.connectionId !== selectedGmailConnectionId ||
+      pendingRequestRef.current.userTimezone !== userTimezone
     ) {
       pendingRequestRef.current = {
         content,
         key: crypto.randomUUID(),
         connectionId: selectedGmailConnectionId,
+        userTimezone,
       }
     }
 
@@ -390,6 +364,7 @@ function Assistant() {
         idempotencyKey,
         existingConversationId: conversationId,
         selectedConnectionId: selectedGmailConnectionId,
+        userTimezone,
       })
 
       const {
@@ -432,6 +407,10 @@ function Assistant() {
         queryClient.invalidateQueries({
           queryKey: ['conversations', userId],
         })
+      }
+
+      if (err.status >= 500) {
+        pendingRequestRef.current = null
       }
 
       setOptimisticMessages((current) =>
@@ -611,7 +590,7 @@ function Assistant() {
                 }`}
               >
                 <div
-                  className={`w-full max-w-[90%] rounded-2xl px-4 py-3 text-sm leading-7 sm:max-w-[85%] ${
+                  className={`min-w-0 w-full max-w-[90%] rounded-2xl px-4 py-3 text-sm leading-7 sm:max-w-[85%] ${
                     item.role === 'user'
                       ? 'rounded-br-sm bg-gradient-to-r from-violet-600 to-indigo-600 text-white'
                       : isDark
@@ -619,12 +598,54 @@ function Assistant() {
                         : 'rounded-bl-sm bg-slate-100 text-slate-800'
                   }`}
                 >
-                  <div className="whitespace-pre-wrap break-words">
-                    {item.content}
-                  </div>
+                  {item.role === 'assistant' ? (
+                    <AssistantMarkdown content={item.content} />
+                  ) : (
+                    <div className="whitespace-pre-wrap break-words">
+                      {item.content}
+                    </div>
+                  )}
+                  {item.role === 'assistant' &&
+                    item.metadata?.response_completion?.status ===
+                      'truncated' && (
+                      <p
+                        role="status"
+                        className="mt-3 border-t border-current/15 pt-2 text-xs leading-5 opacity-80"
+                      >
+                        This response may be incomplete because the AI
+                        reached its output limit. Ask me to continue from
+                        where it stopped.
+                      </p>
+                    )}
                   {item.role === 'assistant' &&
                     item.metadata?.email_draft && (
                       <EmailDraftCard
+                        message={item}
+                        isDark={isDark}
+                        connectionId={
+                          item.metadata.email_draft_connection_id ||
+                          selectedGmailConnectionId
+                        }
+                        onUpdated={(updatedMessage) => {
+                          queryClient.setQueryData(
+                            [
+                              'conversation-messages',
+                              userId,
+                              item.conversation_id,
+                            ],
+                            (current = []) =>
+                              current.map((currentMessage) =>
+                                currentMessage.id === updatedMessage.id
+                                  ? updatedMessage
+                                  : currentMessage,
+                              ),
+                          )
+                        }}
+                      />
+                    )}
+                  {item.role === 'assistant' &&
+                    item.metadata?.action_approval && (
+                      <ActionApprovalCard
                         message={item}
                         isDark={isDark}
                         onUpdated={(updatedMessage) => {
@@ -677,62 +698,19 @@ function Assistant() {
         <div className={`border-t p-4 sm:p-5 ${
           isDark ? 'border-[#252838]' : 'border-slate-200'
         }`}>
-          <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <label className="flex min-w-0 flex-1 items-center gap-3">
-              <span className="shrink-0 text-xs font-semibold">
-                Gmail account
+          {selectedGmailConnection && (
+            <div className={`mb-3 flex flex-wrap items-center justify-between gap-2 text-xs ${muted}`}>
+              <span>
+                Gmail ready · {selectedGmailConnection.email || 'Connected account'}
               </span>
-              <select
-                value={selectedGmailConnectionId}
-                onChange={handleGmailConnectionChange}
-                disabled={
-                  sending ||
-                  initializing ||
-                  gmailConnectionsQuery.isLoading ||
-                  gmailConnections.length === 0
-                }
-                aria-label="Select Gmail account for the assistant"
-                className={`min-w-0 max-w-full rounded-lg border px-3 py-2 text-xs outline-none transition focus:border-violet-500 disabled:opacity-60 sm:max-w-sm ${
-                  isDark
-                    ? 'border-[#303448] bg-[#171a27] text-slate-200'
-                    : 'border-slate-200 bg-white text-slate-700'
-                }`}
-              >
-                <option value="">
-                  {gmailConnectionsQuery.isLoading
-                    ? 'Loading connected accounts...'
-                    : 'Select an account to use Gmail'}
-                </option>
-                {gmailConnections.map((connection) => (
-                  <option key={connection.id} value={connection.id}>
-                    {connection.email || 'Google account'}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            {gmailConnectionsQuery.isError ? (
-              <button
-                type="button"
-                onClick={() => gmailConnectionsQuery.refetch()}
-                className="self-start text-xs font-semibold text-rose-400 hover:text-rose-300 sm:self-auto"
-              >
-                Could not load accounts · Retry
-              </button>
-            ) : gmailConnections.length === 0 &&
-              !gmailConnectionsQuery.isLoading ? (
               <Link
                 to="/dashboard/connectors"
-                className="self-start text-xs font-semibold text-violet-400 hover:text-violet-300 sm:self-auto"
+                className="font-semibold text-violet-400 hover:text-violet-300"
               >
-                Connect Gmail in Connectors →
+                Manage in Connectors
               </Link>
-            ) : (
-              <span className={`text-xs ${muted}`}>
-                Select an account before asking about Gmail.
-              </span>
-            )}
-          </div>
+            </div>
+          )}
           <form onSubmit={handleSubmit}>
             <div className={`flex items-end gap-2 rounded-2xl border p-2 ${
               isDark

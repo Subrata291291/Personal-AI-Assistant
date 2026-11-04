@@ -57,7 +57,7 @@ function GoogleIcon() {
 }
 
 function Connectors() {
-  const { user } = useAuth()
+  const { user, updateUserMetadata } = useAuth()
   const { isDark } = useOutletContext()
 
   const queryClient = useQueryClient()
@@ -124,6 +124,16 @@ function Connectors() {
   const googleConnections = connections.filter(
     (connection) => connection.provider === 'google',
   )
+  const connectedGoogleConnections = googleConnections.filter(
+    (connection) => connection.status === 'connected',
+  )
+  const configuredDefaultConnectionId =
+    user?.user_metadata?.default_gmail_connection_id
+  const defaultGmailConnectionId = connectedGoogleConnections.some(
+    (connection) => connection.id === configuredDefaultConnectionId,
+  )
+    ? configuredDefaultConnectionId
+    : ''
 
   const isGoogleConnected = googleConnections.some(
     (connection) => connection.status === 'connected',
@@ -154,6 +164,27 @@ function Connectors() {
     },
   })
 
+  const defaultGmailMutation = useMutation({
+    mutationFn: (connectionId) =>
+      updateUserMetadata({
+        default_gmail_connection_id: connectionId || null,
+      }),
+    onSuccess: (_updatedUser, connectionId) => {
+      setNotice({
+        type: 'success',
+        message: connectionId
+          ? 'Default Gmail account updated.'
+          : 'Default Gmail account cleared.',
+      })
+    },
+    onError: (error) => {
+      setNotice({
+        type: 'error',
+        message: error.message || 'Unable to update the default Gmail account.',
+      })
+    },
+  })
+
   // Disconnect Google account
   const disconnectMutation = useMutation({
     mutationFn: (connectionId) =>
@@ -161,13 +192,20 @@ function Connectors() {
         `/api/v1/oauth/connections/${connectionId}`,
       ),
 
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: CONNECTIONS_KEY(userId),
-      })
+    onSuccess: async (_result, disconnectedConnectionId) => {
+      let defaultPreferenceError = false
+      if (configuredDefaultConnectionId === disconnectedConnectionId) {
+        try {
+          await updateUserMetadata({
+            default_gmail_connection_id: null,
+          })
+        } catch {
+          defaultPreferenceError = true
+        }
+      }
 
       await queryClient.invalidateQueries({
-        queryKey: ['gmail-connections', userId],
+        queryKey: CONNECTIONS_KEY(userId),
       })
 
       await queryClient.removeQueries({
@@ -179,8 +217,10 @@ function Connectors() {
       })
 
       setNotice({
-        type: 'success',
-        message: 'Google account disconnected successfully.',
+        type: defaultPreferenceError ? 'error' : 'success',
+        message: defaultPreferenceError
+          ? 'The account disconnected, but its default preference could not be cleared. Choose a default in Connectors.'
+          : 'Google account disconnected successfully.',
       })
     },
 
@@ -208,9 +248,6 @@ function Connectors() {
         queryKey: CONNECTIONS_KEY(userId),
       })
 
-      queryClient.invalidateQueries({
-        queryKey: ['gmail-connections', userId],
-      })
     } else if (googleStatus === 'error') {
       setNotice({
         type: 'error',
@@ -362,6 +399,49 @@ function Connectors() {
           </div>
         ))}
 
+        {connectedGoogleConnections.length > 0 && (
+          <div className={`mt-6 rounded-xl border p-4 ${colors.account}`}>
+            <label className="block">
+              <span className={`block text-sm font-semibold ${colors.heading}`}>
+                Assistant default Gmail account
+              </span>
+              <span className={`mt-1 block text-xs leading-5 ${colors.muted}`}>
+                The Assistant uses the only connected account automatically.
+                With multiple accounts, it uses this default and will not pick
+                an account on its own.
+              </span>
+              <select
+                value={defaultGmailConnectionId}
+                onChange={(event) => {
+                  setNotice(null)
+                  defaultGmailMutation.mutate(event.target.value)
+                }}
+                disabled={
+                  connectedGoogleConnections.length < 2 ||
+                  defaultGmailMutation.isPending
+                }
+                aria-label="Default Gmail account for Assistant"
+                className={`mt-3 w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-violet-500 disabled:cursor-not-allowed disabled:opacity-60 ${
+                  isDark
+                    ? 'border-[#303448] bg-[#171a27] text-slate-200'
+                    : 'border-slate-200 bg-white text-slate-700'
+                }`}
+              >
+                <option value="">
+                  {connectedGoogleConnections.length < 2
+                    ? 'Automatically use the only connected account'
+                    : 'No default — choose an account'}
+                </option>
+                {connectedGoogleConnections.map((connection) => (
+                  <option key={connection.id} value={connection.id}>
+                    {connection.email || 'Google account'}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        )}
+
         {/* Connect button */}
         <div className="mt-6">
           {!isGoogleConnected && (
@@ -399,29 +479,29 @@ function Connectors() {
             {
               name: 'Gmail',
               icon: '✉',
-              description: 'Read and summarize your emails.',
-              status: 'Read-only scope configured',
+              description: 'Search and summarize email, prepare editable draft previews, and save reviewed drafts.',
+              status: 'Implemented · sending requires the separate approval flow',
               enabled: true,
             },
             {
               name: 'Google Calendar',
               icon: '▦',
-              description: 'Manage your events and schedules.',
-              status: 'Scope not configured',
+              description: 'Calendar event access is not implemented. Meeting discovery can search Gmail instead.',
+              status: 'Not implemented',
               enabled: false,
             },
             {
               name: 'Google Drive',
               icon: '▱',
-              description: 'Search and summarize documents.',
-              status: 'Scope not configured',
+              description: 'Drive file access is not implemented.',
+              status: 'Not implemented',
               enabled: false,
             },
             {
               name: 'Google Contacts',
               icon: '♙',
-              description: 'Access your contacts.',
-              status: 'Scope not configured',
+              description: 'Contacts access is not implemented.',
+              status: 'Not implemented',
               enabled: false,
             },
           ].map((service) => (

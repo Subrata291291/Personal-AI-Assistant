@@ -1,4 +1,5 @@
 
+import logging
 from typing import Annotated
 from uuid import UUID
 
@@ -13,7 +14,10 @@ from sqlalchemy.orm import Session
 from supabase import Client
 
 from app.api.deps import CurrentUser, get_current_supabase_client
+from app.core.error_logging import log_exception_traceback
 from app.db.session import get_db
+from app.integrations.google.exceptions import GoogleAPIError
+from app.llm.fallback import LLMFallbackError
 from app.memory.memory_pipeline import MemoryPipeline
 from app.repositories.chat_request_repository import (
     IdempotencyConflictError,
@@ -30,6 +34,7 @@ from app.services.user_settings_service import UserSettingsService
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def get_chat_service(
@@ -81,6 +86,7 @@ def chat(
             content=payload.content,
             idempotency_key=idempotency_key,
             gmail_connection_id=payload.gmail_connection_id,
+            user_timezone=payload.user_timezone,
         )
 
     except LookupError:
@@ -111,8 +117,59 @@ def chat(
             detail=str(exc),
         )
 
-    except Exception:
+    except LLMFallbackError as exc:
+        log_exception_traceback(
+            logger,
+            "Chat request failed after LLM provider fallback was exhausted.",
+            exc,
+        )
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="The AI assistant could not process your message.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The AI service could not complete your request. "
+                "Please try again later."
+            ),
+        )
+
+    except GoogleAPIError as exc:
+        logger.warning(
+            "Chat request failed during a Google API call | status=%s",
+            exc.status_code,
+        )
+        if exc.status_code == status.HTTP_403_FORBIDDEN:
+            response_status = status.HTTP_403_FORBIDDEN
+            detail = (
+                "Gmail access was denied. Check the connected account's "
+                "Gmail permissions."
+            )
+        elif exc.status_code == status.HTTP_404_NOT_FOUND:
+            response_status = status.HTTP_404_NOT_FOUND
+            detail = "The requested Gmail item is no longer available."
+        elif (
+            exc.retryable
+            or exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+            or exc.status_code >= 500
+        ):
+            response_status = status.HTTP_503_SERVICE_UNAVAILABLE
+            detail = "Gmail is temporarily unavailable. Please try again later."
+        else:
+            response_status = status.HTTP_502_BAD_GATEWAY
+            detail = "Gmail could not complete the request. Please try again."
+        raise HTTPException(
+            status_code=response_status,
+            detail=detail,
+        )
+
+    except Exception as exc:
+        log_exception_traceback(
+            logger,
+            "Unexpected chat request failure.",
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The assistant encountered an unexpected error. "
+                "Please try again later."
+            ),
         )

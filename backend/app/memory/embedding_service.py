@@ -1,13 +1,17 @@
 import math
+import logging
+from time import perf_counter
 
 from google import genai
 from google.genai import types
 
 from app.core.config import settings
+from app.core.request_metrics import record_timing, request_id
 
 
 EMBEDDING_MODEL = "gemini-embedding-2"
 EMBEDDING_DIMENSION = 768
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingService:
@@ -28,13 +32,23 @@ class EmbeddingService:
         if not text or not text.strip():
             raise ValueError("Text cannot be empty.")
 
-        response = self.client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=text,
-            config=types.EmbedContentConfig(
-                output_dimensionality=EMBEDDING_DIMENSION
-            ),
-        )
+        started_at = perf_counter()
+        try:
+            response = self.client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=text,
+                config=types.EmbedContentConfig(
+                    output_dimensionality=EMBEDDING_DIMENSION
+                ),
+            )
+        finally:
+            duration_ms = (perf_counter() - started_at) * 1000
+            record_timing("embedding", duration_ms)
+            logger.info(
+                "embedding_completed | request_id=%s | duration_ms=%.2f",
+                request_id(),
+                duration_ms,
+            )
 
         if not response.embeddings:
             raise RuntimeError("Gemini returned an empty embedding response.")

@@ -46,21 +46,25 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[SecretStr] = None
     GROQ_MODEL: Optional[str] = None
     GROQ_TIMEOUT_SECONDS: int = Field(default=20, gt=0)
+    GROQ_MAX_OUTPUT_TOKENS: int = Field(default=2048, gt=0)
 
     # OpenRouter
     OPENROUTER_API_KEY: Optional[SecretStr] = None
     OPENROUTER_MODEL: Optional[str] = None
     OPENROUTER_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    OPENROUTER_MAX_OUTPUT_TOKENS: int = Field(default=2048, gt=0)
 
     # Gemini
     GEMINI_API_KEY: Optional[SecretStr] = None
     GEMINI_MODEL: Optional[str] = None
     GEMINI_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    GEMINI_MAX_OUTPUT_TOKENS: int = Field(default=2048, gt=0)
 
     # OpenAI
     OPENAI_API_KEY: Optional[SecretStr] = None
     OPENAI_MODEL: Optional[str] = None
     OPENAI_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    OPENAI_MAX_OUTPUT_TOKENS: int = Field(default=2048, gt=0)
 
     # Google OAuth
     GOOGLE_CLIENT_ID: Optional[str] = None

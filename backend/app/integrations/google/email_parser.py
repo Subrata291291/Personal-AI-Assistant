@@ -21,11 +21,21 @@ class GmailEmailParser:
     def decode_body(
         data: str | None,
         charset: str = "utf-8",
+        max_chars: int | None = None,
     ) -> str:
         if not data:
             return ""
 
         try:
+            if max_chars is not None:
+                if max_chars <= 0:
+                    return ""
+                encoded_limit = (max_chars * 16 + 2) // 3
+                encoded_limit -= encoded_limit % 4
+                data = data[:encoded_limit]
+                if not data:
+                    return ""
+
             padding = "=" * (-len(data) % 4)
 
             decoded = base64.urlsafe_b64decode(
@@ -33,15 +43,16 @@ class GmailEmailParser:
             )
 
             try:
-                return decoded.decode(
+                text = decoded.decode(
                     charset or "utf-8",
                     errors="replace",
                 )
             except LookupError:
-                return decoded.decode(
+                text = decoded.decode(
                     "utf-8",
                     errors="replace",
                 )
+            return text[:max_chars] if max_chars is not None else text
 
         except (ValueError, UnicodeError):
             return ""
@@ -66,6 +77,8 @@ class GmailEmailParser:
     def extract_bodies(
         cls,
         payload: dict[str, Any],
+        include_html: bool = True,
+        max_body_chars: int | None = None,
     ) -> dict[str, str]:
 
         result = {
@@ -75,8 +88,12 @@ class GmailEmailParser:
 
         plain_parts = []
         html_parts = []
+        plain_chars = 0
+        html_chars = 0
 
         def walk(part: dict[str, Any]) -> None:
+            nonlocal html_chars, plain_chars
+
             mime_type = part.get("mimeType", "").lower()
 
             filename = part.get("filename", "")
@@ -87,21 +104,36 @@ class GmailEmailParser:
             if filename:
                 return
 
-            if data and mime_type in {
-                "text/plain",
-                "text/html",
-            }:
-                decoded = cls.decode_body(
-                    data,
-                    cls._get_charset(part),
+            if data and (
+                mime_type == "text/plain"
+                or (include_html and mime_type == "text/html")
+            ):
+                remaining_chars = None
+                if max_body_chars is not None:
+                    used_chars = (
+                        plain_chars
+                        if mime_type == "text/plain"
+                        else html_chars
+                    )
+                    remaining_chars = max(0, max_body_chars - used_chars)
+                decoded = (
+                    cls.decode_body(
+                        data,
+                        cls._get_charset(part),
+                        max_chars=remaining_chars,
+                    )
+                    if remaining_chars is None or remaining_chars > 0
+                    else ""
                 )
 
                 if decoded:
                     if mime_type == "text/plain":
                         plain_parts.append(decoded)
+                        plain_chars += len(decoded)
 
                     elif mime_type == "text/html":
                         html_parts.append(decoded)
+                        html_chars += len(decoded)
 
             for child in part.get("parts", []):
                 walk(child)
@@ -117,6 +149,10 @@ class GmailEmailParser:
         result["html"] = "\n".join(
             html_parts
         )
+
+        if max_body_chars is not None:
+            result["plain_text"] = result["plain_text"][:max_body_chars]
+            result["html"] = result["html"][:max_body_chars]
 
         return result
 
@@ -187,11 +223,17 @@ class GmailEmailParser:
     def parse_message(
         cls,
         message: dict[str, Any],
+        include_html: bool = True,
+        max_body_chars: int | None = None,
     ) -> dict[str, Any]:
 
         payload = message.get("payload", {})
 
-        bodies = cls.extract_bodies(payload)
+        bodies = cls.extract_bodies(
+            payload,
+            include_html=include_html,
+            max_body_chars=max_body_chars,
+        )
         headers = cls.extract_headers(payload)
         attachments = cls.extract_attachments(payload)
 

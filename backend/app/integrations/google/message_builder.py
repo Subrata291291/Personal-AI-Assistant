@@ -2,7 +2,7 @@
 import base64
 import re
 from email.message import EmailMessage
-from email.utils import parseaddr
+from email.utils import formataddr, parseaddr
 from typing import Sequence
 
 
@@ -18,16 +18,25 @@ class GmailMessageBuilder:
         if not isinstance(email, str):
             raise ValueError("Email address must be a string.")
 
-        _, parsed_email = parseaddr(email)
+        candidate = email.strip()
+        if "<" in candidate or ">" in candidate:
+            if not re.fullmatch(r'\s*(.*?)<\s*([^<>]+)\s*>\s*', candidate):
+                raise ValueError(f"Invalid email address: {email}")
+            display_name, parsed_email = parseaddr(candidate)
+        else:
+            display_name, parsed_email = "", candidate
 
         if (
             not parsed_email
-            or parsed_email != email.strip()
             or "@" not in parsed_email
+            or any(character.isspace() for character in parsed_email)
+            or "\r" in candidate
+            or "\n" in candidate
+            or any(ord(character) < 32 or ord(character) == 127 for character in display_name)
         ):
             raise ValueError(f"Invalid email address: {email}")
 
-        return parsed_email
+        return formataddr((display_name, parsed_email)) if display_name else parsed_email
 
     @classmethod
     def _validate_recipients(
@@ -96,11 +105,13 @@ class GmailMessageBuilder:
         reply_to: str | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        require_recipient: bool = True,
+        draft_operation_id: str | None = None,
     ) -> str:
 
         to_list = cls._validate_recipients(
             to,
-            required=True,
+            required=require_recipient,
         )
 
         cc_list = cls._validate_recipients(cc or [])
@@ -140,7 +151,8 @@ class GmailMessageBuilder:
 
         message = EmailMessage()
 
-        message["To"] = ", ".join(to_list)
+        if to_list:
+            message["To"] = ", ".join(to_list)
         message["Subject"] = subject
 
         if cc_list:
@@ -159,6 +171,13 @@ class GmailMessageBuilder:
 
         if references:
             message["References"] = references
+        if draft_operation_id:
+            message["X-Personal-AI-Draft-Operation-ID"] = (
+                cls._validate_message_header(
+                    draft_operation_id,
+                    "Draft operation ID",
+                )
+            )
 
         message.set_content(body)
 

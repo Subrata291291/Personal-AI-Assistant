@@ -1,5 +1,6 @@
 from datetime import date
 from typing import Annotated, Literal, TypeAlias
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
     BaseModel,
@@ -22,12 +23,36 @@ class GeneralPlan(GmailPlanBase):
     intent: Literal["general"]
 
 
+class DailyPlanningPlan(GmailPlanBase):
+    intent: Literal["daily_planning"]
+
+
 class ClarifyPlan(GmailPlanBase):
     intent: Literal["clarify"]
 
 
 class UnsupportedPlan(GmailPlanBase):
     intent: Literal["unsupported"]
+
+
+class IntegrationPlan(GmailPlanBase):
+    intent: Literal[
+        "google_drive",
+        "google_calendar",
+        "google_contacts",
+        "tasks",
+    ]
+
+
+class MeetingDiscoveryPlan(GmailPlanBase):
+    intent: Literal["discover_meetings"]
+    target_date: date
+    max_results: int = Field(default=10, ge=1, le=10)
+
+
+class ApprovalWorkflowPlan(GmailPlanBase):
+    intent: Literal["approval_workflow"]
+    operation: Literal["approve", "reject", "execute"]
 
 
 class DraftEmailPlan(GmailPlanBase):
@@ -49,6 +74,7 @@ class DraftEmailPlan(GmailPlanBase):
 
 class SearchEmailsPlan(GmailPlanBase):
     intent: Literal["search_emails"]
+    query: str | None = Field(default=None, min_length=1, max_length=500)
     sender: str | None = Field(default=None, min_length=1, max_length=320)
     subject: str | None = Field(default=None, min_length=1, max_length=200)
     after: date | None = None
@@ -56,7 +82,7 @@ class SearchEmailsPlan(GmailPlanBase):
     has_attachment: bool | None = None
     max_results: int = Field(default=5, ge=1, le=10)
 
-    @field_validator("sender", "subject")
+    @field_validator("query", "sender", "subject")
     @classmethod
     def normalize_search_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -73,6 +99,7 @@ class SearchEmailsPlan(GmailPlanBase):
         if not any(
             value is not None
             for value in (
+                self.query,
                 self.sender,
                 self.subject,
                 self.after,
@@ -86,6 +113,40 @@ class SearchEmailsPlan(GmailPlanBase):
             raise ValueError("'after' must be earlier than 'before'.")
 
         return self
+
+
+class SummarizeImportantPlan(GmailPlanBase):
+    intent: Literal["summarize_important"]
+    max_results: int = Field(default=10, ge=1, le=10)
+
+
+class SummarizeUrgentPlan(GmailPlanBase):
+    intent: Literal["summarize_urgent"]
+    max_results: int = Field(default=10, ge=1, le=10)
+
+
+class SummarizeAttentionPlan(GmailPlanBase):
+    intent: Literal["summarize_attention"]
+    max_results: int = Field(default=10, ge=1, le=10)
+
+
+class SummarizeTodayPlan(GmailPlanBase):
+    intent: Literal["summarize_today"]
+    max_results: int = Field(default=10, ge=1, le=10)
+
+
+class SummarizeLatestThreadPlan(GmailPlanBase):
+    intent: Literal["summarize_latest_thread"]
+    query: str = Field(min_length=1, max_length=500)
+    max_results: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("query")
+    @classmethod
+    def normalize_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ord(character) < 32 for character in value):
+            raise ValueError("Search query must be non-empty text.")
+        return value
 
 
 class GetEmailPlan(GmailPlanBase):
@@ -120,12 +181,52 @@ class SummarizeThreadPlan(GmailPlanBase):
     )
 
 
-GmailPlan: TypeAlias = Annotated[
+class MeetingEventExtraction(GmailPlanBase):
+    title: str = Field(min_length=1, max_length=250)
+    event_date: date | None = None
+    start_time: str | None = Field(default=None, max_length=40)
+    end_time: str | None = Field(default=None, max_length=40)
+    timezone: str | None = Field(default=None, max_length=100)
+    organizer: str | None = Field(default=None, max_length=320)
+    participants: list[str] = Field(default_factory=list, max_length=30)
+    location: str | None = Field(default=None, max_length=500)
+    meeting_url: str | None = Field(default=None, max_length=2048)
+    status: Literal[
+        "confirmed",
+        "proposed",
+        "invitation_awaiting_confirmation",
+        "mentioned_without_confirmed_time",
+    ]
+    source_thread_id: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    date_evidence: str | None = Field(default=None, max_length=500)
+    start_time_evidence: str | None = Field(default=None, max_length=500)
+    end_time_evidence: str | None = Field(default=None, max_length=500)
+    status_evidence: str | None = Field(default=None, max_length=1000)
+
+
+class MeetingExtractionResponse(GmailPlanBase):
+    events: list[MeetingEventExtraction] = Field(default_factory=list, max_length=10)
+
+
+AssistantIntent: TypeAlias = Annotated[
     GeneralPlan
+    | DailyPlanningPlan
     | ClarifyPlan
     | UnsupportedPlan
+    | IntegrationPlan
+    | MeetingDiscoveryPlan
+    | ApprovalWorkflowPlan
     | DraftEmailPlan
     | SearchEmailsPlan
+    | SummarizeImportantPlan
+    | SummarizeUrgentPlan
+    | SummarizeAttentionPlan
+    | SummarizeTodayPlan
+    | SummarizeLatestThreadPlan
     | GetEmailPlan
     | GetThreadPlan
     | SummarizeUnreadPlan
@@ -133,9 +234,15 @@ GmailPlan: TypeAlias = Annotated[
     Field(discriminator="intent"),
 ]
 
-gmail_plan_adapter = TypeAdapter(GmailPlan)
+GmailPlan: TypeAlias = AssistantIntent
+assistant_intent_adapter = TypeAdapter(AssistantIntent)
 
 
-def parse_gmail_plan(raw_plan: str) -> GmailPlan:
-    """Parse only strict JSON plans matching the supported intent schemas."""
-    return gmail_plan_adapter.validate_json(raw_plan)
+def parse_assistant_intent(raw_plan: str) -> AssistantIntent:
+    """Parse only strict JSON decisions matching supported intent schemas."""
+    return assistant_intent_adapter.validate_json(raw_plan)
+
+
+def parse_gmail_plan(raw_plan: str) -> AssistantIntent:
+    """Backward-compatible parser name for the unified assistant intents."""
+    return parse_assistant_intent(raw_plan)

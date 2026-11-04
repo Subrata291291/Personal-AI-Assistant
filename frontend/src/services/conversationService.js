@@ -62,6 +62,37 @@ export const conversationService = {
     )
   },
 
+  async saveEmailDraftToGmail(
+    conversationId,
+    messageId,
+    connectionId,
+    operationId,
+  ) {
+    return api.post(
+      `${BASE_PATH}/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/draft/save`,
+      {
+        connection_id: connectionId,
+        operation_id: operationId,
+      },
+    )
+  },
+
+  async getEmailDraftSaveStatus(
+    conversationId,
+    messageId,
+    connectionId,
+    operationId,
+  ) {
+    const params = new URLSearchParams({
+      connection_id: connectionId,
+      operation_id: operationId,
+    })
+
+    return api.get(
+      `${BASE_PATH}/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/draft/save-status?${params.toString()}`
+    )
+  },
+
   // Create a user message directly.
   // Use this only when a standalone message insert is required.
   async createMessage(conversationId, content) {
@@ -77,6 +108,7 @@ export const conversationService = {
     content,
     idempotencyKey,
     gmailConnectionId = null,
+    userTimezone = 'UTC',
   ) {
     return api.post(
       CHAT_PATH,
@@ -84,6 +116,7 @@ export const conversationService = {
         conversation_id: conversationId,
         content,
         gmail_connection_id: gmailConnectionId,
+        user_timezone: userTimezone,
       },
       {
         'Idempotency-Key': idempotencyKey,

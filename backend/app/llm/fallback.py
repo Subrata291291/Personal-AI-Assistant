@@ -1,10 +1,12 @@
 
 import logging
+from time import perf_counter
 from typing import Any
 
 from app.core.config import settings
 from app.llm.registry import ProviderRegistry
 from app.llm.schemas import LLMRequest, LLMResponse
+from app.core.request_metrics import record_timing, request_id
 
 
 logger = logging.getLogger(__name__)
@@ -123,7 +125,24 @@ class FallbackManager:
                     provider_name,
                 )
 
-                response = provider.generate(request)
+                provider_started_at = perf_counter()
+                try:
+                    response = provider.generate(request)
+                finally:
+                    provider_duration_ms = (
+                        perf_counter() - provider_started_at
+                    ) * 1000
+                    record_timing(
+                        "llm_provider",
+                        provider_duration_ms,
+                    )
+                    logger.info(
+                        "llm_provider_attempt_completed | request_id=%s "
+                        "| provider=%s | duration_ms=%.2f",
+                        request_id(),
+                        provider_name,
+                        provider_duration_ms,
+                    )
 
                 logger.info(
                     "LLM provider succeeded: %s | model=%s | latency_ms=%.2f",
