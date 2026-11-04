@@ -56,6 +56,14 @@ class GoogleOAuthClient:
                 "Redirect URI cannot contain credentials."
             )
 
+        expected_callback_path = (
+            f"{settings.API_V1_PREFIX.rstrip('/')}/oauth/google/callback"
+        )
+        if parsed.path != expected_callback_path:
+            raise ValueError(
+                "Google redirect URI must target the backend OAuth callback."
+            )
+
         if settings.APP_ENV.lower() == "production":
             if parsed.scheme != "https":
                 raise ValueError(

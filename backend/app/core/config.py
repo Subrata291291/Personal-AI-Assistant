@@ -2,6 +2,7 @@
 from pathlib import Path
 from functools import lru_cache
 from typing import Optional
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -141,6 +142,20 @@ class Settings(BaseSettings):
                     normalized.append(cleaned)
 
         return normalized
+
+    @property
+    def google_oauth_frontend_url(self) -> str:
+        """Return the configured frontend origin, with a production fallback."""
+        frontend_url = self.FRONTEND_URL.strip().rstrip("/")
+        parsed = urlsplit(frontend_url)
+
+        if (
+            self.APP_ENV.lower() == "production"
+            and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        ):
+            return "https://www.myorbitai.in"
+
+        return frontend_url
 
 @lru_cache
 def get_settings() -> Settings:

@@ -1,5 +1,5 @@
 from uuid import UUID
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
@@ -21,9 +21,30 @@ logger = get_logger(__name__)
 
 
 def _frontend_connector_url(status_value: str) -> str:
-    """Build a redirect URL using the trusted frontend configuration."""
+    """Build a safe redirect URL using the trusted frontend configuration."""
 
-    frontend_url = settings.FRONTEND_URL.rstrip("/")
+    if status_value not in {"connected", "error"}:
+        raise ValueError("Invalid Google OAuth callback status.")
+
+    frontend_url = settings.google_oauth_frontend_url
+    parsed_frontend_url = urlsplit(frontend_url)
+
+    if (
+        parsed_frontend_url.scheme not in {"http", "https"}
+        or not parsed_frontend_url.netloc
+        or parsed_frontend_url.username
+        or parsed_frontend_url.password
+        or parsed_frontend_url.path not in {"", "/"}
+        or parsed_frontend_url.query
+        or parsed_frontend_url.fragment
+    ):
+        raise ValueError("Invalid configured frontend URL.")
+
+    if (
+        settings.APP_ENV.lower() == "production"
+        and parsed_frontend_url.scheme != "https"
+    ):
+        raise ValueError("Production frontend URL must use HTTPS.")
 
     query = urlencode({
         "google": status_value,
