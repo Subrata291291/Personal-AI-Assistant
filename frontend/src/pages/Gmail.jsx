@@ -12,6 +12,7 @@ import { api } from '../lib/api.js'
 import { gmailService } from '../services/gmailService.js'
 import { useAuth } from '../context/AuthContext'
 import { sanitizeEmailHtml } from '../utils/sanitizeEmailHtml.js'
+import SenderAvatar from '../components/SenderAvatar.jsx'
 import {
   formatGmailTimestamp,
   sortGmailMessagesByReceivedTime,
@@ -31,19 +32,6 @@ const FOLDERS = [
   { id: 'spam', label: 'Spam', icon: '🚫' },
   { id: 'trash', label: 'Trash', icon: '🗑️' },
 ]
-
-function getInitials(sender) {
-  if (!sender) return '?'
-
-  const match = sender.match(/^([^<]+)</)
-  const name = (match?.[1] || sender).trim()
-
-  return name
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join('')
-}
 
 function getAttachmentName(attachment) {
   return (
@@ -1399,9 +1387,10 @@ export default function Gmail() {
                           className="flex min-w-0 flex-1 items-start gap-3 text-left sm:gap-4"
                         >
 
-                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 text-sm font-bold text-white">
-                            {getInitials(message.sender)}
-                          </div>
+                          <SenderAvatar
+                            sender={message.sender}
+                            isDark={isDark}
+                          />
 
                           <div className="min-w-0 flex-1">
 
@@ -2095,10 +2084,17 @@ export default function Gmail() {
                   {/* Email metadata */}
                   <div className={`space-y-2 text-sm ${colors.text}`}>
 
-                    <p className="break-words">
-                      <span className={colors.muted}>From: </span>
-                      {selectedMessage.headers?.from || 'Unknown sender'}
-                    </p>
+                    <div className="flex min-w-0 items-center gap-3">
+                      <SenderAvatar
+                        sender={selectedMessage.headers?.from}
+                        isDark={isDark}
+                        size="h-9 w-9"
+                      />
+                      <p className="min-w-0 break-words">
+                        <span className={colors.muted}>From: </span>
+                        {selectedMessage.headers?.from || 'Unknown sender'}
+                      </p>
+                    </div>
 
                     <p className="break-words">
                       <span className={colors.muted}>To: </span>

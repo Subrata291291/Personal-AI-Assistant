@@ -145,6 +145,58 @@ describe('Gmail archive flow', () => {
     }))).toBeInTheDocument()
   })
 
+  it('renders the shared sender avatar in every Gmail folder and search results', async () => {
+    const folders = [
+      'Inbox',
+      'Starred',
+      'Important',
+      'Sent',
+      'Drafts',
+      'All Mail',
+      'Spam',
+      'Trash',
+    ]
+    renderGmail()
+
+    for (const folder of folders) {
+      if (folder !== 'Inbox') {
+        fireEvent.click(
+          within(screen.getByRole('navigation', { name: 'Gmail folders' }))
+            .getByRole('button', { name: new RegExp(folder) }),
+        )
+      }
+      expect(await screen.findByRole('img', { name: /^sender@example.com avatar/ }))
+        .toBeInTheDocument()
+    }
+
+    const search = screen.getByPlaceholderText('Search in Trash...')
+    fireEvent.change(search, { target: { value: 'sender' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    expect(await screen.findByRole('img', { name: /^sender@example.com avatar/ }))
+      .toBeInTheDocument()
+  })
+
+  it('uses the same avatar in email details', async () => {
+    gmailService.getMessage.mockResolvedValue({
+      message: {
+        ...message,
+        headers: { from: 'Sender Name <sender@example.com>' },
+        internal_date: '1793815200000',
+        body: { plain_text: 'Message body', html: '' },
+        attachments: [],
+      },
+    })
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    expect(await screen.findByRole('img', { name: /^Sender Name avatar/ }))
+      .toBeInTheDocument()
+  })
+
   it('uses the Archive icon and neutral purple styling in its confirmation', async () => {
     renderGmail()
 
