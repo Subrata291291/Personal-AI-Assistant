@@ -12,6 +12,7 @@ import {
 
 import { api } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
+import GoogleServiceIcon from '../components/GoogleServiceIcon'
 
 const CACHE_TIME = 5 * 60 * 1000
 const GC_TIME = 30 * 60 * 1000
@@ -33,29 +34,6 @@ function formatDate(value) {
   return date.toLocaleString()
 }
 
-function GoogleIcon() {
-  return (
-    <svg viewBox="0 0 48 48" className="h-10 w-10">
-      <path
-        fill="#4285F4"
-        d="M43.6 24.5c0-1.4-.1-2.8-.4-4.1H24v7.8h11a9.4 9.4 0 0 1-4.1 6.2v5.1h6.6c3.9-3.6 6.1-8.9 6.1-15z"
-      />
-      <path
-        fill="#34A853"
-        d="M24 44c5.5 0 10.1-1.8 13.5-4.9l-6.6-5.1c-1.8 1.2-4.1 2-6.9 2-5.3 0-9.8-3.6-11.4-8.4H5.8v5.3A20 20 0 0 0 24 44z"
-      />
-      <path
-        fill="#FBBC05"
-        d="M12.6 27.6a12 12 0 0 1 0-7.2v-5.3H5.8a20 20 0 0 0 0 17.8z"
-      />
-      <path
-        fill="#EA4335"
-        d="M24 12c3 0 5.7 1 7.8 3.1l5.8-5.8C34.1 6 29.5 4 24 4A20 20 0 0 0 5.8 15.1l6.8 5.3C14.2 15.6 18.7 12 24 12z"
-      />
-    </svg>
-  )
-}
-
 function Connectors() {
   const { user, updateUserMetadata } = useAuth()
   const { isDark } = useOutletContext()
@@ -68,33 +46,17 @@ function Connectors() {
   const userId = user?.id
 
   const colors = {
-    card: isDark
-      ? 'border-[#252838] bg-[#11131c]'
-      : 'border-slate-200 bg-white',
-
     heading: isDark
       ? 'text-slate-100'
       : 'text-slate-800',
-
-    text: isDark
-      ? 'text-slate-300'
-      : 'text-slate-700',
 
     muted: isDark
       ? 'text-slate-400'
       : 'text-slate-500',
 
-    account: isDark
-      ? 'border-[#303448] bg-[#191c29]'
-      : 'border-slate-200 bg-slate-50',
-
     service: isDark
       ? 'border-[#252838] bg-[#11131c]'
       : 'border-slate-200 bg-white',
-
-    hover: isDark
-      ? 'hover:bg-[#202333]'
-      : 'hover:bg-slate-100',
 
     divider: isDark
       ? 'border-[#252838]'
@@ -127,17 +89,25 @@ function Connectors() {
   const connectedGoogleConnections = googleConnections.filter(
     (connection) => connection.status === 'connected',
   )
+  const gmailConnections = connectedGoogleConnections.filter(
+    (connection) => connection.capabilities?.gmail === true,
+  )
   const configuredDefaultConnectionId =
     user?.user_metadata?.default_gmail_connection_id
-  const defaultGmailConnectionId = connectedGoogleConnections.some(
-    (connection) => connection.id === configuredDefaultConnectionId,
-  )
-    ? configuredDefaultConnectionId
-    : ''
+  const isGmailConnected = gmailConnections.length > 0
 
-  const isGoogleConnected = googleConnections.some(
-    (connection) => connection.status === 'connected',
-  )
+  async function clearDefaultGmailPreference(connectionIds) {
+    if (!connectionIds.includes(configuredDefaultConnectionId)) return false
+
+    try {
+      await updateUserMetadata({
+        default_gmail_connection_id: null,
+      })
+      return false
+    } catch {
+      return true
+    }
+  }
 
   // Connect Google account
   const connectMutation = useMutation({
@@ -164,45 +134,35 @@ function Connectors() {
     },
   })
 
-  const defaultGmailMutation = useMutation({
-    mutationFn: (connectionId) =>
-      updateUserMetadata({
-        default_gmail_connection_id: connectionId || null,
-      }),
-    onSuccess: (_updatedUser, connectionId) => {
-      setNotice({
-        type: 'success',
-        message: connectionId
-          ? 'Default Gmail account updated.'
-          : 'Default Gmail account cleared.',
-      })
-    },
-    onError: (error) => {
-      setNotice({
-        type: 'error',
-        message: error.message || 'Unable to update the default Gmail account.',
-      })
-    },
-  })
-
   // Disconnect Google account
   const disconnectMutation = useMutation({
-    mutationFn: (connectionId) =>
-      api.delete(
-        `/api/v1/oauth/connections/${connectionId}`,
-      ),
+    mutationFn: async (connectionIds) => {
+      const disconnectedConnectionIds = []
+      const errors = []
 
-    onSuccess: async (_result, disconnectedConnectionId) => {
-      let defaultPreferenceError = false
-      if (configuredDefaultConnectionId === disconnectedConnectionId) {
+      for (const connectionId of connectionIds) {
         try {
-          await updateUserMetadata({
-            default_gmail_connection_id: null,
-          })
-        } catch {
-          defaultPreferenceError = true
+          await api.delete(`/api/v1/oauth/connections/${connectionId}`)
+          disconnectedConnectionIds.push(connectionId)
+        } catch (error) {
+          errors.push(error)
         }
       }
+
+      if (errors.length > 0) {
+        const error = new Error(
+          errors[0].message || 'Unable to disconnect Google.',
+        )
+        error.disconnectedConnectionIds = disconnectedConnectionIds
+        throw error
+      }
+
+      return connectionIds
+    },
+
+    onSuccess: async (_result, disconnectedConnectionIds) => {
+      const defaultPreferenceError =
+        await clearDefaultGmailPreference(disconnectedConnectionIds)
 
       await queryClient.invalidateQueries({
         queryKey: CONNECTIONS_KEY(userId),
@@ -219,15 +179,35 @@ function Connectors() {
       setNotice({
         type: defaultPreferenceError ? 'error' : 'success',
         message: defaultPreferenceError
-          ? 'The account disconnected, but its default preference could not be cleared. Choose a default in Connectors.'
+          ? 'The account disconnected, but the Assistant could not update its saved Gmail account preference.'
           : 'Google account disconnected successfully.',
       })
     },
 
-    onError: (error) => {
+    onError: async (error) => {
+      const disconnectedConnectionIds =
+        error.disconnectedConnectionIds || []
+      const defaultPreferenceError = await clearDefaultGmailPreference(
+        disconnectedConnectionIds,
+      )
+
+      await queryClient.invalidateQueries({
+        queryKey: CONNECTIONS_KEY(userId),
+      })
+      if (disconnectedConnectionIds.length > 0) {
+        await queryClient.removeQueries({
+          queryKey: ['gmail-messages', userId],
+        })
+        await queryClient.removeQueries({
+          queryKey: ['gmail-message', userId],
+        })
+      }
+
       setNotice({
         type: 'error',
-        message: error.message || 'Unable to disconnect Google.',
+        message: defaultPreferenceError
+          ? `${error.message || 'Unable to disconnect Google.'} The Assistant's saved Gmail account preference could not be updated.`
+          : error.message || 'Unable to disconnect Google.',
       })
     },
   })
@@ -263,15 +243,34 @@ function Connectors() {
     userId,
   ])
 
-  function handleDisconnect(connectionId) {
+  function handleDisconnect(connectionIds) {
+    const ids = Array.isArray(connectionIds)
+      ? connectionIds
+      : [connectionIds]
+    if (ids.length === 0) return
+
     const confirmed = window.confirm(
-      'Disconnect this Google account? Your stored OAuth credentials will be deleted.',
+      ids.length === 1
+        ? 'Disconnect this Google account? Its stored OAuth credentials will be removed from this app.'
+        : `Disconnect Gmail from all ${ids.length} connected Google accounts? Their stored OAuth credentials will be removed from this app.`,
     )
 
     if (!confirmed) return
 
     setNotice(null)
-    disconnectMutation.mutate(connectionId)
+    disconnectMutation.mutate(ids)
+  }
+
+  function handleGmailToggle() {
+    if (connectionsQuery.isLoading || connectionsQuery.isError) return
+
+    if (isGmailConnected) {
+      handleDisconnect(gmailConnections.map((connection) => connection.id))
+      return
+    }
+
+    setNotice(null)
+    connectMutation.mutate()
   }
 
   return (
@@ -295,7 +294,7 @@ function Connectors() {
       {/* Notification */}
       {notice && (
         <div
-          role="status"
+          role={notice.type === 'error' ? 'alert' : 'status'}
           className={`rounded-xl border p-4 text-sm ${
             notice.type === 'success'
               ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-500'
@@ -306,56 +305,17 @@ function Connectors() {
         </div>
       )}
 
-      {/* Google Workspace */}
-      <section className={`rounded-2xl border p-6 ${colors.card}`}>
+      <section aria-labelledby="google-services-heading">
+        <h2
+          id="google-services-heading"
+          className={`mb-4 text-xl font-semibold ${colors.heading}`}
+        >
+          Google Services
+        </h2>
 
-        <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
-
-          <div className="flex items-center gap-4">
-
-            <div className="rounded-xl bg-white p-2 shadow-sm">
-              <GoogleIcon />
-            </div>
-
-            <div>
-              <h2 className={`text-xl font-semibold ${colors.heading}`}>
-                Google Workspace
-              </h2>
-
-              <p className={`mt-1 text-sm ${colors.muted}`}>
-                Connect your Google account to access supported services.
-              </p>
-            </div>
-
-          </div>
-
-          <div>
-            {connectionsQuery.isLoading ? (
-              <span className={`text-sm ${colors.muted}`}>
-                Checking connection...
-              </span>
-            ) : isGoogleConnected ? (
-              <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-sm font-medium text-emerald-500">
-                Connected
-              </span>
-            ) : (
-              <span className={`rounded-full border px-3 py-1.5 text-sm ${
-                isDark
-                  ? 'border-slate-700 bg-slate-800 text-slate-400'
-                  : 'border-slate-200 bg-slate-100 text-slate-500'
-              }`}>
-                Not connected
-              </span>
-            )}
-          </div>
-
-        </div>
-
-        {/* Connection error */}
         {connectionsQuery.isError && (
-          <div className="mt-5 rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-500">
+          <div className="mb-4 rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-500">
             {connectionsQuery.error.message}
-
             <button
               type="button"
               onClick={() => connectionsQuery.refetch()}
@@ -366,183 +326,158 @@ function Connectors() {
           </div>
         )}
 
-        {/* Connected accounts */}
-        {googleConnections.map((connection) => (
-          <div
-            key={connection.id}
-            className={`mt-6 flex flex-col justify-between gap-4 rounded-xl border p-4 sm:flex-row sm:items-center ${colors.account}`}
-          >
-            <div>
-              <div className={`font-medium ${colors.heading}`}>
-                {connection.email || 'Google account'}
-              </div>
-
-              <div className={`mt-1 text-xs ${colors.muted}`}>
-                Connected: {formatDate(connection.connected_at)}
-              </div>
-
-              <div className="mt-2 text-xs font-medium text-emerald-500">
-                Status: {connection.status}
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => handleDisconnect(connection.id)}
-              disabled={disconnectMutation.isPending}
-              className="rounded-lg border border-red-500/30 px-4 py-2 text-sm font-medium text-red-500 transition hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {disconnectMutation.isPending
-                ? 'Disconnecting...'
-                : 'Disconnect'}
-            </button>
-          </div>
-        ))}
-
-        {connectedGoogleConnections.length > 0 && (
-          <div className={`mt-6 rounded-xl border p-4 ${colors.account}`}>
-            <label className="block">
-              <span className={`block text-sm font-semibold ${colors.heading}`}>
-                Assistant default Gmail account
-              </span>
-              <span className={`mt-1 block text-xs leading-5 ${colors.muted}`}>
-                The Assistant uses the only connected account automatically.
-                With multiple accounts, it uses this default and will not pick
-                an account on its own.
-              </span>
-              <select
-                value={defaultGmailConnectionId}
-                onChange={(event) => {
-                  setNotice(null)
-                  defaultGmailMutation.mutate(event.target.value)
-                }}
-                disabled={
-                  connectedGoogleConnections.length < 2 ||
-                  defaultGmailMutation.isPending
-                }
-                aria-label="Default Gmail account for Assistant"
-                className={`mt-3 w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-violet-500 disabled:cursor-not-allowed disabled:opacity-60 ${
-                  isDark
-                    ? 'border-[#303448] bg-[#171a27] text-slate-200'
-                    : 'border-slate-200 bg-white text-slate-700'
-                }`}
-              >
-                <option value="">
-                  {connectedGoogleConnections.length < 2
-                    ? 'Automatically use the only connected account'
-                    : 'No default — choose an account'}
-                </option>
-                {connectedGoogleConnections.map((connection) => (
-                  <option key={connection.id} value={connection.id}>
-                    {connection.email || 'Google account'}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-        )}
-
-        {/* Connect button */}
-        <div className="mt-6">
-          {!isGoogleConnected && (
-            <button
-              type="button"
-              onClick={() => {
-                setNotice(null)
-                connectMutation.mutate()
-              }}
-              disabled={
-                connectMutation.isPending ||
-                connectionsQuery.isLoading
-              }
-              className="rounded-xl bg-violet-600 px-6 py-3 font-semibold text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {connectMutation.isPending
-                ? 'Connecting...'
-                : 'Connect Google Account'}
-            </button>
-          )}
-        </div>
-
-      </section>
-
-      {/* Google services */}
-      <section>
-
-        <h2 className={`mb-4 text-xl font-semibold ${colors.heading}`}>
-          Google Services
-        </h2>
-
-        <div className="grid gap-4 sm:grid-cols-2">
-
+        <div className="grid items-stretch gap-4 sm:grid-cols-2">
           {[
             {
+              id: 'gmail',
               name: 'Gmail',
-              icon: '✉',
-              description: 'Search and summarize email, prepare editable draft previews, and save reviewed drafts.',
-              status: 'Implemented · sending requires the separate approval flow',
-              enabled: true,
+              description: 'Connect your account to access Gmail in your workspace.',
+              available: true,
             },
             {
+              id: 'calendar',
               name: 'Google Calendar',
-              icon: '▦',
-              description: 'Calendar event access is not implemented. Meeting discovery can search Gmail instead.',
-              status: 'Not implemented',
-              enabled: false,
+              description: 'Manage your events and schedule.',
+              available: false,
             },
             {
+              id: 'drive',
               name: 'Google Drive',
-              icon: '▱',
-              description: 'Drive file access is not implemented.',
-              status: 'Not implemented',
-              enabled: false,
+              description: 'Access and organize your files.',
+              available: false,
             },
             {
+              id: 'contacts',
               name: 'Google Contacts',
-              icon: '♙',
-              description: 'Contacts access is not implemented.',
-              status: 'Not implemented',
-              enabled: false,
+              description: 'Access and manage your contacts.',
+              available: false,
             },
-          ].map((service) => (
-            <div
-              key={service.name}
-              className={`rounded-xl border p-5 transition ${colors.service}`}
-            >
-              <div className="flex items-center gap-3">
+          ].map((service) => {
+            const isGmail = service.id === 'gmail'
+            const isConnected = isGmail && isGmailConnected
+            const toggleDisabled = !service.available
+              || connectionsQuery.isLoading
+              || connectionsQuery.isError
+              || connectMutation.isPending
+              || disconnectMutation.isPending
 
-                <div className={`flex h-10 w-10 items-center justify-center rounded-xl text-xl ${
-                  service.enabled
-                    ? 'bg-emerald-500/10 text-emerald-500'
-                    : isDark
-                      ? 'bg-slate-800 text-slate-400'
-                      : 'bg-slate-100 text-slate-500'
-                }`}>
-                  {service.icon}
+            return (
+              <article
+                key={service.id}
+                className={`flex min-h-44 flex-col rounded-2xl border p-5 ${colors.service}`}
+              >
+                <div className="flex items-start gap-3">
+                  <div className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-xl ${
+                    isDark ? 'bg-[#1b1e2b]' : 'bg-slate-50'
+                  }`}>
+                    <GoogleServiceIcon service={service.id} />
+                  </div>
+
+                  <div className="min-w-0 flex-1">
+                    <h3 className={`font-semibold ${colors.heading}`}>
+                      {service.name}
+                    </h3>
+                    <p className={`mt-1 text-sm leading-5 ${colors.muted}`}>
+                      {service.description}
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-label={`${service.name} connection`}
+                    aria-checked={Boolean(isConnected)}
+                    aria-disabled={toggleDisabled}
+                    disabled={toggleDisabled}
+                    onClick={() => {
+                      if (isGmail) handleGmailToggle()
+                    }}
+                    className={`relative mt-1 inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2 ${
+                      isConnected
+                        ? 'bg-violet-600'
+                        : isDark
+                          ? 'bg-slate-700'
+                          : 'bg-slate-300'
+                    } ${toggleDisabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                        isConnected ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
                 </div>
 
-                <h3 className={`font-semibold ${colors.heading}`}>
-                  {service.name}
-                </h3>
+                <div className="mt-auto pt-5">
+                  {isGmail ? (
+                    <>
+                      <p className={`text-xs font-medium ${
+                        isConnected ? 'text-emerald-500' : colors.muted
+                      }`}>
+                        {connectionsQuery.isLoading
+                          ? 'Checking connection...'
+                          : connectMutation.isPending
+                            ? 'Connecting...'
+                            : disconnectMutation.isPending
+                              ? 'Disconnecting...'
+                              : isConnected
+                                ? 'Connected'
+                                : 'Not connected'}
+                      </p>
 
-              </div>
+                      {connectedGoogleConnections.some(
+                        (connection) => connection.capabilities?.gmail !== true,
+                      ) && !isConnected && (
+                        <p className={`mt-2 text-xs ${colors.muted}`}>
+                          Gmail access is not enabled for this account.
+                        </p>
+                      )}
 
-              <p className={`mt-3 text-sm ${colors.muted}`}>
-                {service.description}
-              </p>
-
-              <div className={`mt-4 text-xs font-medium ${
-                service.enabled
-                  ? 'text-emerald-500'
-                  : colors.muted
-              }`}>
-                {service.status}
-              </div>
-            </div>
-          ))}
-
+                      {connectedGoogleConnections.map((connection) => (
+                        <div
+                          key={connection.id}
+                          className={`mt-3 flex items-center justify-between gap-3 border-t pt-3 ${colors.divider}`}
+                        >
+                          <div className="min-w-0">
+                            <p className={`truncate text-sm font-medium ${colors.heading}`}>
+                              {connection.email || 'Google account'}
+                            </p>
+                            <p className={`mt-1 text-xs ${colors.muted}`}>
+                              {connection.capabilities?.gmail === true
+                                ? `Connected ${formatDate(connection.connected_at)}`
+                                : 'Gmail access unavailable'}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleDisconnect(connection.id)}
+                            disabled={disconnectMutation.isPending}
+                            className={`shrink-0 rounded-lg border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                              isDark
+                                ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                                : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                            }`}
+                          >
+                            Disconnect
+                          </button>
+                        </div>
+                      ))}
+                    </>
+                  ) : (
+                    <div className="flex items-center justify-between">
+                      <span className={`text-xs ${colors.muted}`}>
+                        Coming soon
+                      </span>
+                      <span className={`text-xs ${colors.muted}`}>
+                        Not connected
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </article>
+            )
+          })}
         </div>
-
       </section>
 
       {/* Background refresh indicator */}

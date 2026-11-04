@@ -2,6 +2,9 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.repositories.oauth_credential_repository import (
+    OAuthCredentialRepository,
+)
 from app.repositories.user_connection_repository import (
     UserConnectionRepository,
 )
@@ -14,9 +17,14 @@ class UserConnectionService:
     Handles connection creation and reconnection.
     """
 
+    GMAIL_READ_SCOPE = (
+        "https://www.googleapis.com/auth/gmail.readonly"
+    )
+
     def __init__(self, db: Session):
         self.db = db
         self.repository = UserConnectionRepository(db)
+        self.credential_repository = OAuthCredentialRepository(db)
 
     def connect_account(
         self,
@@ -93,17 +101,32 @@ class UserConnectionService:
             user_id=user_id,
         )
 
-        return [
-            {
+        results = []
+        for connection in connections:
+            credential = (
+                self.credential_repository.get_by_connection(
+                    user_id=user_id,
+                    connection_id=connection.id,
+                )
+                if connection.provider == "google"
+                and connection.status == "connected"
+                else None
+            )
+            granted_scopes = set(credential.scopes or []) if credential else set()
+
+            results.append({
                 "id": connection.id,
                 "provider": connection.provider,
                 "email": connection.email,
                 "status": connection.status,
                 "connected_at": connection.connected_at,
                 "created_at": connection.created_at,
-            }
-            for connection in connections
-        ]
+                "capabilities": {
+                    "gmail": self.GMAIL_READ_SCOPE in granted_scopes,
+                },
+            })
+
+        return results
 
     def disconnect_account(
         self,
