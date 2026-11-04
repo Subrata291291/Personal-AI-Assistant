@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { getOAuthRedirectTo } from '../lib/authRedirect'
 import { supabase } from '../lib/supabase'
 
 function Signup() {
@@ -68,7 +69,7 @@ function Signup() {
       const { error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: `${window.location.origin}/dashboard`,
+          redirectTo: getOAuthRedirectTo(),
         },
       })
 
