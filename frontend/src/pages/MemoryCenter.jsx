@@ -8,6 +8,7 @@ import {
 } from '@tanstack/react-query'
 
 import { useAuth } from '../context/AuthContext'
+import MemorySettingControl from '../components/MemorySettingControl.jsx'
 import { memoryService } from '../services/memoryService'
 import { api } from '../lib/api.js'
 
@@ -433,10 +434,8 @@ export default function MemoryCenter() {
   // 14. Toggle automatic memory
   // --------------------------------------------------
 
-  function handleMemoryToggle() {
+  function handleMemoryToggle(nextValue) {
     if (settingsMutation.isPending) return
-
-    const nextValue = !memoryEnabled
 
     setError('')
 
@@ -539,8 +538,8 @@ export default function MemoryCenter() {
 
       {/* Automatic Memory */}
       <section className={`rounded-2xl border p-5 ${cardSurface}`}>
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div>
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
             <h2 className="font-semibold">
               Automatic Memory
             </h2>
@@ -551,26 +550,16 @@ export default function MemoryCenter() {
             </p>
           </div>
 
-          <button
-            onClick={handleMemoryToggle}
+          <MemorySettingControl
+            variant="switch"
+            checked={memoryEnabled}
             disabled={
               settingsQuery.isPending ||
               settingsMutation.isPending
             }
-            className={`rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50 ${
-              memoryEnabled
-                ? 'bg-emerald-500/20 text-emerald-500'
-                : 'bg-slate-500/20 text-slate-500'
-            }`}
-          >
-            {settingsQuery.isPending
-              ? 'Loading...'
-              : settingsMutation.isPending
-                ? 'Saving...'
-                : memoryEnabled
-                  ? 'ON'
-                  : 'OFF'}
-          </button>
+            isDark={isDark}
+            onChange={handleMemoryToggle}
+          />
         </div>
       </section>
 

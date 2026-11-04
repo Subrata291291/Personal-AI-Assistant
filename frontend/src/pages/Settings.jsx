@@ -7,6 +7,7 @@ import {
 import { useOutletContext } from 'react-router-dom'
 
 import AppIcon from '../components/AppIcon'
+import MemorySettingControl from '../components/MemorySettingControl.jsx'
 import { useAuth } from '../context/AuthContext'
 import { api } from '../lib/api.js'
 
@@ -285,20 +286,18 @@ function Settings() {
                 Enable long-term memory
               </span>
               <span className={`mt-1 block text-xs leading-5 ${muted}`}>
-                {memoryEnabled
-                  ? 'Personal details may be saved to help future conversations.'
-                  : 'New details will not be added to long-term memory.'}
+                Personal details may be saved to help future conversations.
               </span>
             </span>
-            <input
-              type="checkbox"
+            <MemorySettingControl
+              variant="checkbox"
               checked={memoryEnabled}
-              disabled={memoryMutation.isPending}
-              onChange={(event) => {
+              disabled={memoryMutation.isPending || settingsQuery.isPending}
+              isDark={isDark}
+              onChange={(nextValue) => {
                 setNotice(null)
-                memoryMutation.mutate(event.target.checked)
+                memoryMutation.mutate(nextValue)
               }}
-              className="h-5 w-5 shrink-0 accent-violet-500"
             />
           </label>
         )}
