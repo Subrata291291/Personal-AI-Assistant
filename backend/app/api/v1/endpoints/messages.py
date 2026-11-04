@@ -463,7 +463,10 @@ async def get_email_draft_save_status(
             state="failed",
             connection_id=connection_id,
             operation_id=operation_id,
-            detail="Gmail rejected the draft creation request; no retry was made.",
+            detail=(
+                "Gmail definitively rejected this draft save. It is safe to "
+                "retry the same operation."
+            ),
         )
 
     if state == "saving":

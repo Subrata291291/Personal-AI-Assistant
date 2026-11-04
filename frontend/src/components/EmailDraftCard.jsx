@@ -164,6 +164,7 @@ function EmailDraftCard({
       setSaveBlockedLocally(false)
       onUpdated(updatedMessage)
       if (emailDraft === null) return
+      setSaveOperationId(null)
       setDraft(draftCopy(updatedMessage.metadata.email_draft))
     },
     onError: (mutationError) => {
@@ -191,7 +192,7 @@ function EmailDraftCard({
           ? 'Gmail confirmed the draft, but conversation history needs reconciliation.'
           : result.repeated
             ? 'This preview was already saved to Gmail Drafts.'
-            : 'Draft saved to Gmail Drafts. It has not been sent.',
+            : 'Draft saved to Gmail. It has not been sent.',
       )
       onUpdated({
         ...message,
@@ -262,6 +263,10 @@ function EmailDraftCard({
       } else if (result.state === 'saving') {
         setSaveBlockedLocally(true)
         setSaveNotice('The original Gmail draft operation is still processing.')
+        setError('')
+      } else if (result.state === 'failed') {
+        setSaveBlockedLocally(false)
+        setSaveNotice('The save was rejected. You can safely retry this draft.')
         setError('')
       } else {
         setSaveBlockedLocally(true)
@@ -401,7 +406,15 @@ function EmailDraftCard({
     gmailSaveInProgress.current = true
     setError('')
     setSaveNotice('')
-    const operationId = saveOperationId || crypto.randomUUID()
+    const operationId =
+      saveOperationId ||
+      (
+        saveRecord.state === 'failed' &&
+        saveRecord.connection_id === connectionId
+          ? saveRecord.operation_id
+          : null
+      ) ||
+      crypto.randomUUID()
     setSaveOperationId(operationId)
     saveMutation.mutate({
       connection: connectionId,
@@ -527,6 +540,14 @@ function EmailDraftCard({
               : 'bg-emerald-50 text-emerald-700'
           }`}>
             Saved Gmail Draft ID: <span className="font-mono">{saveRecord.saved_result.draft_id}</span>
+            <a
+              href="https://mail.google.com/mail/u/0/#drafts"
+              target="_blank"
+              rel="noreferrer"
+              className="ml-2 font-semibold underline"
+            >
+              Open Gmail Drafts
+            </a>
             {saveRecord.saved_connection_id !== connectionId && (
               <span className="ml-1">· saved in a different selected account</span>
             )}

@@ -300,6 +300,12 @@ class MessageService:
                     "Draft type and source email cannot be changed."
                 )
             updated_metadata["email_draft"] = email_draft
+            if (
+                email_draft != existing_draft
+                and isinstance(save_record, dict)
+                and save_record.get("state") == "failed"
+            ):
+                updated_metadata.pop("gmail_draft_save", None)
 
         updated_result = (
             self.supabase
