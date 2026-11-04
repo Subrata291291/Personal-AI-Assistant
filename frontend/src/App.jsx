@@ -18,6 +18,8 @@ import Settings from './pages/Settings'
 
 import Login from './pages/Login'
 import Signup from './pages/Signup'
+import PrivacyPolicy from './pages/PrivacyPolicy'
+import TermsOfService from './pages/TermsOfService'
 
 import { useAuth } from './context/AuthContext'
 
@@ -59,6 +61,8 @@ function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
+          <Route path="/privacy" element={<PrivacyPolicy />} />
+          <Route path="/terms" element={<TermsOfService />} />
 
           {/* Protected dashboard routes */}
           <Route element={<ProtectedRoute />}>

@@ -449,6 +449,26 @@ function Signup() {
               </span>
             </button>
 
+            <div
+              className={`mt-6 flex items-center justify-center gap-3 text-xs ${
+                isDark ? 'text-slate-400' : 'text-slate-500'
+              }`}
+            >
+              <Link
+                to="/privacy"
+                className="font-medium text-violet-500 hover:text-violet-400"
+              >
+                Privacy Policy
+              </Link>
+              <span>•</span>
+              <Link
+                to="/terms"
+                className="font-medium text-violet-500 hover:text-violet-400"
+              >
+                Terms of Service
+              </Link>
+            </div>
+
             <p
               className={`mt-8 text-center text-sm ${
                 isDark ? 'text-slate-400' : 'text-slate-500'
