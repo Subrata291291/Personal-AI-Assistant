@@ -859,9 +859,25 @@ class GmailService:
             json_data={"removeLabelIds": ["INBOX"]},
         )
 
+        result_id = result.get("id")
+        label_ids = result.get("labelIds")
+        if (
+            result_id != message_id
+            or not isinstance(label_ids, list)
+            or any(not isinstance(label, str) for label in label_ids)
+        ):
+            raise RuntimeError(
+                "Gmail API returned an invalid archive response."
+            )
+
+        if "INBOX" in label_ids:
+            raise RuntimeError(
+                "Gmail API did not remove the message from Inbox."
+            )
+
         return {
-            "id": result.get("id", message_id),
-            "label_ids": result.get("labelIds", []),
+            "id": result_id,
+            "label_ids": label_ids,
             "status": "archived",
         }
 

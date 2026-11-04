@@ -309,6 +309,18 @@ export default function Gmail() {
         return gmailService.archiveMessage({
           connectionId: targetConnectionId,
           messageId,
+        }).then((result) => {
+          if (
+            result?.id !== messageId ||
+            !Array.isArray(result.label_ids) ||
+            result.label_ids.includes('INBOX')
+          ) {
+            throw new Error(
+              'Gmail did not confirm that the email was removed from Inbox.'
+            )
+          }
+
+          return result
         })
       }
 
@@ -509,7 +521,7 @@ export default function Gmail() {
             variables.connectionId,
             'inbox',
           ],
-          refetchType: 'none',
+          refetchType: 'active',
         })
       }
 
@@ -1866,27 +1878,53 @@ export default function Gmail() {
             <div className="flex items-start justify-between gap-4">
               <div className="flex items-center gap-3">
                 <div
+                  data-testid={
+                    messageActionConfirmation.action === 'archive'
+                      ? 'archive-confirmation-icon'
+                      : 'destructive-confirmation-icon'
+                  }
                   className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-xl ${
-                    isDark
-                      ? 'bg-rose-500/15 text-rose-400'
-                      : 'bg-rose-50 text-rose-600'
+                    messageActionConfirmation.action === 'archive'
+                      ? isDark
+                        ? 'bg-violet-500/15 text-violet-300'
+                        : 'bg-violet-50 text-violet-700'
+                      : isDark
+                        ? 'bg-rose-500/15 text-rose-400'
+                        : 'bg-rose-50 text-rose-600'
                   }`}
                   aria-hidden="true"
                 >
-                  <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    className="h-5 w-5"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M3 6h18m-2 0-.9 13.1A2 2 0 0 1 16.1 21H7.9a2 2 0 0 1-2-1.9L5 6m4 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m-5 4v7m4-7v7"
-                    />
-                  </svg>
+                  {messageActionConfirmation.action === 'archive' ? (
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      className="h-5 w-5"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M4 4h16l1 5H3l1-5ZM4 9v11h16V9m-11 4h6"
+                      />
+                    </svg>
+                  ) : (
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      className="h-5 w-5"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M3 6h18m-2 0-.9 13.1A2 2 0 0 1 16.1 21H7.9a2 2 0 0 1-2-1.9L5 6m4 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m-5 4v7m4-7v7"
+                      />
+                    </svg>
+                  )}
                 </div>
                 <div>
                   <h2
