@@ -21,6 +21,7 @@ from app.schemas.action_approval import (
 
 ACTION_REQUIRED_SCOPES = {
     "gmail.send": "https://www.googleapis.com/auth/gmail.send",
+    "gmail.send_draft": "https://www.googleapis.com/auth/gmail.send",
     "gmail.reply": "https://www.googleapis.com/auth/gmail.send",
     "gmail.reply_all": "https://www.googleapis.com/auth/gmail.send",
     "gmail.forward": "https://www.googleapis.com/auth/gmail.send",
@@ -123,6 +124,37 @@ class ActionApprovalService:
             )
         return ActionApprovalProposal.model_validate(row)
 
+    def create_gmail_draft_proposal(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        parameters: dict[str, Any],
+    ) -> ActionApprovalProposal:
+        connection = self._validate_connection(
+            user_id=user_id,
+            connection_id=connection_id,
+            action_type="gmail.send_draft",
+        )
+        validated = ApprovalProposalCreate.model_validate({
+            "conversation_id": uuid4(),
+            "source_message_id": uuid4(),
+            "connection_id": connection_id,
+            "action_type": "gmail.send_draft",
+            "parameters": parameters,
+        })
+        proposal_id = uuid4()
+        row = self.repository.create_gmail_draft_proposal(
+            proposal_id=proposal_id,
+            source_message_id=validated.source_message_id,
+            conversation_id=validated.conversation_id,
+            user_id=user_id,
+            parameters=validated.parameters,
+            connection_id=connection_id,
+            account_email=connection.email,
+            expiration_minutes=self.PROPOSAL_TTL_MINUTES,
+        )
+        return ActionApprovalProposal.model_validate(row)
+
     def list_pending(
         self,
         user_id: UUID,
@@ -213,7 +245,7 @@ class ActionApprovalService:
     ) -> ActionApprovalProposal:
         """Atomically claim an approved Gmail-send proposal."""
         proposal = self.get_proposal(user_id, proposal_id)
-        if proposal.action_type != "gmail.send":
+        if proposal.action_type not in {"gmail.send", "gmail.send_draft"}:
             raise PermissionError(
                 "Only Gmail send actions can be executed in this phase."
             )
@@ -275,6 +307,27 @@ class ActionApprovalService:
         if transitioned is None:
             raise ApprovalConflictError(
                 "The proposal is not owned by this user or is not executing."
+            )
+        return self.get_proposal(user_id, proposal_id)
+
+    def finish_reconciled_execution(
+        self,
+        user_id: UUID,
+        proposal_id: UUID,
+        safe_result: dict[str, Any],
+    ) -> ActionApprovalProposal:
+        result = validate_safe_result(safe_result)
+        transitioned = self.repository.transition(
+            user_id=user_id,
+            proposal_id=proposal_id,
+            expected_status="execution_uncertain",
+            new_status="completed",
+            timestamp_field="completed_at",
+            result=result,
+        )
+        if transitioned is None:
+            raise ApprovalConflictError(
+                "The uncertain proposal is not owned by this user."
             )
         return self.get_proposal(user_id, proposal_id)
 

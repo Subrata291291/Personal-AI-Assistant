@@ -103,7 +103,7 @@ _RECOVER_STALE_GMAIL_SEND = text("""
       AND approval_message.metadata->'action_approval'->>'proposal_id'
           = CAST(:proposal_id AS uuid)::text
       AND approval_message.metadata->'action_approval'->>'action_type'
-          = 'gmail.send'
+          IN ('gmail.send', 'gmail.send_draft')
       AND approval_message.metadata->'action_approval'->>'status'
           = 'executing'
       AND (
@@ -116,6 +116,72 @@ _RECOVER_STALE_GMAIL_SEND = text("""
         approval_message.id AS message_id,
         approval_message.metadata->'action_approval' AS proposal,
         NULL::text AS account_email
+""")
+
+_INSERT_GMAIL_DRAFT_PROPOSAL = text("""
+    WITH proposal_clock AS (
+        SELECT clock_timestamp() AS created_at
+    ),
+    approval_conversation AS (
+        INSERT INTO public.pa_conversations (
+            id, user_id, title, is_archived
+        )
+        VALUES (
+            CAST(:conversation_id AS uuid),
+            CAST(:user_id AS uuid),
+            'Gmail draft approval',
+            true
+        )
+        RETURNING id
+    ),
+    source_message AS (
+        INSERT INTO public.pa_conversation_messages (
+            id, conversation_id, role, content, metadata
+        )
+        SELECT
+            CAST(:source_message_id AS uuid),
+            approval_conversation.id,
+            'assistant',
+            'Gmail draft send approval context',
+            jsonb_build_object('internal_action_approval_source', true)
+        FROM approval_conversation
+        RETURNING id, conversation_id
+    )
+    INSERT INTO public.pa_conversation_messages (
+        id, conversation_id, role, content, metadata
+    )
+    SELECT
+        CAST(:proposal_id AS uuid),
+        source_message.conversation_id,
+        'assistant',
+        'Approval proposal: gmail.send_draft',
+        jsonb_build_object(
+            'action_approval',
+            jsonb_build_object(
+                'proposal_id', CAST(:proposal_id AS uuid)::text,
+                'source_message_id', source_message.id::text,
+                'user_id', CAST(:user_id AS uuid)::text,
+                'conversation_id', source_message.conversation_id::text,
+                'action_type', 'gmail.send_draft',
+                'parameters', CAST(:parameters AS jsonb),
+                'connection_id', CAST(:connection_id AS uuid)::text,
+                'account_email', :account_email,
+                'created_at', proposal_clock.created_at::text,
+                'expires_at',
+                    (
+                        proposal_clock.created_at
+                        + make_interval(mins => :expiration_minutes)
+                    )::text,
+                'status', 'pending',
+                'approved_at', NULL,
+                'execution_started_at', NULL,
+                'completed_at', NULL,
+                'result', NULL
+            )
+        )
+    FROM source_message
+    CROSS JOIN proposal_clock
+    RETURNING id AS message_id, metadata, created_at
 """)
 
 _LIST_PENDING = text("""
@@ -258,6 +324,45 @@ class ActionApprovalRepository:
             if row is None:
                 return None
             return self._proposal_row(row, account_email)
+
+    def create_gmail_draft_proposal(
+        self,
+        *,
+        proposal_id: UUID,
+        source_message_id: UUID,
+        conversation_id: UUID,
+        user_id: UUID,
+        parameters: dict[str, Any],
+        connection_id: UUID,
+        account_email: str | None,
+        expiration_minutes: int,
+    ) -> dict[str, Any]:
+        params = {
+            "proposal_id": str(proposal_id),
+            "source_message_id": str(source_message_id),
+            "conversation_id": str(conversation_id),
+            "user_id": str(user_id),
+            "parameters": json.dumps(
+                parameters,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "connection_id": str(connection_id),
+            "account_email": account_email,
+            "expiration_minutes": expiration_minutes,
+        }
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    _INSERT_GMAIL_DRAFT_PROPOSAL,
+                    params,
+                )
+                .mappings()
+                .first()
+            )
+        if row is None:
+            raise RuntimeError("Gmail draft approval could not be stored.")
+        return self._proposal_row(row, account_email)
 
     def get_proposal(
         self,

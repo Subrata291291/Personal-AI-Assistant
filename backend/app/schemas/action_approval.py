@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import (
     BaseModel,
     ConfigDict,
+    EmailStr,
     Field,
     JsonValue,
     field_validator,
@@ -18,6 +19,7 @@ from app.schemas.email_draft import normalize_email_address
 
 ActionType = Literal[
     "gmail.send",
+    "gmail.send_draft",
     "gmail.reply",
     "gmail.reply_all",
     "gmail.forward",
@@ -49,6 +51,10 @@ ApprovalStatus = Literal[
 ACTION_PARAMETER_FIELDS: dict[str, tuple[set[str], set[str]]] = {
     "gmail.send": (
         {"to", "subject", "body"},
+        {"cc", "bcc"},
+    ),
+    "gmail.send_draft": (
+        {"draft_id", "message_id", "to", "subject", "body"},
         {"cc", "bcc"},
     ),
     "gmail.reply": (
@@ -186,6 +192,7 @@ class ApprovalProposalCreate(BaseModel):
                 raise ValueError(f"{key} cannot be empty.")
         if self.action_type in {
             "gmail.send",
+            "gmail.send_draft",
             "gmail.reply",
             "gmail.reply_all",
             "gmail.forward",
@@ -197,6 +204,9 @@ class ApprovalProposalCreate(BaseModel):
             value = self.parameters.get(key)
             if isinstance(value, str) and not _RESOURCE_ID_PATTERN.fullmatch(value):
                 raise ValueError(f"{key} is invalid.")
+        draft_id = self.parameters.get("draft_id")
+        if isinstance(draft_id, str) and not _RESOURCE_ID_PATTERN.fullmatch(draft_id):
+            raise ValueError("draft_id is invalid.")
 
         for key in ("to", "cc", "bcc"):
             recipients = self.parameters.get(key)
@@ -231,6 +241,7 @@ class ApprovalProposalCreate(BaseModel):
 
         if self.action_type in {
             "gmail.send",
+            "gmail.send_draft",
             "gmail.reply",
             "gmail.reply_all",
             "gmail.forward",
@@ -254,6 +265,17 @@ class ApprovalProposalCreate(BaseModel):
         ):
             raise ValueError("A new contact requires an email or phone number.")
         return self
+
+
+class GmailDraftSendApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connection_id: UUID
+    to: list[EmailStr] = Field(min_length=1, max_length=50)
+    cc: list[EmailStr] = Field(default_factory=list, max_length=50)
+    bcc: list[EmailStr] = Field(default_factory=list, max_length=50)
+    subject: str = Field(max_length=500)
+    body: str = Field(min_length=1, max_length=20_000)
 
 
 class ActionApprovalProposal(BaseModel):

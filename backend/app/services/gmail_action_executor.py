@@ -45,7 +45,7 @@ class GmailActionExecutor:
             user_id=user_id,
             proposal_id=proposal_id,
         )
-        if proposal.action_type != "gmail.send":
+        if proposal.action_type not in {"gmail.send", "gmail.send_draft"}:
             raise PermissionError(
                 "Only Gmail send actions can be executed in this phase."
             )
@@ -55,7 +55,7 @@ class GmailActionExecutor:
             user_id=user_id,
             proposal_id=proposal_id,
         )
-        if claimed.action_type != "gmail.send":
+        if claimed.action_type not in {"gmail.send", "gmail.send_draft"}:
             raise PermissionError(
                 "Only Gmail send actions can be executed in this phase."
             )
@@ -63,15 +63,29 @@ class GmailActionExecutor:
         try:
             validated = self._validate_stored_send(claimed)
             parameters = validated.parameters
-            result = await self.gmail_service.send_message(
-                user_id=user_id,
-                connection_id=claimed.connection_id,
-                to=parameters["to"],
-                cc=parameters.get("cc"),
-                bcc=parameters.get("bcc"),
-                subject=parameters["subject"],
-                body=parameters["body"],
-            )
+            if claimed.action_type == "gmail.send_draft":
+                result = await self.gmail_service.send_draft(
+                    user_id=user_id,
+                    connection_id=claimed.connection_id,
+                    draft_id=parameters["draft_id"],
+                    message_id=parameters["message_id"],
+                    to=parameters["to"],
+                    cc=parameters.get("cc"),
+                    bcc=parameters.get("bcc"),
+                    subject=parameters["subject"],
+                    body=parameters["body"],
+                    operation_id=proposal_id,
+                )
+            else:
+                result = await self.gmail_service.send_message(
+                    user_id=user_id,
+                    connection_id=claimed.connection_id,
+                    to=parameters["to"],
+                    cc=parameters.get("cc"),
+                    bcc=parameters.get("bcc"),
+                    subject=parameters["subject"],
+                    body=parameters["body"],
+                )
         except GoogleAPIError as exc:
             uncertain = exc.status_code == 408 or exc.status_code >= 500
             state = "execution_uncertain" if uncertain else "failed"
@@ -163,7 +177,7 @@ class GmailActionExecutor:
     def _validate_stored_send(
         proposal: ActionApprovalProposal,
     ) -> ApprovalProposalCreate:
-        if proposal.action_type != "gmail.send":
+        if proposal.action_type not in {"gmail.send", "gmail.send_draft"}:
             raise PermissionError(
                 "Only Gmail send actions can be executed in this phase."
             )
@@ -196,6 +210,61 @@ class GmailActionExecutor:
             )
             raise ExecutionStatePersistenceError(
                 "The Gmail send outcome could not be persisted. Do not retry."
+            ) from exc
+
+    async def reconcile(
+        self,
+        user_id: UUID,
+        proposal_id: UUID,
+    ) -> ActionApprovalProposal:
+        proposal = self.approval_service.get_proposal(
+            user_id=user_id,
+            proposal_id=proposal_id,
+        )
+        if (
+            proposal.action_type != "gmail.send_draft"
+            or proposal.status != "execution_uncertain"
+        ):
+            return proposal
+        try:
+            found = await self.gmail_service.find_sent_draft_by_operation_id(
+                user_id=user_id,
+                connection_id=proposal.connection_id,
+                operation_id=proposal_id,
+                started_at=proposal.execution_started_at,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Gmail draft send reconciliation failed | proposal_id=%s "
+                "error_type=%s",
+                proposal_id,
+                type(exc).__name__,
+            )
+            return proposal
+        if found is None:
+            return proposal
+        safe_result = {
+            "outcome": "sent",
+            "gmail_message_id": found["id"],
+        }
+        thread_id = found.get("thread_id")
+        if isinstance(thread_id, str) and _GMAIL_ID_PATTERN.fullmatch(thread_id):
+            safe_result["gmail_thread_id"] = thread_id
+        try:
+            return self.approval_service.finish_reconciled_execution(
+                user_id=user_id,
+                proposal_id=proposal_id,
+                safe_result=safe_result,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Confirmed Gmail draft send could not be reconciled | "
+                "proposal_id=%s",
+                proposal_id,
+            )
+            raise ExecutionStatePersistenceError(
+                "Gmail confirmed the send, but its result could not be "
+                "persisted. Do not retry."
             ) from exc
 
 

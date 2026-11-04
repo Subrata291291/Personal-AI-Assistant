@@ -1,5 +1,6 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   useInfiniteQuery,
   useQuery,
@@ -10,6 +11,7 @@ import { useOutletContext } from 'react-router-dom'
 
 import { api } from '../lib/api.js'
 import { gmailService } from '../services/gmailService.js'
+import { actionApprovalService } from '../services/actionApprovalService.js'
 import { useAuth } from '../context/AuthContext'
 import { sanitizeEmailHtml } from '../utils/sanitizeEmailHtml.js'
 import SenderAvatar from '../components/SenderAvatar.jsx'
@@ -39,6 +41,16 @@ function getAttachmentName(attachment) {
     attachment.name ||
     'Unnamed attachment'
   )
+}
+
+function isValidEmailAddress(address) {
+  return /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
+    .test(address)
+}
+
+function isGmailDraft(message) {
+  return Array.isArray(message?.labels) &&
+    message.labels.some((label) => String(label).toUpperCase() === 'DRAFT')
 }
 
 function GmailActionSpinner() {
@@ -96,10 +108,24 @@ export default function Gmail() {
   const [showHtmlBody, setShowHtmlBody] = useState(true)
   const [downloadingAttachmentId, setDownloadingAttachmentId] = useState(null)
   const [attachmentDownloadError, setAttachmentDownloadError] = useState('')
+  const [draftReviewOpen, setDraftReviewOpen] = useState(false)
+  const [draftReviewStep, setDraftReviewStep] = useState('edit')
+  const [draftReviewData, setDraftReviewData] = useState({
+    to: '',
+    cc: '',
+    bcc: '',
+    subject: '',
+    body: '',
+  })
+  const [draftReviewError, setDraftReviewError] = useState('')
+  const [draftSendApproval, setDraftSendApproval] = useState(null)
   const [manualRefreshing, setManualRefreshing] = useState(false)
   const [trashNotice, setTrashNotice] = useState(null)
   const [messageActionConfirmation, setMessageActionConfirmation] = useState(null)
   const trashRequestInFlight = useRef(false)
+  const draftApprovalInFlight = useRef(false)
+  const draftExecutionInFlight = useRef(false)
+  const completedDraftProposalId = useRef(null)
 
   useEffect(
     () => () => window.clearTimeout(searchTimerRef.current),
@@ -251,6 +277,94 @@ export default function Gmail() {
 
     onError: (error) => {
       setComposeError(error.message || 'Unable to send email.')
+    },
+  })
+
+  const createDraftSendApprovalMutation = useMutation({
+    mutationFn: ({ messageId, payload }) =>
+      actionApprovalService.createDraftSendApproval(messageId, payload),
+    onSuccess: (response) => {
+      setDraftSendApproval(response.proposal)
+      setDraftReviewStep('approval')
+      setDraftReviewError('')
+    },
+    onError: (error) => {
+      setDraftReviewError(
+        error.message || 'Unable to create the Gmail draft approval.',
+      )
+    },
+    onSettled: () => {
+      draftApprovalInFlight.current = false
+    },
+  })
+
+  const approveDraftSendMutation = useMutation({
+    mutationFn: (proposalId) => actionApprovalService.approve(proposalId),
+    onSuccess: (response) => {
+      setDraftSendApproval(response.proposal)
+      setDraftReviewError('')
+    },
+    onError: (error) => {
+      setDraftReviewError(error.message || 'Unable to approve this send.')
+    },
+    onSettled: () => {
+      draftApprovalInFlight.current = false
+    },
+  })
+
+  const rejectDraftSendMutation = useMutation({
+    mutationFn: (proposalId) => actionApprovalService.reject(proposalId),
+    onSuccess: (response) => {
+      setDraftSendApproval(response.proposal)
+      setDraftReviewError('')
+    },
+    onError: (error) => {
+      setDraftReviewError(error.message || 'Unable to cancel this approval.')
+    },
+    onSettled: () => {
+      draftApprovalInFlight.current = false
+    },
+  })
+
+  const executeDraftSendMutation = useMutation({
+    mutationFn: (proposalId) => actionApprovalService.execute(proposalId),
+    onSuccess: (response) => {
+      setDraftSendApproval(response.proposal)
+      setDraftReviewError('')
+      if (response.proposal.status === 'completed') {
+        completeDraftSend(response.proposal.proposal_id)
+      }
+    },
+    onError: (error) => {
+      setDraftSendApproval((current) =>
+        current
+          ? { ...current, status: 'execution_uncertain' }
+          : current,
+      )
+      setDraftReviewError(
+        error.message ||
+          'The send outcome is uncertain. Check status before taking further action.',
+      )
+    },
+    onSettled: () => {
+      draftExecutionInFlight.current = false
+    },
+  })
+
+  const checkDraftSendStatusMutation = useMutation({
+    mutationFn: (proposalId) => actionApprovalService.getProposal(proposalId),
+    onSuccess: (proposal) => {
+      setDraftSendApproval(proposal)
+      setDraftReviewError('')
+      if (proposal.status === 'completed') {
+        completeDraftSend(proposal.proposal_id)
+      }
+    },
+    onError: (error) => {
+      setDraftReviewError(
+        error.message ||
+          'Unable to check send status. Do not retry an uncertain send.',
+      )
     },
   })
 
@@ -722,11 +836,166 @@ export default function Gmail() {
     setShowHtmlBody(true)
   }
 
-  function closeMessageDetails() {
+  function closeMessageDetails(force = false) {
+    if (
+      !force &&
+      draftSendApproval &&
+      ['executing', 'execution_uncertain'].includes(draftSendApproval.status)
+    ) {
+      return
+    }
     setSelectedMessageId(null)
     setShowHtmlBody(true)
     setAttachmentDownloadError('')
     setDownloadingAttachmentId(null)
+  }
+
+  function openDraftSendReview(message) {
+    if (!isGmailDraft(message)) return
+    setDraftReviewData({
+      to: message.headers?.to || '',
+      cc: message.headers?.cc || '',
+      bcc: message.headers?.bcc || '',
+      subject: message.headers?.subject || '',
+      body: message.body?.plain_text || message.body?.text || '',
+    })
+    setDraftReviewError(
+      message.attachments?.length
+        ? 'This draft has attachments. To avoid losing them, send it in Gmail until attachment-preserving review is supported.'
+        : '',
+    )
+    setDraftSendApproval(null)
+    setDraftReviewStep('edit')
+    setDraftReviewOpen(true)
+  }
+
+  function completeDraftSend(proposalId) {
+    if (completedDraftProposalId.current === proposalId) return
+    completedDraftProposalId.current = proposalId
+    const sentDraftMessageId =
+      draftSendApproval?.parameters?.message_id || selectedMessageId
+    queryClient.setQueriesData(
+      {
+        queryKey: [
+          'gmail-messages',
+          userId,
+          connectionId,
+          'drafts',
+        ],
+      },
+      (data) => data?.pages
+        ? {
+            ...data,
+            pages: data.pages.map((page) => ({
+              ...page,
+              messages: (page.messages || []).filter(
+                (message) => message.id !== sentDraftMessageId,
+              ),
+            })),
+          }
+        : data,
+    )
+    for (const folder of ['drafts', 'sent', 'all']) {
+      queryClient.invalidateQueries({
+        queryKey: [
+          'gmail-messages',
+          userId,
+          connectionId,
+          folder,
+        ],
+        refetchType: 'all',
+      })
+    }
+    setDraftReviewOpen(false)
+    setDraftSendApproval(null)
+    setComposeSuccess('Draft sent successfully!')
+    closeMessageDetails(true)
+  }
+
+  function handleDraftReviewChange(field, value) {
+    setDraftReviewData((current) => ({ ...current, [field]: value }))
+    setDraftReviewError('')
+  }
+
+  function createDraftSendApproval(event) {
+    event.preventDefault()
+    if (
+      !selectedMessageId ||
+      !connectionId ||
+      draftApprovalInFlight.current ||
+      createDraftSendApprovalMutation.isPending
+    ) {
+      return
+    }
+    if (selectedMessage?.attachments?.length) {
+      setDraftReviewError(
+        'This draft has attachments. To avoid losing them, send it in Gmail until attachment-preserving review is supported.',
+      )
+      return
+    }
+    const to = parseRecipients(draftReviewData.to)
+    const cc = parseRecipients(draftReviewData.cc)
+    const bcc = parseRecipients(draftReviewData.bcc)
+    const recipients = [...to, ...cc, ...bcc]
+    if (!to.length) {
+      setDraftReviewError('Enter at least one To recipient.')
+      return
+    }
+    if (recipients.some((address) => !isValidEmailAddress(address))) {
+      setDraftReviewError('Enter valid email addresses for all recipients.')
+      return
+    }
+    if (new Set(recipients.map((address) => address.toLowerCase())).size !== recipients.length) {
+      setDraftReviewError('A recipient cannot appear more than once.')
+      return
+    }
+    if (!draftReviewData.subject.trim() || !draftReviewData.body.trim()) {
+      setDraftReviewError('Subject and message are required before sending.')
+      return
+    }
+    draftApprovalInFlight.current = true
+    createDraftSendApprovalMutation.mutate({
+      messageId: selectedMessageId,
+      payload: {
+        connection_id: connectionId,
+        to,
+        cc,
+        bcc,
+        subject: draftReviewData.subject.trim(),
+        body: draftReviewData.body,
+      },
+    })
+  }
+
+  function approveDraftSend() {
+    const proposalId = draftSendApproval?.proposal_id
+    if (!proposalId || draftApprovalInFlight.current) return
+    draftApprovalInFlight.current = true
+    approveDraftSendMutation.mutate(proposalId)
+  }
+
+  function rejectDraftSend() {
+    const proposalId = draftSendApproval?.proposal_id
+    if (!proposalId || draftApprovalInFlight.current) return
+    draftApprovalInFlight.current = true
+    rejectDraftSendMutation.mutate(proposalId)
+  }
+
+  function executeApprovedDraftSend() {
+    const proposalId = draftSendApproval?.proposal_id
+    if (
+      !proposalId ||
+      draftSendApproval.status !== 'approved' ||
+      draftExecutionInFlight.current
+    ) {
+      return
+    }
+    draftExecutionInFlight.current = true
+    setDraftSendApproval((current) =>
+      current ? { ...current, status: 'executing' } : current,
+    )
+    setDraftReviewError('')
+    executeDraftSendMutation.mutate(proposalId)
   }
 
   async function handleAttachmentDownload(attachment) {
@@ -1743,7 +2012,7 @@ export default function Gmail() {
                       id="compose-subject"
                       type="text"
                       required
-                      maxLength={998}
+                      maxLength={500}
                       value={composeData.subject}
                       onChange={(event) => handleComposeChange('subject', event.target.value)}
                       placeholder="Email subject"
@@ -2040,8 +2309,14 @@ export default function Gmail() {
               <button
                 type="button"
                 onClick={closeMessageDetails}
+                disabled={
+                  Boolean(draftSendApproval) &&
+                  ['executing', 'execution_uncertain'].includes(
+                    draftSendApproval.status,
+                  )
+                }
                 aria-label="Close email details"
-                className={`rounded-lg px-3 py-2 text-xl ${colors.hover} ${colors.text}`}
+                className={`rounded-lg px-3 py-2 text-xl ${colors.hover} ${colors.text} disabled:cursor-not-allowed disabled:opacity-50`}
               >
                 ×
               </button>
@@ -2189,6 +2464,241 @@ export default function Gmail() {
                       </div>
                     )}
 
+                    {draftReviewOpen && selectedMessage && createPortal((
+                      <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 p-3 sm:p-6">
+                        <section
+                          role="dialog"
+                          aria-modal="true"
+                          aria-labelledby="draft-send-review-title"
+                          className={`gmail-scrollbar max-h-[92vh] w-full max-w-2xl overflow-y-auto rounded-2xl border shadow-2xl ${colors.card}`}
+                        >
+                          <header className={`border-b p-5 ${colors.divider}`}>
+                            <h2
+                              id="draft-send-review-title"
+                              className={`text-lg font-bold ${colors.heading}`}
+                            >
+                              {draftReviewStep === 'edit'
+                                ? 'Review draft before sending'
+                                : 'Approve Gmail draft send'}
+                            </h2>
+                            <p className={`mt-1 text-xs ${colors.muted}`}>
+                              Review the final message. Sending requires approval and a separate send confirmation.
+                            </p>
+                          </header>
+
+                          {draftReviewStep === 'edit' ? (
+                            <form onSubmit={createDraftSendApproval}>
+                              <div className="space-y-4 p-5">
+                                {[
+                                  ['to', 'To'],
+                                  ['cc', 'Cc'],
+                                  ['bcc', 'Bcc'],
+                                ].map(([field, label]) => (
+                                  <label key={field} className="block">
+                                    <span className={`mb-1 block text-xs font-semibold ${colors.muted}`}>
+                                      {label}
+                                    </span>
+                                    <input
+                                      aria-label={label}
+                                      value={draftReviewData[field]}
+                                      onChange={(event) =>
+                                        handleDraftReviewChange(field, event.target.value)
+                                      }
+                                      placeholder="name@example.com, ..."
+                                      className={`w-full rounded-lg border px-3 py-2.5 text-sm outline-none focus:border-violet-500 ${colors.input}`}
+                                    />
+                                  </label>
+                                ))}
+                                <label className="block">
+                                  <span className={`mb-1 block text-xs font-semibold ${colors.muted}`}>
+                                    Subject
+                                  </span>
+                                  <input
+                                    aria-label="Subject"
+                                    value={draftReviewData.subject}
+                                    onChange={(event) =>
+                                      handleDraftReviewChange('subject', event.target.value)
+                                    }
+                                    maxLength={998}
+                                    className={`w-full rounded-lg border px-3 py-2.5 text-sm outline-none focus:border-violet-500 ${colors.input}`}
+                                  />
+                                </label>
+                                <label className="block">
+                                  <span className={`mb-1 block text-xs font-semibold ${colors.muted}`}>
+                                    Message
+                                  </span>
+                                  <textarea
+                                    aria-label="Message"
+                                    value={draftReviewData.body}
+                                    onChange={(event) =>
+                                      handleDraftReviewChange('body', event.target.value)
+                                    }
+                                    rows={10}
+                                    maxLength={20_000}
+                                    className={`w-full resize-y rounded-lg border px-3 py-3 text-sm leading-6 outline-none focus:border-violet-500 ${colors.input}`}
+                                  />
+                                </label>
+                                <p className={`text-xs ${colors.muted}`}>
+                                  Continuing stores this exact content in a human-approval proposal. It will not send until you approve and explicitly choose Send approved draft.
+                                </p>
+                                {draftReviewError && (
+                                  <p role="alert" className="text-sm text-rose-500">
+                                    {draftReviewError}
+                                  </p>
+                                )}
+                              </div>
+                              <footer className={`flex justify-end gap-2 border-t p-4 ${colors.divider}`}>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setDraftReviewOpen(false)
+                                    setDraftReviewError('')
+                                  }}
+                                  disabled={createDraftSendApprovalMutation.isPending}
+                                  className={`rounded-lg border px-4 py-2.5 text-sm font-semibold ${colors.input} disabled:opacity-50`}
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="submit"
+                                  disabled={
+                                    createDraftSendApprovalMutation.isPending ||
+                                    Boolean(selectedMessage?.attachments?.length)
+                                  }
+                                  className="rounded-lg bg-violet-600 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  {createDraftSendApprovalMutation.isPending
+                                    ? 'Preparing approval...'
+                                    : 'Continue to approval'}
+                                </button>
+                              </footer>
+                            </form>
+                          ) : (
+                            <>
+                              <div className="space-y-4 p-5">
+                                <p className={`text-sm ${colors.text}`}>
+                                  Approval status: <strong>{draftSendApproval?.status || 'loading'}</strong>
+                                </p>
+                                <dl className={`space-y-3 rounded-xl border p-4 text-sm ${colors.divider}`}>
+                                  {[
+                                    ['To', draftSendApproval?.parameters?.to],
+                                    ['Cc', draftSendApproval?.parameters?.cc],
+                                    ['Bcc', draftSendApproval?.parameters?.bcc],
+                                    ['Subject', draftSendApproval?.parameters?.subject],
+                                    ['Message', draftSendApproval?.parameters?.body],
+                                  ].map(([label, value]) => (
+                                    <div key={label}>
+                                      <dt className={`text-xs font-semibold ${colors.muted}`}>
+                                        {label}
+                                      </dt>
+                                      <dd className={`mt-1 break-words whitespace-pre-wrap ${colors.text}`}>
+                                        {Array.isArray(value) ? value.join(', ') : value || (label === 'Cc' || label === 'Bcc' ? '—' : '')}
+                                      </dd>
+                                    </div>
+                                  ))}
+                                </dl>
+                                {draftSendApproval?.status === 'pending' && (
+                                  <p role="status" className="text-xs text-amber-500">
+                                    No email has been sent. Approve this exact content to enable the separate send action.
+                                  </p>
+                                )}
+                                {draftSendApproval?.status === 'approved' && (
+                                  <p role="status" className="text-xs text-emerald-500">
+                                    Approved. Gmail will send only after you choose Send approved draft.
+                                  </p>
+                                )}
+                                {draftSendApproval?.status === 'executing' && (
+                                  <p role="status" className="text-xs text-violet-400">
+                                    Gmail is processing the approved draft. Do not retry.
+                                  </p>
+                                )}
+                                {draftSendApproval?.status === 'execution_uncertain' && (
+                                  <p role="alert" className="text-xs text-rose-500">
+                                    The send outcome is uncertain. Check status to reconcile; do not retry.
+                                  </p>
+                                )}
+                                {draftSendApproval?.status === 'failed' && (
+                                  <p role="alert" className="text-xs text-rose-500">
+                                    Gmail definitively rejected the send. No automatic retry was made.
+                                  </p>
+                                )}
+                                {draftReviewError && (
+                                  <p role="alert" className="text-sm text-rose-500">
+                                    {draftReviewError}
+                                  </p>
+                                )}
+                              </div>
+                              <footer className={`flex flex-wrap justify-end gap-2 border-t p-4 ${colors.divider}`}>
+                                {draftSendApproval?.status === 'pending' && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={rejectDraftSend}
+                                      disabled={approveDraftSendMutation.isPending || rejectDraftSendMutation.isPending}
+                                      className={`rounded-lg border px-4 py-2.5 text-sm font-semibold ${colors.input} disabled:opacity-50`}
+                                    >
+                                      {rejectDraftSendMutation.isPending ? 'Cancelling...' : 'Cancel approval'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={approveDraftSend}
+                                      disabled={approveDraftSendMutation.isPending}
+                                      className="rounded-lg bg-violet-600 px-4 py-2.5 text-sm font-bold text-white disabled:opacity-50"
+                                    >
+                                      {approveDraftSendMutation.isPending ? 'Approving...' : 'Approve'}
+                                    </button>
+                                  </>
+                                )}
+                                {draftSendApproval?.status === 'approved' && (
+                                  <button
+                                    type="button"
+                                    onClick={executeApprovedDraftSend}
+                                    disabled={executeDraftSendMutation.isPending}
+                                    className="rounded-lg bg-violet-600 px-4 py-2.5 text-sm font-bold text-white disabled:opacity-50"
+                                  >
+                                    {executeDraftSendMutation.isPending
+                                      ? 'Sending approved draft...'
+                                      : 'Send approved draft'}
+                                  </button>
+                                )}
+                                {draftSendApproval?.status === 'execution_uncertain' && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      checkDraftSendStatusMutation.mutate(
+                                        draftSendApproval.proposal_id,
+                                      )
+                                    }
+                                    disabled={checkDraftSendStatusMutation.isPending}
+                                    className={`rounded-lg border px-4 py-2.5 text-sm font-semibold ${colors.input} disabled:opacity-50`}
+                                  >
+                                    {checkDraftSendStatusMutation.isPending
+                                      ? 'Checking send status...'
+                                      : 'Check send status'}
+                                  </button>
+                                )}
+                                {['rejected', 'expired', 'failed'].includes(
+                                  draftSendApproval?.status,
+                                ) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setDraftSendApproval(null)
+                                      setDraftReviewStep('edit')
+                                      setDraftReviewError('')
+                                    }}
+                                    className={`rounded-lg border px-4 py-2.5 text-sm font-semibold ${colors.input}`}
+                                  >
+                                    Edit and review again
+                                  </button>
+                                )}
+                              </footer>
+                            </>
+                          )}
+                        </section>
+                      </div>
+                    ), document.body)}
+
                   </div>
 
                   {/* Attachments */}
@@ -2283,7 +2793,19 @@ export default function Gmail() {
             >
               <div className="flex flex-wrap items-center gap-2">
 
-                {selectedMessage && !messageDetailQuery.isLoading && (
+                {selectedMessage && !messageDetailQuery.isLoading &&
+                  isGmailDraft(selectedMessage) && (
+                  <button
+                    type="button"
+                    onClick={() => openDraftSendReview(selectedMessage)}
+                    className="rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-violet-500"
+                  >
+                    Send
+                  </button>
+                )}
+
+                {selectedMessage && !messageDetailQuery.isLoading &&
+                  !isGmailDraft(selectedMessage) && (
                   <>
                     <button
                       type="button"
@@ -2316,7 +2838,13 @@ export default function Gmail() {
               <button
                 type="button"
                 onClick={closeMessageDetails}
-                className="rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-violet-500"
+                disabled={
+                  Boolean(draftSendApproval) &&
+                  ['executing', 'execution_uncertain'].includes(
+                    draftSendApproval.status,
+                  )
+                }
+                className="rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Back to Inbox
               </button>

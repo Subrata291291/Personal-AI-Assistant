@@ -63,7 +63,7 @@ function renderGmail() {
     },
   })
 
-  return render(
+  const view = render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={['/gmail']}>
         <Routes>
@@ -74,6 +74,7 @@ function renderGmail() {
       </MemoryRouter>
     </QueryClientProvider>,
   )
+  return { ...view, queryClient }
 }
 
 describe('Gmail archive flow', () => {
@@ -286,5 +287,280 @@ describe('Gmail archive flow', () => {
       .toHaveClass('bg-rose-50', 'text-rose-600')
     expect(screen.getByRole('button', { name: 'Delete permanently' }))
       .toHaveClass('bg-rose-600')
+  })
+
+  it('shows only Send for Gmail drafts and opens an editable review', async () => {
+    gmailService.getMessages.mockResolvedValue({
+      messages: [{ ...message, labels: ['DRAFT'] }],
+      next_page_token: null,
+    })
+    gmailService.getMessage.mockResolvedValue({
+      message: {
+        ...message,
+        labels: ['DRAFT'],
+        headers: {
+          to: 'recipient@example.com',
+          cc: 'copy@example.com',
+          subject: 'Draft subject',
+        },
+        body: { plain_text: 'Draft body' },
+        attachments: [],
+      },
+    })
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByRole('dialog', {
+      name: 'Review draft before sending',
+    })).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'To' }))
+      .toHaveValue('recipient@example.com')
+    expect(screen.getByRole('textbox', { name: 'Cc' }))
+      .toHaveValue('copy@example.com')
+    expect(screen.getByRole('textbox', { name: 'Subject' }))
+      .toHaveValue('Draft subject')
+    expect(screen.getByRole('textbox', { name: 'Message' }))
+      .toHaveValue('Draft body')
+    expect(screen.queryByRole('button', { name: /Reply/ }))
+      .not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Forward' }))
+      .not.toBeInTheDocument()
+    expect(api.post.mock.calls.some(([url]) =>
+      url.includes('/action-approvals/gmail-drafts/')
+    )).toBe(false)
+  })
+
+  it('preserves Reply, Reply All, and Forward for received emails', async () => {
+    renderGmail()
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+
+    expect(await screen.findByRole('button', { name: /Reply$/ }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Reply All/ }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Forward/ }))
+      .toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Send' }))
+      .not.toBeInTheDocument()
+  })
+
+  it('cancelling draft review does not create an approval or send', async () => {
+    gmailService.getMessages.mockResolvedValue({
+      messages: [{ ...message, labels: ['DRAFT'] }],
+      next_page_token: null,
+    })
+    gmailService.getMessage.mockResolvedValue({
+      message: {
+        ...message,
+        labels: ['DRAFT'],
+        headers: { to: 'recipient@example.com', subject: 'Draft subject' },
+        body: { plain_text: 'Draft body' },
+        attachments: [],
+      },
+    })
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+
+    expect(screen.queryByRole('dialog', {
+      name: 'Review draft before sending',
+    })).not.toBeInTheDocument()
+    expect(api.post.mock.calls.some(([url]) =>
+      url.includes('/action-approvals/')
+    )).toBe(false)
+  })
+
+  it('blocks editable sending for drafts with attachments to prevent losing them', async () => {
+    gmailService.getMessages.mockResolvedValue({
+      messages: [{ ...message, labels: ['DRAFT'] }],
+      next_page_token: null,
+    })
+    gmailService.getMessage.mockResolvedValue({
+      message: {
+        ...message,
+        labels: ['DRAFT'],
+        headers: { to: 'recipient@example.com', subject: 'Draft subject' },
+        body: { plain_text: 'Draft body' },
+        attachments: [{
+          attachment_id: 'attachment-1',
+          filename: 'proposal.pdf',
+        }],
+      },
+    })
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'This draft has attachments.',
+    )
+    expect(screen.getByRole('button', { name: 'Continue to approval' }))
+      .toBeDisabled()
+    expect(api.post.mock.calls.some(([url]) =>
+      url.includes('/action-approvals/gmail-drafts/')
+    )).toBe(false)
+  })
+
+  it('requires explicit approval and a second send confirmation', async () => {
+    const pendingProposal = {
+      proposal_id: 'proposal-123',
+      status: 'pending',
+      parameters: {
+        to: ['recipient@example.com'],
+        cc: [],
+        bcc: [],
+        subject: 'Draft subject',
+        body: 'Draft body',
+      },
+    }
+    api.post.mockImplementation(async (url) => {
+      if (url.includes('/gmail-drafts/')) {
+        return { proposal: pendingProposal }
+      }
+      if (url.endsWith('/approve')) {
+        return { proposal: { ...pendingProposal, status: 'approved' } }
+      }
+      if (url.endsWith('/execute')) {
+        return {
+          proposal: { ...pendingProposal, status: 'completed' },
+        }
+      }
+      return { authorization_url: 'https://accounts.google.com/' }
+    })
+    gmailService.getMessages.mockResolvedValue({
+      messages: [{ ...message, labels: ['DRAFT'] }],
+      next_page_token: null,
+    })
+    gmailService.getMessage.mockResolvedValue({
+      message: {
+        ...message,
+        labels: ['DRAFT'],
+        headers: { to: 'recipient@example.com', subject: 'Draft subject' },
+        body: { plain_text: 'Draft body' },
+        attachments: [],
+      },
+    })
+    const { queryClient } = renderGmail()
+    const invalidateQueries = vi.spyOn(queryClient, 'invalidateQueries')
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
+
+    expect(await screen.findByText('Approval status:')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument()
+    expect(api.post.mock.calls.some(([url]) => url.endsWith('/execute')))
+      .toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    expect(await screen.findByRole('button', {
+      name: 'Send approved draft',
+    })).toBeInTheDocument()
+    expect(api.post.mock.calls.some(([url]) => url.endsWith('/execute')))
+      .toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send approved draft' }))
+    expect(await screen.findByText('Draft sent successfully!'))
+      .toBeInTheDocument()
+    expect(api.post.mock.calls.filter(([url]) => url.endsWith('/execute')))
+      .toHaveLength(1)
+    await waitFor(() => {
+      const invalidatedFolders = invalidateQueries.mock.calls
+        .map(([filters]) => filters.queryKey?.[3])
+      expect(invalidatedFolders).toEqual(
+        expect.arrayContaining(['drafts', 'sent', 'all']),
+      )
+    })
+  })
+
+  it('does not retry a draft send with an uncertain outcome', async () => {
+    const pendingProposal = {
+      proposal_id: 'proposal-123',
+      status: 'pending',
+      parameters: {
+        to: ['recipient@example.com'],
+        cc: [],
+        bcc: [],
+        subject: 'Draft subject',
+        body: 'Draft body',
+      },
+    }
+    api.post.mockImplementation(async (url) => {
+      if (url.includes('/gmail-drafts/')) {
+        return { proposal: pendingProposal }
+      }
+      if (url.endsWith('/approve')) {
+        return { proposal: { ...pendingProposal, status: 'approved' } }
+      }
+      if (url.endsWith('/execute')) {
+        throw new Error('Connection lost.')
+      }
+      return { authorization_url: 'https://accounts.google.com/' }
+    })
+    api.get.mockImplementation(async (url) => {
+      if (url.endsWith('/action-approvals/proposal-123')) {
+        return { ...pendingProposal, status: 'execution_uncertain' }
+      }
+      return {
+        connections: [{
+          id: 'connection-1',
+          provider: 'google',
+          status: 'connected',
+          email: 'user@example.com',
+        }],
+      }
+    })
+    gmailService.getMessages.mockResolvedValue({
+      messages: [{ ...message, labels: ['DRAFT'] }],
+      next_page_token: null,
+    })
+    gmailService.getMessage.mockResolvedValue({
+      message: {
+        ...message,
+        labels: ['DRAFT'],
+        headers: { to: 'recipient@example.com', subject: 'Draft subject' },
+        body: { plain_text: 'Draft body' },
+        attachments: [],
+      },
+    })
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Send approved draft',
+    }))
+
+    expect(await screen.findByRole('button', { name: 'Check send status' }))
+      .toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Check send status' }))
+    await waitFor(() => {
+      expect(api.get).toHaveBeenCalledWith(
+        expect.stringContaining('/action-approvals/proposal-123'),
+      )
+    })
+    expect(api.post.mock.calls.filter(([url]) => url.endsWith('/execute')))
+      .toHaveLength(1)
+    expect(screen.queryByRole('button', { name: 'Send approved draft' }))
+      .not.toBeInTheDocument()
   })
 })

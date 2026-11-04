@@ -3,6 +3,13 @@ import { api } from '../lib/api.js'
 const BASE_PATH = '/api/v1/action-approvals'
 
 export const actionApprovalService = {
+  createDraftSendApproval(messageId, payload) {
+    return api.post(
+      `${BASE_PATH}/gmail-drafts/${encodeURIComponent(messageId)}`,
+      payload,
+    )
+  },
+
   createProposal(payload) {
     return api.post(BASE_PATH, payload)
   },
