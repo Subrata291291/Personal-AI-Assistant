@@ -269,6 +269,7 @@ class GmailService:
                 "sender": headers.get("from"),
                 "recipient": headers.get("to"),
                 "subject": headers.get("subject"),
+                "internal_date": metadata.get("internalDate"),
                 "date": headers.get("date"),
                 "labels": metadata.get("labelIds", []),
             }

@@ -8,6 +8,7 @@ class GmailMessageSummary(BaseModel):
     sender: str | None = None
     recipient: str | None = None
     subject: str | None = None
+    internal_date: str | None = None
     date: str | None = None
     labels: list[str] = []
 

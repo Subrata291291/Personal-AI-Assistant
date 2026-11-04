@@ -12,6 +12,10 @@ import { api } from '../lib/api.js'
 import { gmailService } from '../services/gmailService.js'
 import { useAuth } from '../context/AuthContext'
 import { sanitizeEmailHtml } from '../utils/sanitizeEmailHtml.js'
+import {
+  formatGmailTimestamp,
+  sortGmailMessagesByReceivedTime,
+} from '../utils/gmailTimestamp.js'
 
 const CACHE_TIME = 5 * 60 * 1000
 const GC_TIME = 30 * 60 * 1000
@@ -27,33 +31,6 @@ const FOLDERS = [
   { id: 'spam', label: 'Spam', icon: '🚫' },
   { id: 'trash', label: 'Trash', icon: '🗑️' },
 ]
-
-function formatDate(value) {
-  if (!value) return ''
-
-  const date = new Date(value)
-
-  if (Number.isNaN(date.getTime())) return value
-
-  return date.toLocaleDateString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-  })
-}
-
-function formatFullDate(value) {
-  if (!value) return 'Not available'
-
-  const date = new Date(value)
-
-  if (Number.isNaN(date.getTime())) return value
-
-  return date.toLocaleString(undefined, {
-    dateStyle: 'medium',
-    timeStyle: 'short',
-  })
-}
 
 function getInitials(sender) {
   if (!sender) return '?'
@@ -640,10 +617,11 @@ export default function Gmail() {
   })
 
   const messages = useMemo(
-    () =>
+    () => sortGmailMessagesByReceivedTime(
       messagesQuery.data?.pages.flatMap(
         (page) => page.messages || [],
       ) || [],
+    ),
     [messagesQuery.data],
   )
 
@@ -1433,8 +1411,11 @@ export default function Gmail() {
                                 {message.sender || 'Unknown sender'}
                               </p>
 
-                              <span className={`shrink-0 text-xs ${colors.muted}`}>
-                                {formatDate(message.date)}
+                              <span
+                                className={`shrink-0 self-end text-right text-xs ${colors.muted} sm:self-auto`}
+                                title={formatGmailTimestamp(message.internal_date).title || undefined}
+                              >
+                                {formatGmailTimestamp(message.internal_date).label}
                               </span>
 
                             </div>
@@ -2147,10 +2128,8 @@ export default function Gmail() {
 
                     <p>
                       <span className={colors.muted}>Date: </span>
-                      {formatFullDate(
-                        selectedMessage.headers?.date ||
-                        selectedMessage.internal_date,
-                      )}
+                      {formatGmailTimestamp(selectedMessage.internal_date).title ||
+                        'Not available'}
                     </p>
 
                   </div>

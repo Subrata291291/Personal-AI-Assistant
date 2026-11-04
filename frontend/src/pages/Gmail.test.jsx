@@ -104,6 +104,47 @@ describe('Gmail archive flow', () => {
     })
   })
 
+  it('uses internalDate for row timestamps and sorts newest received first', async () => {
+    const newest = {
+      ...message,
+      id: 'newest-message',
+      subject: 'Newest received',
+      date: 'Mon, 01 Jan 2001 00:00:00 +0000',
+      internal_date: String(new Date('2026-11-04T19:20:00Z').getTime()),
+    }
+    const older = {
+      ...message,
+      id: 'older-message',
+      subject: 'Older received',
+      date: 'Wed, 01 Jan 2099 00:00:00 +0000',
+      internal_date: String(new Date('2026-11-02T19:20:00Z').getTime()),
+    }
+    gmailService.getMessages.mockImplementation(() => ({
+      messages: [older, newest],
+      next_page_token: null,
+    }))
+
+    renderGmail()
+
+    const newestRow = await screen.findByRole('button', {
+      name: /Open email: Newest received/,
+    })
+    const olderRow = screen.getByRole('button', {
+      name: /Open email: Older received/,
+    })
+    expect(newestRow.compareDocumentPosition(olderRow) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy()
+    const received = new Date(Number(newest.internal_date))
+    expect(screen.getByTitle(received.toLocaleString(undefined, {
+      month: 'long',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+    }))).toBeInTheDocument()
+  })
+
   it('uses the Archive icon and neutral purple styling in its confirmation', async () => {
     renderGmail()
 
