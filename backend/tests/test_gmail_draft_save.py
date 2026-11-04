@@ -3,14 +3,17 @@ import base64
 from datetime import datetime, timezone
 from email import message_from_bytes
 from email.policy import default
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from app.api.deps import get_current_user
 from app.api.v1.endpoints import messages as messages_endpoint
+from app.db.session import get_db
 from app.integrations.google.api_client import GoogleAPIClient
 from app.integrations.google.exceptions import GoogleAPIError
 from app.integrations.google.message_builder import GmailMessageBuilder
@@ -24,6 +27,8 @@ CONVERSATION_ID = uuid4()
 MESSAGE_ID = uuid4()
 CONNECTION_ID = uuid4()
 OPERATION_ID = uuid4()
+VALID_CONNECTION_ID = "4e703667-ef83-49e5-9fb1-99c89bf2b136"
+VALID_OPERATION_ID = "5f582828-884a-4f2f-a3ab-dd10440e255d"
 DRAFT = EmailDraftPreview(
     draft_type="new",
     to=[{"email": "subrata291291@gmail.com"}],
@@ -32,6 +37,33 @@ DRAFT = EmailDraftPreview(
     subject="Draft subject",
     body="Draft body",
 )
+
+
+def test_gmail_draft_save_request_parses_json_uuid_strings():
+    request = GmailDraftSaveRequest.model_validate({
+        "connection_id": VALID_CONNECTION_ID,
+        "operation_id": VALID_OPERATION_ID,
+    })
+
+    assert request.connection_id == UUID(VALID_CONNECTION_ID)
+    assert request.operation_id == UUID(VALID_OPERATION_ID)
+    assert isinstance(request.connection_id, UUID)
+    assert isinstance(request.operation_id, UUID)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["connection_id", "operation_id"],
+)
+def test_gmail_draft_save_request_rejects_malformed_uuid_strings(field):
+    payload = {
+        "connection_id": VALID_CONNECTION_ID,
+        "operation_id": VALID_OPERATION_ID,
+    }
+    payload[field] = "not-a-uuid"
+
+    with pytest.raises(ValidationError):
+        GmailDraftSaveRequest.model_validate(payload)
 
 
 def test_create_draft_uses_operation_marker_and_never_sends(monkeypatch):
@@ -348,6 +380,93 @@ class DraftGmail:
             "draft": self.found,
             "complete_scan": self.complete_scan,
         }
+
+
+def draft_save_test_client(monkeypatch, store, gmail):
+    app = FastAPI()
+    app.include_router(
+        messages_endpoint.router,
+        prefix="/api/v1/conversations/{conversation_id}/messages",
+    )
+    app.dependency_overrides[get_current_user] = lambda: {
+        "id": str(USER_ID),
+    }
+    app.dependency_overrides[get_db] = lambda: None
+    app.dependency_overrides[messages_endpoint.get_message_service] = (
+        lambda: store
+    )
+    monkeypatch.setattr(
+        messages_endpoint,
+        "GmailService",
+        lambda _db: gmail,
+    )
+    return TestClient(app)
+
+
+def test_valid_uuid_json_request_reaches_gmail_draft_save_service(monkeypatch):
+    store = DraftSaveStore()
+    gmail = DraftGmail()
+    claim_calls = []
+    original_claim = store.claim_gmail_draft_save
+
+    def track_claim(**kwargs):
+        claim_calls.append(kwargs)
+        return original_claim(**kwargs)
+
+    store.claim_gmail_draft_save = track_claim
+    client = draft_save_test_client(monkeypatch, store, gmail)
+
+    response = client.post(
+        f"/api/v1/conversations/{CONVERSATION_ID}/messages/{MESSAGE_ID}/draft/save",
+        json={
+            "connection_id": VALID_CONNECTION_ID,
+            "operation_id": VALID_OPERATION_ID,
+        },
+    )
+
+    assert response.status_code == 200
+    assert claim_calls[0]["connection_id"] == UUID(VALID_CONNECTION_ID)
+    assert claim_calls[0]["operation_id"] == UUID(VALID_OPERATION_ID)
+    assert gmail.create_calls[0]["connection_id"] == UUID(VALID_CONNECTION_ID)
+    assert gmail.create_calls[0]["operation_id"] == UUID(VALID_OPERATION_ID)
+    assert store.state == "saved"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["connection_id", "operation_id"],
+)
+def test_invalid_uuid_json_request_never_reaches_gmail_or_marks_uncertain(
+    monkeypatch,
+    field,
+):
+    store = DraftSaveStore(state="not_started")
+    gmail = DraftGmail()
+    claim_calls = []
+    original_claim = store.claim_gmail_draft_save
+
+    def track_claim(**kwargs):
+        claim_calls.append(kwargs)
+        return original_claim(**kwargs)
+
+    store.claim_gmail_draft_save = track_claim
+    client = draft_save_test_client(monkeypatch, store, gmail)
+    payload = {
+        "connection_id": VALID_CONNECTION_ID,
+        "operation_id": VALID_OPERATION_ID,
+    }
+    payload[field] = "not-a-uuid"
+
+    response = client.post(
+        f"/api/v1/conversations/{CONVERSATION_ID}/messages/{MESSAGE_ID}/draft/save",
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert claim_calls == []
+    assert gmail.create_calls == []
+    assert store.finish_calls == []
+    assert store.state == "not_started"
 
 
 def test_created_draft_after_timeout_is_reconciled_without_duplicate(monkeypatch):

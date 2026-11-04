@@ -159,8 +159,8 @@ class EmailDraftUpdate(BaseModel):
 class GmailDraftSaveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    connection_id: UUID
-    operation_id: UUID
+    connection_id: UUID = Field(strict=False)
+    operation_id: UUID = Field(strict=False)
 
 
 class GmailDraftSaveResponse(BaseModel):
