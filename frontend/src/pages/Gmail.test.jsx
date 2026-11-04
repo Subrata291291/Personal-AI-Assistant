@@ -380,6 +380,44 @@ describe('Gmail archive flow', () => {
     )).toBe(false)
   })
 
+  it('blocks proposal creation when the operation ID cannot be persisted', async () => {
+    gmailService.getMessages.mockResolvedValue({
+      messages: [{ ...message, labels: ['DRAFT'] }],
+      next_page_token: null,
+    })
+    gmailService.getMessage.mockResolvedValue({
+      message: {
+        ...message,
+        labels: ['DRAFT'],
+        headers: { to: 'recipient@example.com', subject: 'Draft subject' },
+        body: { plain_text: 'Draft body' },
+        attachments: [],
+      },
+    })
+    const setItem = Storage.prototype.setItem
+    const storageSpy = vi.spyOn(Storage.prototype, 'setItem')
+      .mockImplementation(function (key, value) {
+        if (key.startsWith('gmail-draft-send-approval:')) {
+          throw new DOMException('Storage blocked', 'SecurityError')
+        }
+        return setItem.call(this, key, value)
+      })
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Browser storage is unavailable',
+    )
+    expect(api.post.mock.calls.some(([url]) =>
+      url.includes('/action-approvals/gmail-drafts/')
+    )).toBe(false)
+    storageSpy.mockRestore()
+  })
+
   it('blocks editable sending for drafts with attachments to prevent losing them', async () => {
     gmailService.getMessages.mockResolvedValue({
       messages: [{ ...message, labels: ['DRAFT'] }],
@@ -460,9 +498,58 @@ describe('Gmail archive flow', () => {
       name: 'Open email: Quarterly update',
     }))
     fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+    const reviewDialog = screen.getByRole('dialog', {
+      name: 'Review draft before sending',
+    })
+    expect(reviewDialog).toHaveClass(
+      'max-h-[calc(100dvh-32px)]',
+      'overflow-hidden',
+      'flex-col',
+    )
+    expect(reviewDialog.querySelectorAll('.gmail-scrollbar.overflow-y-auto'))
+      .toHaveLength(1)
+    expect(within(reviewDialog).getByLabelText('Message'))
+      .toHaveClass('max-h-[40dvh]', 'overflow-y-auto')
+    expect(within(reviewDialog).getByRole('button', { name: 'Cancel' }))
+      .toBeVisible()
+    for (const field of ['To', 'Cc', 'Bcc', 'Subject', 'Message']) {
+      expect(within(reviewDialog).getByLabelText(field)).toBeEnabled()
+    }
+    expect(document.body.style.overflow).toBe('hidden')
+    fireEvent.change(within(reviewDialog).getByLabelText('To'), {
+      target: { value: 'recipient@example.com, second@example.com' },
+    })
+    fireEvent.change(within(reviewDialog).getByLabelText('Cc'), {
+      target: { value: 'copy@example.com' },
+    })
+    fireEvent.change(within(reviewDialog).getByLabelText('Bcc'), {
+      target: { value: 'hidden@example.com' },
+    })
+    fireEvent.change(within(reviewDialog).getByLabelText('Subject'), {
+      target: { value: 'Reviewed subject' },
+    })
+    fireEvent.change(within(reviewDialog).getByLabelText('Message'), {
+      target: { value: 'Reviewed message' },
+    })
     fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
 
     expect(await screen.findByText('Approval status:')).toBeInTheDocument()
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/action-approvals/gmail-drafts/message-123',
+      expect.objectContaining({
+        connection_id: 'connection-1',
+        to: ['recipient@example.com', 'second@example.com'],
+        cc: ['copy@example.com'],
+        bcc: ['hidden@example.com'],
+        subject: 'Reviewed subject',
+        body: 'Reviewed message',
+      }),
+      {
+        'Idempotency-Key': expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        ),
+      },
+    )
     expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument()
     expect(api.post.mock.calls.some(([url]) => url.endsWith('/execute')))
       .toBe(false)
@@ -486,6 +573,150 @@ describe('Gmail archive flow', () => {
         expect.arrayContaining(['drafts', 'sent', 'all']),
       )
     })
+  })
+
+  it('reconciles an uncertain approval request before allowing a retry', async () => {
+    const requestError = Object.assign(
+      new TypeError('Failed to fetch'),
+      { networkFailure: true, requestId: 'request-create-1' },
+    )
+    const statusError = Object.assign(
+      new TypeError('Failed to fetch'),
+      { networkFailure: true, requestId: 'request-status-1' },
+    )
+    let statusChecks = 0
+    api.post.mockImplementation(async (url) => {
+      if (url.includes('/gmail-drafts/')) throw requestError
+      return { authorization_url: 'https://accounts.google.com/' }
+    })
+    api.get.mockImplementation(async (url) => {
+      if (url.includes('/gmail-drafts/approval/')) {
+        statusChecks += 1
+        if (statusChecks === 1) throw statusError
+        const notFound = new Error(
+          'No approval proposal was created for this request.',
+        )
+        notFound.status = 404
+        throw notFound
+      }
+      return {
+        connections: [{
+          id: 'connection-1',
+          provider: 'google',
+          status: 'connected',
+          email: 'user@example.com',
+        }],
+      }
+    })
+    gmailService.getMessages.mockResolvedValue({
+      messages: [{ ...message, labels: ['DRAFT'] }],
+      next_page_token: null,
+    })
+    gmailService.getMessage.mockResolvedValue({
+      message: {
+        ...message,
+        labels: ['DRAFT'],
+        headers: { to: 'recipient@example.com', subject: 'Draft subject' },
+        body: { plain_text: 'Draft body' },
+        attachments: [],
+      },
+    })
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
+
+    expect(await screen.findByRole('button', {
+      name: 'Check approval status',
+    })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Continue to approval' }))
+      .toBeDisabled()
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Do not retry until status is checked.',
+    )
+    expect(screen.getByRole('alert')).toHaveTextContent('request-status-1')
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Check approval status',
+    }))
+    expect(await screen.findByText(
+      /server confirmed that no approval proposal was created/,
+    )).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Continue to approval' }))
+      .toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
+    await waitFor(() => {
+      expect(api.post.mock.calls.filter(([url]) =>
+        url.includes('/gmail-drafts/'),
+      )).toHaveLength(2)
+    })
+    const proposalCalls = api.post.mock.calls.filter(([url]) =>
+      url.includes('/gmail-drafts/'),
+    )
+    expect(proposalCalls[0][2]['Idempotency-Key']).toBe(
+      proposalCalls[1][2]['Idempotency-Key'],
+    )
+  })
+
+  it('renders structured validation errors as readable text', async () => {
+    const validationError = Object.assign(new Error(''), {
+      detail: [{
+        loc: ['body', 'subject'],
+        msg: 'Subject is too long',
+        input: 'private value',
+      }],
+      status: 422,
+      requestId: 'request-validation-1',
+    })
+    api.post.mockImplementation(async (url) => {
+      if (url.includes('/gmail-drafts/')) throw validationError
+      return { authorization_url: 'https://accounts.google.com/' }
+    })
+    api.get.mockImplementation(async (url) => {
+      if (url.includes('/gmail-drafts/approval/')) {
+        const notFound = new Error('No approval proposal was created.')
+        notFound.status = 404
+        throw notFound
+      }
+      return {
+        connections: [{
+          id: 'connection-1',
+          provider: 'google',
+          status: 'connected',
+          email: 'user@example.com',
+        }],
+      }
+    })
+    gmailService.getMessages.mockResolvedValue({
+      messages: [{ ...message, labels: ['DRAFT'] }],
+      next_page_token: null,
+    })
+    gmailService.getMessage.mockResolvedValue({
+      message: {
+        ...message,
+        labels: ['DRAFT'],
+        headers: { to: 'recipient@example.com', subject: 'Draft subject' },
+        body: { plain_text: 'Draft body' },
+        attachments: [],
+      },
+    })
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('body.subject: Subject is too long')
+    expect(alert).toHaveTextContent('request-validation-1')
+    expect(alert.textContent).not.toContain('[object Object]')
+    expect(alert.textContent).not.toContain('private value')
   })
 
   it('does not retry a draft send with an uncertain outcome', async () => {

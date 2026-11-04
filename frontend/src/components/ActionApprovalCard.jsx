@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 
 import { actionApprovalService } from '../services/actionApprovalService.js'
+import { formatRequestError } from '../lib/errorMessage.js'
 
 function displayValue(value) {
   if (Array.isArray(value)) return value.join(', ')
@@ -45,10 +46,10 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       updateProposalMessage(message, response.proposal, onUpdated)
     },
     onError: (mutationError) => {
-      setError(
-        mutationError?.message ||
+      setError(formatRequestError(
+        mutationError,
         'Unable to update this approval proposal.',
-      )
+      ))
     },
     onSettled: () => {
       requestInProgress.current = false
@@ -63,17 +64,25 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       updateProposalMessage(message, response.proposal, onUpdated)
     },
     onError: async (mutationError) => {
-      setError(
-        mutationError?.message ||
+      setError(formatRequestError(
+        mutationError,
         'The Gmail send outcome could not be confirmed.',
-      )
+      ))
       try {
         const latest = await actionApprovalService.getProposal(
           proposal.proposal_id,
         )
         updateProposalMessage(message, latest, onUpdated)
-      } catch {
-        // Keep the execution error visible; a later conversation reload can recover status.
+      } catch (statusError) {
+        setError(
+          `${formatRequestError(
+            mutationError,
+            'The Gmail send outcome could not be confirmed.',
+          )} Status check failed: ${formatRequestError(
+            statusError,
+            'Check the send status before taking further action.',
+          )}`,
+        )
       }
     },
     onSettled: () => {
@@ -89,10 +98,10 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       updateProposalMessage(message, latest, onUpdated)
     },
     onError: (mutationError) => {
-      setError(
-        mutationError?.message ||
+      setError(formatRequestError(
+        mutationError,
         'Unable to refresh the Gmail send status.',
-      )
+      ))
     },
     onSettled: () => {
       requestInProgress.current = false

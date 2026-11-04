@@ -81,6 +81,12 @@ _GET_PROPOSAL = text("""
     LIMIT 1
 """)
 
+_LOCK_PROPOSAL_IDEMPOTENCY = text("""
+    SELECT pg_advisory_xact_lock(
+        hashtextextended(CAST(:lock_key AS text), 0)
+    )
+""")
+
 _RECOVER_STALE_GMAIL_SEND = text("""
     UPDATE public.pa_conversation_messages AS approval_message
     SET metadata = jsonb_set(
@@ -352,6 +358,23 @@ class ActionApprovalRepository:
             "expiration_minutes": expiration_minutes,
         }
         with self.engine.begin() as connection:
+            connection.execute(
+                _LOCK_PROPOSAL_IDEMPOTENCY,
+                {"lock_key": str(proposal_id)},
+            )
+            existing = (
+                connection.execute(
+                    _GET_PROPOSAL,
+                    {
+                        "user_id": str(user_id),
+                        "proposal_id": str(proposal_id),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+            if existing is not None:
+                return self._proposal_row(existing)
             row = (
                 connection.execute(
                     _INSERT_GMAIL_DRAFT_PROPOSAL,
@@ -363,6 +386,30 @@ class ActionApprovalRepository:
         if row is None:
             raise RuntimeError("Gmail draft approval could not be stored.")
         return self._proposal_row(row, account_email)
+
+    def get_gmail_draft_proposal(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+    ) -> dict[str, Any] | None:
+        with self.engine.begin() as connection:
+            connection.execute(
+                _LOCK_PROPOSAL_IDEMPOTENCY,
+                {"lock_key": str(proposal_id)},
+            )
+            row = (
+                connection.execute(
+                    _GET_PROPOSAL,
+                    {
+                        "user_id": str(user_id),
+                        "proposal_id": str(proposal_id),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+        return self._proposal_row(row) if row is not None else None
 
     def get_proposal(
         self,

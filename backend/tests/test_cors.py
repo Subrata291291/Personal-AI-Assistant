@@ -16,15 +16,20 @@ def test_cors_preflight_allows_production_origin():
     client = TestClient(app)
 
     response = client.options(
-        "/api/v1/oauth/connections",
+        "/api/v1/action-approvals/gmail-drafts/message-123",
         headers={
             "Origin": "https://www.myorbitai.in",
-            "Access-Control-Request-Method": "GET",
-            "Access-Control-Request-Headers": "authorization,content-type",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": (
+                "authorization,content-type,idempotency-key,x-request-id"
+            ),
         },
     )
 
     assert response.status_code == 200
     assert response.headers.get("access-control-allow-origin") == "https://www.myorbitai.in"
     assert response.headers.get("access-control-allow-credentials") == "true"
-    assert "GET" in response.headers.get("access-control-allow-methods", "")
+    assert "POST" in response.headers.get("access-control-allow-methods", "")
+    allowed_headers = response.headers.get("access-control-allow-headers", "").lower()
+    assert "idempotency-key" in allowed_headers
+    assert "x-request-id" in allowed_headers

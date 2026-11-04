@@ -1,5 +1,6 @@
 
 import { supabase } from './supabase.js'
+import { formatErrorMessage } from './errorMessage.js'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL
 
@@ -31,6 +32,7 @@ async function request(path, options = {}) {
   const requestId = globalThis.crypto?.randomUUID?.() || ''
   let authDurationMs = 0
   let status = 'not_sent'
+  let fetchStarted = false
   const { responseType, ...fetchOptions } = options
 
   try {
@@ -55,6 +57,7 @@ async function request(path, options = {}) {
       headers.set('Content-Type', 'application/json')
     }
 
+    fetchStarted = true
     const response = await fetch(
       `${API_BASE_URL.replace(/\/+$/, '')}${path}`,
       {
@@ -76,15 +79,14 @@ async function request(path, options = {}) {
         ? await response.json()
         : await response.text()
 
-      const message =
-        typeof responseData === 'object' && responseData !== null
-          ? responseData.detail || responseData.message
-          : responseData
-
       const error = new Error(
-        message || `API request failed with status ${response.status}`
+        formatErrorMessage(
+          responseData,
+          `API request failed with status ${response.status}`,
+        ),
       )
       error.status = response.status
+      error.requestId = requestId || null
       throw error
     }
 
@@ -100,9 +102,16 @@ async function request(path, options = {}) {
     return responseData
   } catch (error) {
     if (status === 'not_sent') {
-      status = authDurationMs ? 'network_error' : 'auth_error'
+      status = fetchStarted ? 'network_error' : 'auth_error'
     }
-    throw error
+    const requestError = error instanceof Error
+      ? error
+      : new Error(formatErrorMessage(error))
+    if (!requestError.requestId) {
+      requestError.requestId = requestId || null
+    }
+    requestError.networkFailure = status === 'network_error'
+    throw requestError
   } finally {
     console.info('api_request_completed', {
       requestId: requestId || null,

@@ -3,10 +3,17 @@ import { api } from '../lib/api.js'
 const BASE_PATH = '/api/v1/action-approvals'
 
 export const actionApprovalService = {
-  createDraftSendApproval(messageId, payload) {
+  createDraftSendApproval(messageId, payload, idempotencyKey) {
     return api.post(
       `${BASE_PATH}/gmail-drafts/${encodeURIComponent(messageId)}`,
       payload,
+      { 'Idempotency-Key': idempotencyKey },
+    )
+  },
+
+  getDraftSendApprovalStatus(idempotencyKey) {
+    return api.get(
+      `${BASE_PATH}/gmail-drafts/approval/${encodeURIComponent(idempotencyKey)}`,
     )
   },
 

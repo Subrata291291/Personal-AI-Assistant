@@ -1,5 +1,5 @@
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy.orm import Session
 
@@ -128,6 +128,8 @@ class ActionApprovalService:
         self,
         user_id: UUID,
         connection_id: UUID,
+        message_id: str,
+        idempotency_key: UUID,
         parameters: dict[str, Any],
     ) -> ActionApprovalProposal:
         connection = self._validate_connection(
@@ -142,7 +144,10 @@ class ActionApprovalService:
             "action_type": "gmail.send_draft",
             "parameters": parameters,
         })
-        proposal_id = uuid4()
+        proposal_id = self._gmail_draft_proposal_id(
+            user_id,
+            idempotency_key,
+        )
         row = self.repository.create_gmail_draft_proposal(
             proposal_id=proposal_id,
             source_message_id=validated.source_message_id,
@@ -153,7 +158,62 @@ class ActionApprovalService:
             account_email=connection.email,
             expiration_minutes=self.PROPOSAL_TTL_MINUTES,
         )
-        return ActionApprovalProposal.model_validate(row)
+        proposal = ActionApprovalProposal.model_validate(row)
+        self.validate_gmail_draft_request_match(
+            proposal=proposal,
+            connection_id=connection_id,
+            message_id=message_id,
+            parameters=validated.parameters,
+        )
+        return proposal
+
+    @staticmethod
+    def _gmail_draft_proposal_id(
+        user_id: UUID,
+        idempotency_key: UUID,
+    ) -> UUID:
+        return uuid5(
+            NAMESPACE_URL,
+            f"gmail-draft-send:{user_id}:{idempotency_key}",
+        )
+
+    def get_gmail_draft_proposal(
+        self,
+        user_id: UUID,
+        idempotency_key: UUID,
+    ) -> ActionApprovalProposal | None:
+        row = self.repository.get_gmail_draft_proposal(
+            user_id=user_id,
+            proposal_id=self._gmail_draft_proposal_id(
+                user_id,
+                idempotency_key,
+            ),
+        )
+        return ActionApprovalProposal.model_validate(row) if row else None
+
+    @staticmethod
+    def validate_gmail_draft_request_match(
+        *,
+        proposal: ActionApprovalProposal,
+        connection_id: UUID,
+        message_id: str,
+        parameters: dict[str, Any],
+    ) -> None:
+        existing_parameters = proposal.parameters
+        matching = (
+            proposal.action_type == "gmail.send_draft"
+            and proposal.connection_id == connection_id
+            and existing_parameters.get("message_id") == message_id
+            and existing_parameters.get("to") == parameters.get("to")
+            and existing_parameters.get("cc", []) == parameters.get("cc", [])
+            and existing_parameters.get("bcc", []) == parameters.get("bcc", [])
+            and existing_parameters.get("subject") == parameters.get("subject")
+            and existing_parameters.get("body") == parameters.get("body")
+        )
+        if not matching:
+            raise ApprovalConflictError(
+                "This idempotency key already belongs to a different Gmail draft approval."
+            )
 
     def list_pending(
         self,

@@ -10,6 +10,7 @@ import {
 import { useOutletContext } from 'react-router-dom'
 
 import { api } from '../lib/api.js'
+import { formatRequestError } from '../lib/errorMessage.js'
 import { gmailService } from '../services/gmailService.js'
 import { actionApprovalService } from '../services/actionApprovalService.js'
 import { useAuth } from '../context/AuthContext'
@@ -51,6 +52,42 @@ function isValidEmailAddress(address) {
 function isGmailDraft(message) {
   return Array.isArray(message?.labels) &&
     message.labels.some((label) => String(label).toUpperCase() === 'DRAFT')
+}
+
+function getDraftApprovalStorageKey(userId, connectionId, messageId) {
+  return `gmail-draft-send-approval:${userId}:${connectionId}:${messageId}`
+}
+
+function readSessionValue(key) {
+  try {
+    const storage = globalThis.sessionStorage
+    if (!storage) throw new Error('Session storage is unavailable.')
+    return storage.getItem(key)
+  } catch {
+    throw new Error(
+      'Browser storage is unavailable, so this approval cannot be tracked safely.',
+    )
+  }
+}
+
+function writeSessionValue(key, value) {
+  try {
+    const storage = globalThis.sessionStorage
+    if (!storage) throw new Error('Session storage is unavailable.')
+    storage.setItem(key, value)
+  } catch {
+    throw new Error(
+      'Browser storage is unavailable, so this approval cannot be tracked safely.',
+    )
+  }
+}
+
+function removeSessionValue(key) {
+  try {
+    globalThis.sessionStorage?.removeItem(key)
+  } catch (error) {
+    if (error?.name !== 'SecurityError') throw error
+  }
 }
 
 function GmailActionSpinner() {
@@ -119,13 +156,28 @@ export default function Gmail() {
   })
   const [draftReviewError, setDraftReviewError] = useState('')
   const [draftSendApproval, setDraftSendApproval] = useState(null)
+  const [draftApprovalStatusUncertain, setDraftApprovalStatusUncertain] =
+    useState(false)
+  const [checkingDraftApprovalStatus, setCheckingDraftApprovalStatus] =
+    useState(false)
   const [manualRefreshing, setManualRefreshing] = useState(false)
   const [trashNotice, setTrashNotice] = useState(null)
   const [messageActionConfirmation, setMessageActionConfirmation] = useState(null)
   const trashRequestInFlight = useRef(false)
   const draftApprovalInFlight = useRef(false)
+  const draftApprovalIdempotency = useRef(null)
   const draftExecutionInFlight = useRef(false)
   const completedDraftProposalId = useRef(null)
+
+  useEffect(() => {
+    if (!draftReviewOpen) return undefined
+
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = previousOverflow
+    }
+  }, [draftReviewOpen])
 
   useEffect(
     () => () => window.clearTimeout(searchTimerRef.current),
@@ -280,18 +332,74 @@ export default function Gmail() {
     },
   })
 
-  const createDraftSendApprovalMutation = useMutation({
-    mutationFn: ({ messageId, payload }) =>
-      actionApprovalService.createDraftSendApproval(messageId, payload),
-    onSuccess: (response) => {
-      setDraftSendApproval(response.proposal)
+  const checkDraftSendApprovalStatusMutation = useMutation({
+    mutationFn: (idempotencyKey) =>
+      actionApprovalService.getDraftSendApprovalStatus(idempotencyKey),
+    onSuccess: (proposal) => {
+      setDraftSendApproval(proposal)
       setDraftReviewStep('approval')
+      setDraftApprovalStatusUncertain(false)
       setDraftReviewError('')
     },
     onError: (error) => {
+      if (error?.status === 404) {
+        setDraftApprovalStatusUncertain(false)
+        setDraftReviewError(
+          'The server confirmed that no approval proposal was created. You can safely continue again.',
+        )
+        return
+      }
+      setDraftApprovalStatusUncertain(true)
       setDraftReviewError(
-        error.message || 'Unable to create the Gmail draft approval.',
+        `Could not confirm whether the approval proposal was created. Do not retry until status is checked. ${formatRequestError(error)}`,
       )
+    },
+    onSettled: () => setCheckingDraftApprovalStatus(false),
+  })
+
+  const createDraftSendApprovalMutation = useMutation({
+    mutationFn: ({ messageId, payload, idempotencyKey }) =>
+      actionApprovalService.createDraftSendApproval(
+        messageId,
+        payload,
+        idempotencyKey,
+      ),
+    onSuccess: (response) => {
+      setDraftSendApproval(response.proposal)
+      setDraftReviewStep('approval')
+      setDraftApprovalStatusUncertain(false)
+      setDraftReviewError('')
+    },
+    onError: async (error, variables) => {
+      setDraftApprovalStatusUncertain(true)
+      setDraftReviewError(
+        `The proposal request did not return a confirmed result. Checking its status. ${formatRequestError(error)}`,
+      )
+      setCheckingDraftApprovalStatus(true)
+      try {
+        const proposal =
+          await actionApprovalService.getDraftSendApprovalStatus(
+            variables.idempotencyKey,
+          )
+        setDraftSendApproval(proposal)
+        setDraftReviewStep('approval')
+        setDraftApprovalStatusUncertain(false)
+        setDraftReviewError('')
+      } catch (statusError) {
+        if (statusError?.status === 404) {
+          setDraftApprovalStatusUncertain(false)
+          setDraftReviewError(
+            `The server confirmed that no approval proposal was created. You can safely continue again. ${formatRequestError(error)}`,
+          )
+        } else {
+          setDraftApprovalStatusUncertain(true)
+          setDraftReviewError(
+            `Could not confirm whether the approval proposal was created. Do not retry until status is checked. ${formatRequestError(statusError)}`,
+          )
+        }
+      } finally {
+        setCheckingDraftApprovalStatus(false)
+      }
     },
     onSettled: () => {
       draftApprovalInFlight.current = false
@@ -305,7 +413,7 @@ export default function Gmail() {
       setDraftReviewError('')
     },
     onError: (error) => {
-      setDraftReviewError(error.message || 'Unable to approve this send.')
+      setDraftReviewError(formatRequestError(error))
     },
     onSettled: () => {
       draftApprovalInFlight.current = false
@@ -317,9 +425,12 @@ export default function Gmail() {
     onSuccess: (response) => {
       setDraftSendApproval(response.proposal)
       setDraftReviewError('')
+      if (response.proposal.status === 'rejected') {
+        clearDraftApprovalIdempotency()
+      }
     },
     onError: (error) => {
-      setDraftReviewError(error.message || 'Unable to cancel this approval.')
+      setDraftReviewError(formatRequestError(error))
     },
     onSettled: () => {
       draftApprovalInFlight.current = false
@@ -342,8 +453,7 @@ export default function Gmail() {
           : current,
       )
       setDraftReviewError(
-        error.message ||
-          'The send outcome is uncertain. Check status before taking further action.',
+        `The send outcome is uncertain. Check status before taking further action. ${formatRequestError(error)}`,
       )
     },
     onSettled: () => {
@@ -362,8 +472,7 @@ export default function Gmail() {
     },
     onError: (error) => {
       setDraftReviewError(
-        error.message ||
-          'Unable to check send status. Do not retry an uncertain send.',
+        `Unable to check send status. Do not retry an uncertain send. ${formatRequestError(error)}`,
       )
     },
   })
@@ -836,6 +945,42 @@ export default function Gmail() {
     setShowHtmlBody(true)
   }
 
+  function getDraftApprovalIdempotency(messageId) {
+    const storageKey = getDraftApprovalStorageKey(
+      userId,
+      connectionId,
+      messageId,
+    )
+    const storedKey = readSessionValue(storageKey)
+    if (draftApprovalIdempotency.current?.storageKey === storageKey) {
+      if (storedKey !== draftApprovalIdempotency.current.idempotencyKey) {
+        throw new Error(
+          'The approval operation ID is no longer available. Check approval status before continuing.',
+        )
+      }
+      return draftApprovalIdempotency.current
+    }
+
+    const idempotencyKey =
+      typeof storedKey === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        .test(storedKey)
+        ? storedKey
+        : crypto.randomUUID()
+    writeSessionValue(storageKey, idempotencyKey)
+    const operation = { storageKey, idempotencyKey }
+    draftApprovalIdempotency.current = operation
+    return operation
+  }
+
+  function clearDraftApprovalIdempotency() {
+    const operation = draftApprovalIdempotency.current
+    if (!operation) return
+    removeSessionValue(operation.storageKey)
+    removeSessionValue(`${operation.storageKey}:attempted`)
+    draftApprovalIdempotency.current = null
+  }
+
   function closeMessageDetails(force = false) {
     if (
       !force &&
@@ -852,6 +997,16 @@ export default function Gmail() {
 
   function openDraftSendReview(message) {
     if (!isGmailDraft(message)) return
+    let operation
+    let attempted
+    try {
+      operation = getDraftApprovalIdempotency(message.id)
+      attempted = readSessionValue(`${operation.storageKey}:attempted`)
+    } catch (error) {
+      setDraftReviewError(formatRequestError(error))
+      setDraftReviewOpen(true)
+      return
+    }
     setDraftReviewData({
       to: message.headers?.to || '',
       cc: message.headers?.cc || '',
@@ -867,11 +1022,19 @@ export default function Gmail() {
     setDraftSendApproval(null)
     setDraftReviewStep('edit')
     setDraftReviewOpen(true)
+    setDraftApprovalStatusUncertain(false)
+    if (attempted === 'true') {
+      setDraftApprovalStatusUncertain(true)
+      setCheckingDraftApprovalStatus(true)
+      setDraftReviewError('Checking for an existing approval proposal...')
+      checkDraftSendApprovalStatusMutation.mutate(operation.idempotencyKey)
+    }
   }
 
   function completeDraftSend(proposalId) {
     if (completedDraftProposalId.current === proposalId) return
     completedDraftProposalId.current = proposalId
+    clearDraftApprovalIdempotency()
     const sentDraftMessageId =
       draftSendApproval?.parameters?.message_id || selectedMessageId
     queryClient.setQueriesData(
@@ -953,9 +1116,19 @@ export default function Gmail() {
       setDraftReviewError('Subject and message are required before sending.')
       return
     }
+    let operation
+    try {
+      operation = getDraftApprovalIdempotency(selectedMessageId)
+      writeSessionValue(`${operation.storageKey}:attempted`, 'true')
+    } catch (error) {
+      setDraftReviewError(formatRequestError(error))
+      return
+    }
     draftApprovalInFlight.current = true
+    setDraftApprovalStatusUncertain(false)
     createDraftSendApprovalMutation.mutate({
       messageId: selectedMessageId,
+      idempotencyKey: operation.idempotencyKey,
       payload: {
         connection_id: connectionId,
         to,
@@ -2465,14 +2638,14 @@ export default function Gmail() {
                     )}
 
                     {draftReviewOpen && selectedMessage && createPortal((
-                      <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 p-3 sm:p-6">
+                      <div className="fixed inset-0 z-[70] flex items-center justify-center overflow-hidden bg-black/75 p-4">
                         <section
                           role="dialog"
                           aria-modal="true"
                           aria-labelledby="draft-send-review-title"
-                          className={`gmail-scrollbar max-h-[92vh] w-full max-w-2xl overflow-y-auto rounded-2xl border shadow-2xl ${colors.card}`}
+                          className={`flex max-h-[calc(100dvh-32px)] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border shadow-2xl ${colors.card}`}
                         >
-                          <header className={`border-b p-5 ${colors.divider}`}>
+                          <header className={`shrink-0 border-b p-5 ${colors.divider}`}>
                             <h2
                               id="draft-send-review-title"
                               className={`text-lg font-bold ${colors.heading}`}
@@ -2487,8 +2660,11 @@ export default function Gmail() {
                           </header>
 
                           {draftReviewStep === 'edit' ? (
-                            <form onSubmit={createDraftSendApproval}>
-                              <div className="space-y-4 p-5">
+                            <form
+                              onSubmit={createDraftSendApproval}
+                              className="flex min-h-0 flex-1 flex-col overflow-hidden"
+                            >
+                              <div className="gmail-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-5">
                                 {[
                                   ['to', 'To'],
                                   ['cc', 'Cc'],
@@ -2519,7 +2695,7 @@ export default function Gmail() {
                                     onChange={(event) =>
                                       handleDraftReviewChange('subject', event.target.value)
                                     }
-                                    maxLength={998}
+                                    maxLength={500}
                                     className={`w-full rounded-lg border px-3 py-2.5 text-sm outline-none focus:border-violet-500 ${colors.input}`}
                                   />
                                 </label>
@@ -2533,21 +2709,40 @@ export default function Gmail() {
                                     onChange={(event) =>
                                       handleDraftReviewChange('body', event.target.value)
                                     }
-                                    rows={10}
+                                    rows={8}
                                     maxLength={20_000}
-                                    className={`w-full resize-y rounded-lg border px-3 py-3 text-sm leading-6 outline-none focus:border-violet-500 ${colors.input}`}
+                                    className={`min-h-[10rem] max-h-[40dvh] w-full resize-y overflow-y-auto rounded-lg border px-3 py-3 text-sm leading-6 outline-none focus:border-violet-500 ${colors.input}`}
                                   />
                                 </label>
                                 <p className={`text-xs ${colors.muted}`}>
                                   Continuing stores this exact content in a human-approval proposal. It will not send until you approve and explicitly choose Send approved draft.
                                 </p>
                                 {draftReviewError && (
-                                  <p role="alert" className="text-sm text-rose-500">
+                                  <p role="alert" className="whitespace-pre-line text-sm text-rose-500">
                                     {draftReviewError}
                                   </p>
                                 )}
                               </div>
-                              <footer className={`flex justify-end gap-2 border-t p-4 ${colors.divider}`}>
+                              <footer className={`flex shrink-0 flex-wrap justify-end gap-2 border-t p-4 ${colors.divider}`}>
+                                {draftApprovalStatusUncertain && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const operation =
+                                        getDraftApprovalIdempotency(selectedMessageId)
+                                      setCheckingDraftApprovalStatus(true)
+                                      checkDraftSendApprovalStatusMutation.mutate(
+                                        operation.idempotencyKey,
+                                      )
+                                    }}
+                                    disabled={checkingDraftApprovalStatus}
+                                    className={`mr-auto rounded-lg border px-4 py-2.5 text-sm font-semibold ${colors.input} disabled:opacity-50`}
+                                  >
+                                    {checkingDraftApprovalStatus
+                                      ? 'Checking status...'
+                                      : 'Check approval status'}
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   onClick={() => {
@@ -2563,6 +2758,8 @@ export default function Gmail() {
                                   type="submit"
                                   disabled={
                                     createDraftSendApprovalMutation.isPending ||
+                                    checkingDraftApprovalStatus ||
+                                    draftApprovalStatusUncertain ||
                                     Boolean(selectedMessage?.attachments?.length)
                                   }
                                   className="rounded-lg bg-violet-600 px-4 py-2.5 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-50"
@@ -2575,7 +2772,7 @@ export default function Gmail() {
                             </form>
                           ) : (
                             <>
-                              <div className="space-y-4 p-5">
+                              <div className="gmail-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-5">
                                 <p className={`text-sm ${colors.text}`}>
                                   Approval status: <strong>{draftSendApproval?.status || 'loading'}</strong>
                                 </p>
@@ -2623,12 +2820,12 @@ export default function Gmail() {
                                   </p>
                                 )}
                                 {draftReviewError && (
-                                  <p role="alert" className="text-sm text-rose-500">
+                                  <p role="alert" className="whitespace-pre-line text-sm text-rose-500">
                                     {draftReviewError}
                                   </p>
                                 )}
                               </div>
-                              <footer className={`flex flex-wrap justify-end gap-2 border-t p-4 ${colors.divider}`}>
+                              <footer className={`flex shrink-0 flex-wrap justify-end gap-2 border-t p-4 ${colors.divider}`}>
                                 {draftSendApproval?.status === 'pending' && (
                                   <>
                                     <button
@@ -2683,6 +2880,7 @@ export default function Gmail() {
                                   <button
                                     type="button"
                                     onClick={() => {
+                                      clearDraftApprovalIdempotency()
                                       setDraftSendApproval(null)
                                       setDraftReviewStep('edit')
                                       setDraftReviewError('')

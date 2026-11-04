@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom'
 
 import { conversationService } from '../services/conversationService.js'
 import { actionApprovalService } from '../services/actionApprovalService.js'
+import { formatRequestError } from '../lib/errorMessage.js'
 
 const EMAIL_ADDRESS_PATTERN =
   /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
@@ -143,18 +144,24 @@ function EmailDraftCard({
   function userFacingError(mutationError, operation) {
     const detail =
       mutationError instanceof Error ? mutationError.message.toLowerCase() : ''
+    const requestIdSuffix = mutationError?.requestId
+      ? ` (Request ID: ${mutationError.requestId})`
+      : ''
     if (/permission|scope|403/.test(detail)) {
-      return 'Gmail permission is missing. Reconnect the account in Connectors and grant Gmail access.'
+      return `Gmail permission is missing. Reconnect the account in Connectors and grant Gmail access.${requestIdSuffix}`
     }
     if (/connection|account|404/.test(detail)) {
-      return 'The selected Gmail account or saved operation could not be found. Check Connectors and the conversation, then try again.'
+      return `The selected Gmail account or saved operation could not be found. Check Connectors and the conversation, then try again.${requestIdSuffix}`
     }
     if (/invalid|validation/.test(detail)) {
-      return 'Some draft details are invalid. Review the recipients, subject, and message before saving.'
+      return `Some draft details are invalid. Review the recipients, subject, and message before saving.${requestIdSuffix}`
     }
-    return operation === 'save'
-      ? 'Gmail could not confirm whether the draft was created. Check the save status before attempting anything else.'
-      : 'Unable to save these draft changes. Reload the conversation and try again.'
+    return formatRequestError(
+      mutationError,
+      operation === 'save'
+        ? 'Gmail could not confirm whether the draft was created. Check the save status before attempting anything else.'
+        : 'Unable to save these draft changes. Reload the conversation and try again.',
+    )
   }
 
   const updateMutation = useMutation({
@@ -370,7 +377,10 @@ function EmailDraftCard({
     },
     onError: (sendError) => {
       sendProposalInProgress.current = false
-      setError(sendError?.message || 'Unable to prepare the Gmail send approval.')
+      setError(formatRequestError(
+        sendError,
+        'Unable to prepare the Gmail send approval.',
+      ))
     },
   })
   const checkSaveStatus = saveStatusMutation.mutate
