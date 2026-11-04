@@ -184,6 +184,69 @@ describe('EmailDraftCard Gmail save', () => {
       .toBeInTheDocument()
   })
 
+  it('keeps an uncertain result blocked when the backend cannot find the marker', async () => {
+    conversationService.getEmailDraftSaveStatus.mockResolvedValue({
+      state: 'uncertain',
+      connection_id: 'connection-1',
+      operation_id: operationId,
+      detail: 'No matching draft was found during inspection, but this does not prove creation failed.',
+    })
+    renderCard(createMessage({
+      state: 'uncertain',
+      connection_id: 'connection-1',
+      operation_id: operationId,
+    }))
+
+    expect(await screen.findByText(
+      'No matching draft was found during inspection, but this does not prove creation failed.',
+    )).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check save status' }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Save outcome needs review' }))
+      .toBeDisabled()
+  })
+
+  it('shows pending status without allowing a second draft save', async () => {
+    conversationService.getEmailDraftSaveStatus.mockResolvedValue({
+      state: 'saving',
+      connection_id: 'connection-1',
+      operation_id: operationId,
+      detail: 'The Gmail draft operation is still being processed.',
+    })
+    renderCard(createMessage({
+      state: 'uncertain',
+      connection_id: 'connection-1',
+      operation_id: operationId,
+    }))
+
+    expect(await screen.findByText(
+      'The original Gmail draft operation is still processing.',
+    )).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check save status' }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Save outcome needs review' }))
+      .toBeDisabled()
+  })
+
+  it('displays the backend status-check detail while keeping the save blocked', async () => {
+    const statusError = new Error(
+      'Gmail draft status could not be checked. The outcome remains uncertain; do not retry the creation.',
+    )
+    statusError.status = 503
+    conversationService.getEmailDraftSaveStatus.mockRejectedValue(statusError)
+    renderCard(createMessage({
+      state: 'uncertain',
+      connection_id: 'connection-1',
+      operation_id: operationId,
+    }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Gmail draft status could not be checked. The outcome remains uncertain; do not retry the creation.',
+    )
+    expect(screen.getByRole('button', { name: 'Save outcome needs review' }))
+      .toBeDisabled()
+  })
+
   it('retries a definitively failed save using its original operation ID', async () => {
     conversationService.getEmailDraftSaveStatus.mockResolvedValue({
       state: 'failed',

@@ -714,8 +714,9 @@ class GmailService:
             required_scope=self.REQUIRED_MODIFY_SCOPE,
         )
         page_token: str | None = None
-        pages_scanned = 0
-        while pages_scanned < 5:
+        seen_page_tokens: set[str] = set()
+        complete_scan = True
+        while True:
             params: dict[str, Any] = {"maxResults": 100}
             if page_token:
                 params["pageToken"] = page_token
@@ -725,18 +726,19 @@ class GmailService:
                 endpoint="drafts",
                 params=params,
             )
-            pages_scanned += 1
             drafts = page.get("drafts", [])
             if not isinstance(drafts, list):
                 raise ValueError("Gmail returned an invalid draft list.")
             for item in drafts:
                 if not isinstance(item, dict):
+                    complete_scan = False
                     continue
                 draft_id = item.get("id")
                 if not isinstance(draft_id, str) or not re.fullmatch(
                     r"[A-Za-z0-9_-]{1,255}",
                     draft_id,
                 ):
+                    complete_scan = False
                     continue
                 details = await self._google_get(
                     user_id=user_id,
@@ -747,15 +749,21 @@ class GmailService:
                 message = details.get("message") or {}
                 payload = message.get("payload") or {}
                 headers = payload.get("headers") or []
-                if not isinstance(headers, list):
+                if not isinstance(headers, list) or not headers:
+                    complete_scan = False
                     continue
-                operation_matches = any(
-                    isinstance(header, dict)
-                    and str(header.get("name", "")).casefold()
-                    == "x-personal-ai-draft-operation-id"
-                    and header.get("value") == str(operation_id)
-                    for header in headers
-                )
+                operation_matches = False
+                for header in headers:
+                    if not isinstance(header, dict):
+                        complete_scan = False
+                        continue
+                    if (
+                        str(header.get("name", "")).casefold()
+                        == "x-personal-ai-draft-operation-id"
+                        and header.get("value") == str(operation_id)
+                    ):
+                        operation_matches = True
+                        break
                 if operation_matches:
                     return {
                         "draft": {
@@ -769,9 +777,10 @@ class GmailService:
             if page_token is not None and not isinstance(page_token, str):
                 raise ValueError("Gmail returned an invalid draft page token.")
             if not page_token:
-                return {"complete_scan": True, "draft": None}
-
-        return {"complete_scan": False, "draft": None}
+                return {"complete_scan": complete_scan, "draft": None}
+            if page_token in seen_page_tokens:
+                raise ValueError("Gmail repeated a draft page token.")
+            seen_page_tokens.add(page_token)
 
     async def trash_message(
         self,

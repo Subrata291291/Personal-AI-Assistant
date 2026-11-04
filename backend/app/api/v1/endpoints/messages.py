@@ -10,6 +10,7 @@ from supabase import Client
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, get_current_supabase_client
+from app.core.request_metrics import request_id
 from app.db.session import get_db
 from app.integrations.google.exceptions import GoogleAPIError
 from app.schemas.email_draft import (
@@ -180,14 +181,30 @@ async def save_email_draft_to_gmail(
 
     _message, draft = stored
     fingerprint = service.email_draft_fingerprint(draft)
-    claim = service.claim_gmail_draft_save(
-        user_id=user_id,
-        conversation_id=conversation_id,
-        message_id=message_id,
-        connection_id=payload.connection_id,
-        operation_id=payload.operation_id,
-        fingerprint=fingerprint,
-    )
+    try:
+        claim = service.claim_gmail_draft_save(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            connection_id=payload.connection_id,
+            operation_id=payload.operation_id,
+            fingerprint=fingerprint,
+        )
+    except Exception as exc:
+        logger.error(
+            "gmail_draft_operation_persistence_failed | request_id=%s "
+            "operation_id=%s error_type=%s",
+            request_id(),
+            payload.operation_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The draft save could not be started because its operation "
+                "could not be recorded. Gmail was not called."
+            ),
+        ) from exc
 
     if claim["status"] == "not_found":
         raise HTTPException(
@@ -239,6 +256,11 @@ async def save_email_draft_to_gmail(
         )
 
     try:
+        logger.info(
+            "gmail_draft_save_started | request_id=%s operation_id=%s",
+            request_id(),
+            payload.operation_id,
+        )
         created = await gmail_service.create_draft(
             user_id=user_id,
             connection_id=payload.connection_id,
@@ -246,10 +268,21 @@ async def save_email_draft_to_gmail(
             operation_id=payload.operation_id,
         )
     except GoogleAPIError as exc:
+        cause = exc.__cause__
         save_state = (
             "uncertain"
             if exc.status_code >= 500
             else "failed"
+        )
+        logger.warning(
+            "gmail_draft_create_outcome | request_id=%s operation_id=%s "
+            "state=%s google_status=%s google_reason=%s cause_type=%s",
+            request_id(),
+            payload.operation_id,
+            save_state,
+            exc.status_code,
+            exc.reason or "-",
+            type(cause).__name__ if cause else "-",
         )
         service.finish_gmail_draft_save(
             user_id=user_id,
@@ -306,7 +339,13 @@ async def save_email_draft_to_gmail(
             detail=str(exc),
         ) from exc
     except Exception as exc:
-        logger.exception("Gmail draft save failed with an uncertain outcome.")
+        logger.error(
+            "gmail_draft_create_outcome | request_id=%s operation_id=%s "
+            "state=uncertain error_type=%s",
+            request_id(),
+            payload.operation_id,
+            type(exc).__name__,
+        )
         service.finish_gmail_draft_save(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -322,6 +361,13 @@ async def save_email_draft_to_gmail(
             ),
         ) from exc
 
+    logger.info(
+        "gmail_draft_create_confirmed | request_id=%s operation_id=%s "
+        "draft_id=%s",
+        request_id(),
+        payload.operation_id,
+        created["draft_id"],
+    )
     result = {
         "draft_id": created["draft_id"],
         "message_id": created.get("message_id"),
@@ -339,7 +385,13 @@ async def save_email_draft_to_gmail(
             saved_preview=draft.model_dump(mode="json"),
         )
     except Exception as exc:
-        logger.exception("Gmail draft was created but save metadata could not be persisted.")
+        logger.error(
+            "gmail_draft_success_persist_failed | request_id=%s "
+            "operation_id=%s error_type=%s",
+            request_id(),
+            payload.operation_id,
+            type(exc).__name__,
+        )
         return GmailDraftSaveResponse(
             state="saved",
             connection_id=payload.connection_id,
@@ -372,7 +424,6 @@ async def save_email_draft_to_gmail(
                 "its status before retrying."
             ),
         )
-
     return GmailDraftSaveResponse(
         state="saved",
         connection_id=payload.connection_id,
@@ -421,6 +472,21 @@ async def get_email_draft_save_status(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        logger.error(
+            "gmail_draft_operation_load_failed | request_id=%s "
+            "operation_id=%s error_type=%s",
+            request_id(),
+            operation_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The saved draft operation could not be loaded. Its outcome "
+                "remains uncertain; do not retry the creation."
+            ),
         ) from exc
 
     state = operation.get("status", "not_found")
@@ -487,6 +553,13 @@ async def get_email_draft_save_status(
                 detail="The Gmail draft operation is still being processed.",
             )
 
+    logger.info(
+        "gmail_draft_status_check_started | request_id=%s operation_id=%s "
+        "stored_state=%s",
+        request_id(),
+        operation_id,
+        state,
+    )
     try:
         found = await gmail_service.find_draft_by_operation_id(
             user_id=user_id,
@@ -500,7 +573,27 @@ async def get_email_draft_save_status(
         ) from exc
     except (GoogleAPIError, ValueError) as exc:
         logger.warning(
-            "Unable to inspect Gmail draft save operation | error_type=%s",
+            "gmail_draft_status_check_failed | request_id=%s operation_id=%s "
+            "error_type=%s google_status=%s google_reason=%s",
+            request_id(),
+            operation_id,
+            type(exc).__name__,
+            exc.status_code if isinstance(exc, GoogleAPIError) else "-",
+            exc.reason if isinstance(exc, GoogleAPIError) and exc.reason else "-",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Gmail draft status could not be checked. The outcome remains "
+                "uncertain; do not retry the creation."
+            ),
+        ) from exc
+    except Exception as exc:
+        logger.error(
+            "gmail_draft_status_check_failed | request_id=%s operation_id=%s "
+            "error_type=%s",
+            request_id(),
+            operation_id,
             type(exc).__name__,
         )
         raise HTTPException(
@@ -512,6 +605,14 @@ async def get_email_draft_save_status(
         ) from exc
 
     found_draft = found.get("draft")
+    logger.info(
+        "gmail_draft_status_scan_completed | request_id=%s operation_id=%s "
+        "complete_scan=%s result=%s",
+        request_id(),
+        operation_id,
+        found.get("complete_scan"),
+        "found" if found_draft is not None else "not_found",
+    )
     if found_draft is not None:
         save_result = {
             "draft_id": found_draft.get("draft_id"),
@@ -527,9 +628,12 @@ async def get_email_draft_save_status(
                 connection_id=connection_id,
             )
         except Exception as exc:
-            logger.exception(
-                "Confirmed Gmail draft could not load its conversation preview | message_id=%s",
-                message_id,
+            logger.error(
+                "gmail_draft_preview_load_failed | request_id=%s "
+                "operation_id=%s error_type=%s",
+                request_id(),
+                operation_id,
+                type(exc).__name__,
             )
             stored = None
         preview_data = (
@@ -549,10 +653,13 @@ async def get_email_draft_save_status(
                 saved_preview=preview_data,
                 allow_uncertain=True,
             ) is not None
-        except Exception:
-            logger.exception(
-                "Found a Gmail draft but could not persist reconciliation | message_id=%s",
-                message_id,
+        except Exception as exc:
+            logger.error(
+                "gmail_draft_reconciliation_persist_failed | request_id=%s "
+                "operation_id=%s error_type=%s",
+                request_id(),
+                operation_id,
+                type(exc).__name__,
             )
         if not persisted:
             logger.warning(
@@ -588,9 +695,11 @@ async def get_email_draft_save_status(
                 state="uncertain",
             )
         except Exception:
-            logger.exception(
-                "Could not persist uncertain Gmail draft status | message_id=%s",
-                message_id,
+            logger.error(
+                "gmail_draft_uncertain_status_persist_failed | request_id=%s "
+                "operation_id=%s",
+                request_id(),
+                operation_id,
             )
 
     detail = (
@@ -598,7 +707,7 @@ async def get_email_draft_save_status(
         "prove creation failed. The outcome remains uncertain; do not retry."
         if found.get("complete_scan")
         else
-        "The draft list was too large to inspect completely. The outcome "
+        "Gmail could not inspect the draft list completely. The outcome "
         "remains uncertain; do not retry."
     )
     return GmailDraftSaveStatus(

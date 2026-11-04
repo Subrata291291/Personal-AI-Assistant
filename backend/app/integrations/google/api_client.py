@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import Any
@@ -46,6 +47,7 @@ class GoogleAPIClient:
 
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 20.0
+    SAFE_GOOGLE_ERROR_REASON = re.compile(r"[A-Za-z0-9_.-]{1,80}")
 
     def __init__(self):
         self.timeout = self.REQUEST_TIMEOUT
@@ -90,6 +92,35 @@ class GoogleAPIClient:
 
         if parsed.fragment:
             raise ValueError("URL fragments are not allowed.")
+
+    @classmethod
+    def _error_reason(cls, response: httpx.Response) -> str | None:
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        if not isinstance(body, dict):
+            return None
+        error = body.get("error")
+        if not isinstance(error, dict):
+            return None
+        candidates = [error.get("status")]
+        errors = error.get("errors")
+        if isinstance(errors, list):
+            candidates.extend(
+                item.get("reason")
+                for item in errors
+                if isinstance(item, dict)
+            )
+        return next(
+            (
+                reason
+                for reason in candidates
+                if isinstance(reason, str)
+                and cls.SAFE_GOOGLE_ERROR_REASON.fullmatch(reason)
+            ),
+            None,
+        )
 
     async def _send_request(
         self,
@@ -167,6 +198,7 @@ class GoogleAPIClient:
                 return result
 
             status_code = response.status_code
+            reason = self._error_reason(response)
 
             if (
                 status_code in self.RETRYABLE_STATUS_CODES
@@ -190,12 +222,14 @@ class GoogleAPIClient:
                     status_code=status_code,
                     message="Google API temporarily unavailable.",
                     retryable=True,
+                    reason=reason,
                 )
 
             raise GoogleAPIError(
                 status_code=status_code,
                 message="Google API request was rejected.",
                 retryable=False,
+                reason=reason,
             )
 
         raise GoogleAPIError(

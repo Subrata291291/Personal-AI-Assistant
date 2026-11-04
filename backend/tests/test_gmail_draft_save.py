@@ -5,15 +5,18 @@ from email import message_from_bytes
 from email.policy import default
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.api.v1.endpoints import messages as messages_endpoint
+from app.integrations.google.api_client import GoogleAPIClient
 from app.integrations.google.exceptions import GoogleAPIError
 from app.integrations.google.message_builder import GmailMessageBuilder
 from app.schemas.email_draft import EmailDraftPreview, GmailDraftSaveRequest
 from app.services.gmail_service import GmailService
+from app.services.message_service import MessageService
 
 
 USER_ID = uuid4()
@@ -112,6 +115,139 @@ def test_operation_marker_finds_existing_gmail_draft(monkeypatch):
     assert requests[1]["endpoint"] == "drafts/draft-existing"
 
 
+def test_operation_marker_scan_reaches_pages_beyond_five_hundred(monkeypatch):
+    service = GmailService(db=None)
+    pages = []
+    detail_requests = []
+    expected_page_tokens = [f"page-{number}" for number in range(2, 7)]
+
+    async def fake_google_get(**kwargs):
+        if kwargs["endpoint"] == "drafts":
+            pages.append(kwargs["params"])
+            page_number = len(pages)
+            page = {
+                "drafts": [
+                    {"id": f"draft-{page_number}-{index}"}
+                    for index in range(100)
+                ],
+            }
+            if page_number <= 5:
+                page["nextPageToken"] = expected_page_tokens[page_number - 1]
+            else:
+                page["drafts"] = [{"id": "draft-page-six"}]
+            return page
+
+        detail_requests.append(kwargs["endpoint"])
+        message_headers = (
+            [{
+                "name": "x-personal-ai-draft-operation-id",
+                "value": str(OPERATION_ID),
+            }]
+            if kwargs["endpoint"] == "drafts/draft-page-six"
+            else []
+        )
+        return {
+            "message": {
+                "id": "message-page-six",
+                "threadId": "thread-page-six",
+                "payload": {"headers": message_headers},
+            },
+        }
+
+    monkeypatch.setattr(service, "_validate_connection", lambda **_kwargs: None)
+    monkeypatch.setattr(service, "_google_get", fake_google_get)
+
+    result = asyncio.run(
+        service.find_draft_by_operation_id(
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            operation_id=OPERATION_ID,
+        )
+    )
+
+    assert result["draft"]["draft_id"] == "draft-page-six"
+    assert result["complete_scan"] is True
+    assert len(pages) == 6
+    assert pages[-1]["pageToken"] == "page-6"
+    assert detail_requests[-1] == "drafts/draft-page-six"
+
+
+def test_missing_operation_marker_is_not_a_confirmed_absence(monkeypatch):
+    service = GmailService(db=None)
+
+    async def fake_google_get(**kwargs):
+        if kwargs["endpoint"] == "drafts":
+            return {"drafts": [{"id": "draft-without-marker"}]}
+        return {
+            "message": {
+                "id": "message-without-marker",
+                "payload": {
+                    "headers": [{"name": "Subject", "value": "No marker"}],
+                },
+            },
+        }
+
+    monkeypatch.setattr(service, "_validate_connection", lambda **_kwargs: None)
+    monkeypatch.setattr(service, "_google_get", fake_google_get)
+
+    result = asyncio.run(
+        service.find_draft_by_operation_id(
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            operation_id=OPERATION_ID,
+        )
+    )
+
+    assert result == {"draft": None, "complete_scan": True}
+
+
+def test_google_api_error_reason_is_extracted_without_error_message():
+    response = httpx.Response(
+        403,
+        json={
+            "error": {
+                "status": "PERMISSION_DENIED",
+                "message": "Sensitive response text",
+                "errors": [{
+                    "reason": "insufficientPermissions",
+                    "message": "Sensitive detail",
+                }],
+            },
+        },
+    )
+
+    assert GoogleAPIClient._error_reason(response) == "PERMISSION_DENIED"
+
+
+def test_google_api_client_does_not_retry_timed_out_draft_post():
+    client = GoogleAPIClient()
+    request_count = 0
+
+    async def timeout_request(_request):
+        nonlocal request_count
+        request_count += 1
+        raise httpx.ReadTimeout("request timeout")
+
+    async def run_request():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(timeout_request),
+        ) as http_client:
+            await client._send_request(
+                client=http_client,
+                method="POST",
+                url="https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+                headers={},
+                params=None,
+                json_data={"message": {"raw": "payload"}},
+            )
+
+    with pytest.raises(GoogleAPIError) as request_error:
+        asyncio.run(run_request())
+
+    assert request_error.value.status_code == 503
+    assert request_count == 1
+
+
 def test_recipient_validation_allows_empty_draft_but_rejects_invalid_address():
     empty_recipient_draft = EmailDraftPreview(
         draft_type="new",
@@ -179,7 +315,13 @@ class DraftSaveStore:
 
 
 class DraftGmail:
-    def __init__(self, create_result=None, create_error=None, found=None):
+    def __init__(
+        self,
+        create_result=None,
+        create_error=None,
+        found=None,
+        complete_scan=True,
+    ):
         self.create_result = create_result or {
             "draft_id": "draft-1",
             "message_id": "gmail-message-1",
@@ -187,6 +329,7 @@ class DraftGmail:
         }
         self.create_error = create_error
         self.found = found
+        self.complete_scan = complete_scan
         self.create_calls = []
         self.find_calls = []
 
@@ -201,7 +344,10 @@ class DraftGmail:
 
     async def find_draft_by_operation_id(self, **kwargs):
         self.find_calls.append(kwargs)
-        return {"draft": self.found, "complete_scan": True}
+        return {
+            "draft": self.found,
+            "complete_scan": self.complete_scan,
+        }
 
 
 def test_created_draft_after_timeout_is_reconciled_without_duplicate(monkeypatch):
@@ -278,6 +424,185 @@ def test_pending_operation_does_not_scan_or_create_another_draft(monkeypatch):
     assert gmail.create_calls == []
 
 
+@pytest.mark.parametrize(
+    "google_error",
+    [
+        GoogleAPIError(403, "permission denied", reason="insufficientPermissions"),
+        GoogleAPIError(429, "quota exceeded", reason="rateLimitExceeded"),
+        GoogleAPIError(503, "lookup timed out"),
+    ],
+)
+def test_failed_status_lookup_stays_uncertain_and_never_creates(
+    monkeypatch,
+    google_error,
+):
+    store = DraftSaveStore(state="uncertain")
+    gmail = DraftGmail()
+
+    async def failed_lookup(**_kwargs):
+        gmail.find_calls.append(_kwargs)
+        raise google_error
+
+    monkeypatch.setattr(gmail, "find_draft_by_operation_id", failed_lookup)
+    monkeypatch.setattr(messages_endpoint, "GmailService", lambda _db: gmail)
+
+    for _ in range(2):
+        with pytest.raises(HTTPException) as check_error:
+            asyncio.run(
+                messages_endpoint.get_email_draft_save_status(
+                    CONVERSATION_ID,
+                    MESSAGE_ID,
+                    CONNECTION_ID,
+                    OPERATION_ID,
+                    {"id": str(USER_ID)},
+                    store,
+                    db=None,
+                )
+            )
+        assert check_error.value.status_code == 503
+
+    assert store.state == "uncertain"
+    assert len(gmail.find_calls) == 2
+    assert gmail.create_calls == []
+
+
+def test_repeated_complete_no_match_checks_do_not_authorize_creation(monkeypatch):
+    store = DraftSaveStore(state="uncertain")
+    gmail = DraftGmail(found=None)
+    monkeypatch.setattr(messages_endpoint, "GmailService", lambda _db: gmail)
+
+    for _ in range(2):
+        result = asyncio.run(
+            messages_endpoint.get_email_draft_save_status(
+                CONVERSATION_ID,
+                MESSAGE_ID,
+                CONNECTION_ID,
+                OPERATION_ID,
+                {"id": str(USER_ID)},
+                store,
+                db=None,
+            )
+        )
+        assert result.state == "uncertain"
+        assert "does not prove creation failed" in result.detail
+
+    assert len(gmail.find_calls) == 2
+    assert gmail.create_calls == []
+
+
+def test_incomplete_scan_remains_uncertain_and_does_not_create(monkeypatch):
+    store = DraftSaveStore(state="uncertain")
+    gmail = DraftGmail(complete_scan=False)
+    monkeypatch.setattr(messages_endpoint, "GmailService", lambda _db: gmail)
+
+    result = asyncio.run(
+        messages_endpoint.get_email_draft_save_status(
+            CONVERSATION_ID,
+            MESSAGE_ID,
+            CONNECTION_ID,
+            OPERATION_ID,
+            {"id": str(USER_ID)},
+            store,
+            db=None,
+        )
+    )
+
+    assert result.state == "uncertain"
+    assert "could not inspect the draft list completely" in result.detail
+    assert gmail.create_calls == []
+
+
+def test_operation_record_load_failure_keeps_status_uncertain(monkeypatch):
+    store = DraftSaveStore(state="uncertain")
+    gmail = DraftGmail()
+
+    def fail_load(**_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store, "get_gmail_draft_save_record", fail_load)
+    monkeypatch.setattr(messages_endpoint, "GmailService", lambda _db: gmail)
+
+    with pytest.raises(HTTPException) as check_error:
+        asyncio.run(
+            messages_endpoint.get_email_draft_save_status(
+                CONVERSATION_ID,
+                MESSAGE_ID,
+                CONNECTION_ID,
+                OPERATION_ID,
+                {"id": str(USER_ID)},
+                store,
+                db=None,
+            )
+        )
+
+    assert check_error.value.status_code == 503
+    assert "remains uncertain" in check_error.value.detail
+    assert gmail.find_calls == []
+    assert gmail.create_calls == []
+
+
+def test_operation_claim_persistence_failure_prevents_gmail_request(monkeypatch):
+    store = DraftSaveStore()
+    gmail = DraftGmail()
+
+    def fail_claim(**_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store, "claim_gmail_draft_save", fail_claim)
+    monkeypatch.setattr(messages_endpoint, "GmailService", lambda _db: gmail)
+
+    with pytest.raises(HTTPException) as save_error:
+        asyncio.run(
+            messages_endpoint.save_email_draft_to_gmail(
+                CONVERSATION_ID,
+                MESSAGE_ID,
+                GmailDraftSaveRequest(
+                    connection_id=CONNECTION_ID,
+                    operation_id=OPERATION_ID,
+                ),
+                {"id": str(USER_ID)},
+                store,
+                db=None,
+            )
+        )
+
+    assert save_error.value.status_code == 503
+    assert "Gmail was not called" in save_error.value.detail
+    assert gmail.create_calls == []
+
+
+def test_reconciliation_database_failure_keeps_operation_recoverable(monkeypatch):
+    store = DraftSaveStore(state="uncertain")
+    gmail = DraftGmail(found={
+        "draft_id": "draft-confirmed",
+        "message_id": "gmail-message-confirmed",
+        "thread_id": "thread-confirmed",
+    })
+
+    def fail_persist(**_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store, "finish_gmail_draft_save", fail_persist)
+    monkeypatch.setattr(messages_endpoint, "GmailService", lambda _db: gmail)
+
+    result = asyncio.run(
+        messages_endpoint.get_email_draft_save_status(
+            CONVERSATION_ID,
+            MESSAGE_ID,
+            CONNECTION_ID,
+            OPERATION_ID,
+            {"id": str(USER_ID)},
+            store,
+            db=None,
+        )
+    )
+
+    assert result.state == "saved"
+    assert result.draft_id == "draft-confirmed"
+    assert "could not be updated" in result.detail
+    assert gmail.create_calls == []
+
+
 def test_definitive_failure_allows_retry_using_same_operation_id(monkeypatch):
     store = DraftSaveStore()
     gmail = DraftGmail(
@@ -338,3 +663,18 @@ def test_definitive_failure_allows_retry_using_same_operation_id(monkeypatch):
 
     assert result.state == "saved"
     assert gmail.create_calls[0]["operation_id"] == OPERATION_ID
+
+
+def test_wrong_conversation_is_not_found_before_operation_lookup():
+    service = object.__new__(MessageService)
+    service.verify_conversation_ownership = lambda **_kwargs: False
+
+    result = service.get_gmail_draft_save_record(
+        user_id=USER_ID,
+        conversation_id=CONVERSATION_ID,
+        message_id=MESSAGE_ID,
+        connection_id=CONNECTION_ID,
+        operation_id=OPERATION_ID,
+    )
+
+    assert result == {"status": "not_found"}

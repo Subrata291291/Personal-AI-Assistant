@@ -301,7 +301,9 @@ function EmailDraftCard({
       }
       setSaveBlockedLocally(true)
       setError(
-        'Gmail could not inspect the save operation. Its outcome remains uncertain; do not retry.',
+        statusError?.status && statusError.message
+          ? statusError.message
+          : 'Gmail could not inspect the save operation. Its outcome remains uncertain; do not retry.',
       )
     },
   })
