@@ -87,6 +87,9 @@ class Settings(BaseSettings):
     # Frontend and Backend
     FRONTEND_URL: str = "http://localhost:5173"
     BACKEND_URL: str = "http://localhost:8000"
+    CORS_ALLOWED_ORIGINS: str = (
+        "http://localhost:5173,https://www.myorbitai.in"
+    )
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
@@ -112,6 +115,32 @@ class Settings(BaseSettings):
             for scope in self.GOOGLE_OAUTH_SCOPES.split(",")
             if scope.strip()
         ]
+
+    @property
+    def allowed_cors_origins(self) -> list[str]:
+        """Return the configured list of allowed frontend origins.
+
+        Keep localhost development support while also allowing the production
+        frontend origin without ever using a wildcard origin with credentials.
+        """
+        configured_values = [
+            self.CORS_ALLOWED_ORIGINS,
+            self.FRONTEND_URL,
+            "http://localhost:5173",
+            "https://www.myorbitai.in",
+        ]
+
+        normalized: list[str] = []
+        for raw_value in configured_values:
+            if not raw_value:
+                continue
+
+            for origin in str(raw_value).split(","):
+                cleaned = origin.strip().rstrip("/")
+                if cleaned and cleaned not in normalized:
+                    normalized.append(cleaned)
+
+        return normalized
 
 @lru_cache
 def get_settings() -> Settings:
