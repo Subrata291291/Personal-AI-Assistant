@@ -150,6 +150,7 @@ class ActionApprovalService:
         )
         row = self.repository.create_gmail_draft_proposal(
             proposal_id=proposal_id,
+            idempotency_key=idempotency_key,
             source_message_id=validated.source_message_id,
             conversation_id=validated.conversation_id,
             user_id=user_id,

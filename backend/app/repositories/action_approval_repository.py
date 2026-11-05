@@ -1,4 +1,6 @@
 import json
+import re
+import traceback
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -11,6 +13,101 @@ from app.db.session import engine
 
 
 logger = get_logger(__name__)
+
+_EMAIL_PATTERN = re.compile(
+    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+    re.IGNORECASE,
+)
+_QUOTED_VALUE_PATTERN = re.compile(r"""(['"]).*?\1""")
+_KEY_VALUE_PATTERN = re.compile(r"Key \(([^)]*)\)=\((.*?)\)")
+_INVALID_INPUT_VALUE_PATTERN = re.compile(
+    r"""(invalid input syntax for type [^:]+:\s*)(['"]).*?\2""",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_postgres_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = _KEY_VALUE_PATTERN.sub(r"Key (\1)=([REDACTED])", value)
+    value = _INVALID_INPUT_VALUE_PATTERN.sub(r"\1[REDACTED]", value)
+    value = _QUOTED_VALUE_PATTERN.sub("[REDACTED]", value)
+    value = _EMAIL_PATTERN.sub("[REDACTED_EMAIL]", value)
+    value = re.sub(
+        r"(?i)\b(bearer\s+|(?:access|refresh)?_?token\s*[:=]\s*)"
+        r"[^\s,;]+",
+        r"\1[REDACTED]",
+        value,
+    )
+    return value.replace("\r", " ").replace("\n", " ")
+
+
+def _safe_exception_traceback(exc: BaseException) -> str:
+    """Keep the complete exception chain and frames, but not exception text."""
+    formatted: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if current.__traceback__ is not None:
+            formatted.extend(traceback.format_tb(current.__traceback__))
+        exception_class = (
+            f"{type(current).__module__}.{type(current).__qualname__}"
+        )
+        formatted.append(f"{exception_class}: [message redacted]")
+        if current.__cause__ is not None:
+            formatted.append("Caused by:")
+            current = current.__cause__
+        elif (
+            current.__context__ is not None
+            and not current.__suppress_context__
+        ):
+            formatted.append("During handling of the above exception:")
+            current = current.__context__
+        else:
+            current = None
+    return "".join(formatted)
+
+
+def _database_exception_diagnostics(exc: Exception) -> dict[str, Any]:
+    original = getattr(exc, "orig", None)
+    diagnostic = getattr(original, "diag", None)
+    statement = getattr(exc, "statement", None)
+    return {
+        "exception_class": (
+            f"{type(exc).__module__}.{type(exc).__qualname__}"
+        ),
+        "dbapi_exception_class": (
+            f"{type(original).__module__}.{type(original).__qualname__}"
+            if original is not None
+            else None
+        ),
+        "sqlstate": (
+            getattr(original, "sqlstate", None)
+            or getattr(original, "pgcode", None)
+        ),
+        "postgres_message": _sanitize_postgres_text(
+            getattr(diagnostic, "message_primary", None),
+        ),
+        "postgres_detail": _sanitize_postgres_text(
+            getattr(diagnostic, "message_detail", None),
+        ),
+        "postgres_hint": _sanitize_postgres_text(
+            getattr(diagnostic, "message_hint", None),
+        ),
+        "constraint": _sanitize_postgres_text(
+            getattr(diagnostic, "constraint_name", None),
+        ),
+        "table": _sanitize_postgres_text(
+            getattr(diagnostic, "table_name", None),
+        ),
+        "column": _sanitize_postgres_text(
+            getattr(diagnostic, "column_name", None),
+        ),
+        "sql_statement": statement if isinstance(statement, str) else None,
+        "sql_parameters": "[REDACTED]",
+        "traceback": _safe_exception_traceback(exc),
+    }
 
 
 _INSERT_PROPOSAL = text("""
@@ -340,6 +437,7 @@ class ActionApprovalRepository:
         self,
         *,
         proposal_id: UUID,
+        idempotency_key: UUID,
         source_message_id: UUID,
         conversation_id: UUID,
         user_id: UUID,
@@ -396,12 +494,16 @@ class ActionApprovalRepository:
             logger.error(
                 "gmail_draft_approval_database_transaction_failed "
                 "| request_id=%s | user_id=%s | approval_id=%s "
-                "| transaction_outcome=unknown | http_status=503 "
-                "| error_type=%s",
+                "| idempotency_key=%s | transaction_outcome=unknown "
+                "| http_status=503 | diagnostics=%s",
                 request_id(),
                 user_id,
                 proposal_id,
-                type(exc).__name__,
+                idempotency_key,
+                json.dumps(
+                    _database_exception_diagnostics(exc),
+                    sort_keys=True,
+                ),
             )
             raise
 
