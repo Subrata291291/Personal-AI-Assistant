@@ -115,9 +115,9 @@ _SAFE_RESULT_DENIED_KEYS = re.compile(
 class ApprovalProposalCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    conversation_id: UUID
-    source_message_id: UUID
-    connection_id: UUID
+    conversation_id: UUID = Field(strict=False)
+    source_message_id: UUID = Field(strict=False)
+    connection_id: UUID = Field(strict=False)
     action_type: ActionType
     parameters: dict[str, JsonValue] = Field(min_length=1, max_length=30)
 
