@@ -4,6 +4,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.security import encrypt_data, decrypt_data
+from app.integrations.google.exceptions import GoogleOAuthAuthorizationError
 from app.repositories.oauth_credential_repository import (
     OAuthCredentialRepository,
 )
@@ -72,6 +73,27 @@ class OAuthCredentialService:
         if credential is None:
             return None
 
+        return self._decrypted_credentials(credential)
+
+    def get_credentials_for_update(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> dict[str, Any] | None:
+        """Lock and retrieve credentials while merging an OAuth grant."""
+
+        credential = self.repository.get_by_connection_for_update(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+
+        if credential is None:
+            return None
+
+        return self._decrypted_credentials(credential)
+
+    @staticmethod
+    def _decrypted_credentials(credential: Any) -> dict[str, Any]:
         access_token = decrypt_data(
             credential.access_token_encrypted
         )
@@ -279,9 +301,7 @@ class OAuthCredentialService:
             return access_token
 
         if not refresh_token:
-            raise ValueError(
-                "Refresh token unavailable. Reconnection required."
-            )
+            raise GoogleOAuthAuthorizationError()
 
         oauth_client = GoogleOAuthClient()
 

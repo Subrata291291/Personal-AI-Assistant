@@ -5,6 +5,11 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 
 from app.core.config import settings
+from app.integrations.google.exceptions import (
+    GoogleOAuthAuthorizationError,
+    GoogleOAuthTransientError,
+)
+from app.integrations.google import scopes as google_scopes
 
 
 class GoogleOAuthClient:
@@ -34,6 +39,9 @@ class GoogleOAuthClient:
     )
 
     REQUEST_TIMEOUT = 15.0
+    IDENTITY_SCOPES = ("openid", "email", "profile")
+    CALENDAR_EVENTS_READ_SCOPE = google_scopes.CALENDAR_EVENTS_READ_SCOPE
+    CALENDAR_FREEBUSY_SCOPE = google_scopes.CALENDAR_FREEBUSY_SCOPE
 
     @staticmethod
     def _validate_redirect_uri(redirect_uri: str) -> None:
@@ -101,6 +109,7 @@ class GoogleOAuthClient:
         self,
         state: str,
         code_challenge: str,
+        service: str = "gmail",
     ) -> str:
         """
         Build the Google OAuth authorization URL.
@@ -129,7 +138,7 @@ class GoogleOAuthClient:
             settings.GOOGLE_REDIRECT_URI
         )
 
-        scopes = settings.google_oauth_scopes_list
+        scopes = self.scopes_for_service(service)
 
         if not scopes:
             raise RuntimeError(
@@ -153,6 +162,35 @@ class GoogleOAuthClient:
             f"{self.AUTHORIZATION_ENDPOINT}?"
             f"{urlencode(params)}"
         )
+
+    @classmethod
+    def scopes_for_service(cls, service: str) -> list[str]:
+        """Return the least-privilege scope set for one Google service."""
+
+        if service == "calendar":
+            requested_scopes = [
+                *cls.IDENTITY_SCOPES,
+                cls.CALENDAR_EVENTS_READ_SCOPE,
+                cls.CALENDAR_FREEBUSY_SCOPE,
+            ]
+        elif service == "gmail":
+            configured_scopes = settings.google_oauth_scopes_list
+            gmail_scopes = [
+                scope
+                for scope in configured_scopes
+                if scope.startswith(
+                    "https://www.googleapis.com/auth/gmail."
+                )
+                or scope == "https://mail.google.com/"
+            ]
+            requested_scopes = [
+                *cls.IDENTITY_SCOPES,
+                *gmail_scopes,
+            ]
+        else:
+            raise ValueError("Unsupported Google service.")
+
+        return list(dict.fromkeys(requested_scopes))
 
     async def exchange_authorization_code(
         self,
@@ -353,6 +391,28 @@ class GoogleOAuthClient:
 
                 response.raise_for_status()
                 token_data = response.json()
+
+        except httpx.HTTPStatusError as exc:
+            error_code = None
+            try:
+                error_payload = exc.response.json()
+            except ValueError:
+                error_payload = None
+            if isinstance(error_payload, dict):
+                error_code = error_payload.get("error")
+            if error_code == "invalid_grant":
+                raise GoogleOAuthAuthorizationError() from exc
+            if (
+                exc.response.status_code == 429
+                or exc.response.status_code >= 500
+            ):
+                raise GoogleOAuthTransientError() from exc
+            raise RuntimeError(
+                "Google access token refresh failed."
+            ) from exc
+
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise GoogleOAuthTransientError() from exc
 
         except (httpx.HTTPError, ValueError) as exc:
             raise RuntimeError(

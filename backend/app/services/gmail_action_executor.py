@@ -27,6 +27,8 @@ class ExecutionStatePersistenceError(Exception):
 class GmailActionExecutor:
     """Execute only explicitly approved, immutable Gmail-send proposals."""
 
+    SUPPORTED_ACTION_TYPES = frozenset({"gmail.send", "gmail.send_draft"})
+
     def __init__(
         self,
         db: Session,
@@ -45,7 +47,7 @@ class GmailActionExecutor:
             user_id=user_id,
             proposal_id=proposal_id,
         )
-        if proposal.action_type not in {"gmail.send", "gmail.send_draft"}:
+        if proposal.action_type not in self.SUPPORTED_ACTION_TYPES:
             raise PermissionError(
                 "Only Gmail send actions can be executed in this phase."
             )
@@ -55,7 +57,7 @@ class GmailActionExecutor:
             user_id=user_id,
             proposal_id=proposal_id,
         )
-        if claimed.action_type not in {"gmail.send", "gmail.send_draft"}:
+        if claimed.action_type not in self.SUPPORTED_ACTION_TYPES:
             raise PermissionError(
                 "Only Gmail send actions can be executed in this phase."
             )
@@ -177,7 +179,7 @@ class GmailActionExecutor:
     def _validate_stored_send(
         proposal: ActionApprovalProposal,
     ) -> ApprovalProposalCreate:
-        if proposal.action_type not in {"gmail.send", "gmail.send_draft"}:
+        if proposal.action_type not in GmailActionExecutor.SUPPORTED_ACTION_TYPES:
             raise PermissionError(
                 "Only Gmail send actions can be executed in this phase."
             )

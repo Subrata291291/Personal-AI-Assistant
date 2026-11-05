@@ -16,7 +16,9 @@ from app.repositories.chat_request_repository import (
     ChatRequestRepository,
 )
 from app.services.message_service import MessageService
-from app.workflows.chat_graph import chat_graph
+from app.services.user_connection_service import UserConnectionService
+from app.workflows.chat_graph import ASSISTANT_ROUTE_NODES, chat_graph
+from app.workflows.gmail_agent_nodes import build_runtime_capabilities
 from app.services import message_service
 
 
@@ -45,10 +47,12 @@ class ChatService:
         user_settings_service: UserSettingsService,
         memory_pipeline: MemoryPipeline,
         request_repository: ChatRequestRepository | None = None,
+        user_connection_service: UserConnectionService | None = None,
     ):
         self.message_service = message_service
         self.user_settings_service = user_settings_service
         self.memory_pipeline = memory_pipeline
+        self.user_connection_service = user_connection_service
 
         self.request_repository = (
             request_repository or ChatRequestRepository()
@@ -60,6 +64,7 @@ class ChatService:
         content: str,
         gmail_connection_id: UUID | None = None,
         user_timezone: str = "UTC",
+        default_calendar_connection_id: str | None = None,
     ) -> str:
         """Generate a deterministic SHA-256 fingerprint."""
 
@@ -71,6 +76,10 @@ class ChatService:
             payload["user_timezone"] = user_timezone
         if gmail_connection_id is not None:
             payload["gmail_connection_id"] = str(gmail_connection_id)
+        if default_calendar_connection_id:
+            payload["default_calendar_connection_id"] = (
+                str(default_calendar_connection_id)
+            )
 
         canonical_payload = json.dumps(
             payload,
@@ -359,6 +368,7 @@ class ChatService:
         idempotency_key: UUID,
         gmail_connection_id: UUID | None = None,
         user_timezone: str = "UTC",
+        default_calendar_connection_id: str | None = None,
     ) -> dict[str, Any]:
         """Process an idempotent chat request using LangGraph."""
 
@@ -384,6 +394,7 @@ class ChatService:
             content=normalized_content,
             gmail_connection_id=gmail_connection_id,
             user_timezone=user_timezone,
+            default_calendar_connection_id=default_calendar_connection_id,
         )
 
         # 3. Create or retrieve the idempotent request.
@@ -527,6 +538,79 @@ class ChatService:
                 history,
                 gmail_connection_id,
             )
+            granted_gmail_scopes = (
+                self.user_connection_service.get_granted_google_scopes(
+                    user_id=user_id,
+                    connection_id=gmail_connection_id,
+                )
+                if self.user_connection_service and gmail_connection_id
+                else None
+            )
+            calendar_access = (
+                self.user_connection_service.get_user_calendar_access(
+                    user_id=user_id,
+                    default_connection_id=default_calendar_connection_id,
+                )
+                if self.user_connection_service
+                else {
+                    "google_connection_available": False,
+                    "capabilities": {},
+                    "event_read_connection_id": None,
+                    "freebusy_connection_id": None,
+                    "default_connection_invalid": False,
+                    "default_connection_selected": False,
+                    "selected_connection_email": None,
+                    "event_selection_required": False,
+                    "freebusy_selection_required": False,
+                    "selected_event_scope_missing": False,
+                    "selected_freebusy_scope_missing": False,
+                }
+            )
+            calendar_capabilities = {
+                **calendar_access["capabilities"],
+                "events_read": bool(
+                    calendar_access["event_read_connection_id"]
+                ),
+                "freebusy": bool(
+                    calendar_access["freebusy_connection_id"]
+                ),
+                "api_available": bool(
+                    calendar_access["event_read_connection_id"]
+                    or calendar_access["freebusy_connection_id"]
+                ),
+                "api_complete": bool(
+                    calendar_access["event_read_connection_id"]
+                    and calendar_access["freebusy_connection_id"]
+                ),
+                "selection_required": bool(
+                    calendar_access["event_selection_required"]
+                    or calendar_access["freebusy_selection_required"]
+                ),
+                "default_connection_invalid": bool(
+                    calendar_access["default_connection_invalid"]
+                ),
+                "default_connection_selected": bool(
+                    calendar_access["default_connection_selected"]
+                ),
+                "selected_event_scope_missing": bool(
+                    calendar_access["selected_event_scope_missing"]
+                ),
+                "selected_freebusy_scope_missing": bool(
+                    calendar_access["selected_freebusy_scope_missing"]
+                ),
+                "google_connection_available": (
+                    calendar_access["google_connection_available"]
+                ),
+            }
+            assistant_capabilities = build_runtime_capabilities(
+                granted_scopes=granted_gmail_scopes or set(),
+                unavailable_routes={
+                    route
+                    for route, node in ASSISTANT_ROUTE_NODES.items()
+                    if node == "integration_unavailable"
+                },
+                calendar_capabilities=calendar_capabilities,
+            )
 
             previous_messages = [
                 {
@@ -561,6 +645,7 @@ class ChatService:
                 "model": "",
                 "messages": previous_messages,
                 "user_timezone": user_timezone,
+                "assistant_capabilities": assistant_capabilities,
             }
             if available_gmail_sources:
                 initial_state["available_gmail_sources"] = (
@@ -596,10 +681,40 @@ class ChatService:
                         "user_id": str(user_id),
                         "gmail_connection_id": (
                             str(gmail_connection_id)
-                            if gmail_connection_id
+                            if granted_gmail_scopes is not None
                             else None
                         ),
                         "user_timezone": user_timezone,
+                        "calendar_event_connection_id": (
+                            calendar_access["event_read_connection_id"]
+                        ),
+                        "calendar_freebusy_connection_id": (
+                            calendar_access["freebusy_connection_id"]
+                        ),
+                        "google_connection_available": (
+                            calendar_access["google_connection_available"]
+                        ),
+                        "calendar_default_connection_selected": (
+                            calendar_access["default_connection_selected"]
+                        ),
+                        "calendar_default_connection_invalid": (
+                            calendar_access["default_connection_invalid"]
+                        ),
+                        "calendar_selected_account_email": (
+                            calendar_access["selected_connection_email"]
+                        ),
+                        "calendar_event_selection_required": (
+                            calendar_access["event_selection_required"]
+                        ),
+                        "calendar_freebusy_selection_required": (
+                            calendar_access["freebusy_selection_required"]
+                        ),
+                        "calendar_selected_event_scope_missing": (
+                            calendar_access["selected_event_scope_missing"]
+                        ),
+                        "calendar_selected_freebusy_scope_missing": (
+                            calendar_access["selected_freebusy_scope_missing"]
+                        ),
                     },
                 )
             finally:

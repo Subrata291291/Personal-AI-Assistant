@@ -44,6 +44,15 @@ class IntegrationPlan(GmailPlanBase):
         "google_contacts",
         "tasks",
     ]
+    calendar_tool: Literal[
+        "list_calendar_events",
+        "get_calendar_event",
+        "get_today_schedule",
+        "get_calendar_schedule",
+        "check_calendar_availability",
+        "clarify",
+    ] | None = None
+    calendar_arguments: dict[str, object] | None = None
 
 
 class MeetingDiscoveryPlan(GmailPlanBase):

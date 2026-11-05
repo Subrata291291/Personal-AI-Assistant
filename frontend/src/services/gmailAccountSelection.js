@@ -5,7 +5,8 @@ export function resolveAssistantGmailConnection(
   const connected = connections.filter(
     (connection) =>
       connection.provider === 'google' &&
-      connection.status === 'connected',
+      connection.status === 'connected' &&
+      connection.capabilities?.gmail === true,
   )
 
   if (connected.length === 1) return connected[0]

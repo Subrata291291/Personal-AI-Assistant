@@ -11,6 +11,16 @@ class ChatContext(TypedDict):
     user_id: str
     gmail_connection_id: str | None
     user_timezone: NotRequired[str]
+    calendar_event_connection_id: NotRequired[str | None]
+    calendar_freebusy_connection_id: NotRequired[str | None]
+    google_connection_available: NotRequired[bool]
+    calendar_default_connection_selected: NotRequired[bool]
+    calendar_default_connection_invalid: NotRequired[bool]
+    calendar_selected_account_email: NotRequired[str | None]
+    calendar_event_selection_required: NotRequired[bool]
+    calendar_freebusy_selection_required: NotRequired[bool]
+    calendar_selected_event_scope_missing: NotRequired[bool]
+    calendar_selected_freebusy_scope_missing: NotRequired[bool]
 
 
 class ChatState(TypedDict):
@@ -22,6 +32,8 @@ class ChatState(TypedDict):
     user_message: str
 
     user_timezone: NotRequired[str]
+
+    assistant_capabilities: NotRequired[dict[str, Any]]
 
     assistant_route: NotRequired[str]
 

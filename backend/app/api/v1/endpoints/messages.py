@@ -305,6 +305,19 @@ async def save_email_draft_to_gmail(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Google denied permission to create this Gmail draft.",
             ) from exc
+        if exc.status_code == 401:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Google authorization is no longer valid. Reconnect "
+                    "Gmail in Connected Apps, then try again."
+                ),
+            ) from exc
+        if exc.retryable or exc.status_code == 429:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Google is temporarily unavailable. Please try again.",
+            ) from exc
         if exc.status_code == 404:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

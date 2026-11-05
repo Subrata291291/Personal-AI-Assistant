@@ -1,4 +1,5 @@
 from uuid import UUID
+from typing import Literal
 from urllib.parse import urlencode, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -57,6 +58,7 @@ def _frontend_connector_url(status_value: str) -> str:
 def connect_google(
     current_user: CurrentUser,
     db: Session = Depends(get_db),
+    service: Literal["gmail", "calendar"] = "gmail",
 ):
     """
     Start Google OAuth authorization for an authenticated user.
@@ -90,6 +92,7 @@ def connect_google(
         authorization_url = oauth_client.build_authorization_url(
             state=state_data["state"],
             code_challenge=state_data["code_challenge"],
+            service=service,
         )
 
         return {
@@ -210,10 +213,14 @@ def list_google_connections(
         connections = service.list_connections(
             user_id=user_id,
         )
+        calendar_capabilities = service.aggregate_calendar_capabilities(
+            connections,
+        )
 
         return {
             "connections": connections,
             "total": len(connections),
+            "calendar_capabilities": calendar_capabilities,
         }
 
     except (KeyError, ValueError) as exc:

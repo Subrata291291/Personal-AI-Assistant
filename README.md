@@ -20,9 +20,11 @@ read [PROJECT_HANDOVER.md](./PROJECT_HANDOVER.md).
   sending as separate operations.
 - Support pluggable language-model providers with transient-failure fallback.
 
-Implemented Google API access is Gmail-focused. Google Drive, Calendar,
-Contacts, tasks, and reminders are not connected integrations; Assistant
-requests for those services receive an unavailable response.
+Implemented Google API operations include Gmail workflows and read-only Google
+Calendar event and FreeBusy endpoints. Calendar event creation and management
+are not implemented. Google Drive, Contacts, tasks, and reminders are not
+connected integrations; Assistant requests for those services receive an
+unavailable response.
 
 ## Technology stack
 
@@ -34,7 +36,7 @@ requests for those services receive an unavailable response.
 | Authentication | Supabase Auth; Supabase JavaScript client and backend bearer-token verification |
 | AI/LLM | Groq, OpenRouter, Google Gemini, OpenAI; Gemini embeddings |
 | Agent orchestration | LangGraph; the Python MCP SDK is a dependency, but no production MCP tool server is wired in the current app |
-| External integrations | Google OAuth and Gmail API |
+| External integrations | Google OAuth, Gmail API, and read-only Google Calendar API |
 | Deployment | Render, Netlify, and Supabase are the intended hosting/services; deployment dashboards and live configuration are not verified from this repository |
 
 Backend dependencies and versions are pinned in
@@ -57,6 +59,7 @@ flowchart LR
   Graph --> LLM[Groq / OpenRouter / Gemini / OpenAI]
   API --> GoogleOAuth[Google OAuth]
   API --> Gmail[Gmail API]
+  API --> Calendar[Google Calendar API - read only]
   GoogleOAuth --> DB
   Gmail --> DB
 ```
@@ -86,6 +89,8 @@ workflow.
   Gmail search, message details, attachment downloads, and message actions.
 - Chat-generated editable email previews, Gmail draft saving, and a distinct
   send-approval workflow.
+- Authenticated, user-scoped, read-only Google Calendar event, schedule,
+  conflict, and FreeBusy endpoints.
 - Email HTML sanitization and sandboxed display; Markdown/GFM assistant
   responses.
 - Request-ID correlation and timing instrumentation.
@@ -96,6 +101,59 @@ through the Assistant. In particular, the Assistant currently reports archive
 and delete as unavailable. Some mailbox UI actions call direct authenticated
 Gmail endpoints rather than the action-approval executor; see the handover
 before changing write behavior.
+
+## Google Calendar read-only API
+
+Every endpoint requires the authenticated user's bearer token and a
+`connection_id` for that user's active Google connection. Calendar access is
+allowed only when that connection has a stored, granted Calendar-capable OAuth
+scope. The default Google calendar is `primary`; `calendar_id` can select an
+accessible shared calendar. Event timestamps are returned as UTC-aware values.
+All-day events retain their dates (the provider's end date is exclusive).
+Recurring events are expanded within the requested time range and retain
+recurrence metadata.
+
+| Method and path | Contract |
+|---|---|
+| `GET /api/v1/calendar/events` | Upcoming events by default. Query parameters: required `connection_id`; optional `calendar_id` (default `primary`), `max_results` (1-2500), `page_token`, RFC3339 `time_min`/`time_max`, text `query`, attendee email `attendee`, and IANA `time_zone`. `query` uses Google Calendar text search; attendee filtering is applied to returned event attendees. Response contains `events`, `next_page_token`, `calendar_id`, and `time_zone`. |
+| `GET /api/v1/calendar/events/{event_id}` | Event details. Requires `connection_id`; optional `calendar_id` (default `primary`). |
+| `GET /api/v1/calendar/schedule/today` | Today's local schedule. Requires `connection_id` and IANA `time_zone`; optional `calendar_id`. |
+| `GET /api/v1/calendar/schedule` | Daily or Monday-based weekly schedule. Requires `connection_id`, `date` (`YYYY-MM-DD`), and IANA `time_zone`; `period` is `day` (default) or `week`; optional `calendar_id`. Response includes overlapping event pairs and `conflicts_complete`; this is false if Google returns another page. |
+| `POST /api/v1/calendar/freebusy` | Read-only Google FreeBusy query. JSON body: `connection_id`, `time_min`, `time_max` (RFC3339 with offsets), `time_zone` (IANA), and optional `calendar_ids` (defaults to `["primary"]`). Per-calendar errors are returned alongside any busy ranges. |
+
+Example:
+
+```http
+GET /api/v1/calendar/events?connection_id=YOUR_CONNECTION_UUID&time_min=2026-11-05T00%3A00%3A00Z&time_max=2026-11-06T00%3A00%3A00Z&time_zone=America%2FLos_Angeles
+```
+
+```json
+{
+  "calendar_id": "primary",
+  "events": [
+    {
+      "id": "event-id",
+      "summary": "Planning",
+      "start": {
+        "date": null,
+        "date_time": "2026-11-05T17:00:00Z",
+        "time_zone": "America/Los_Angeles"
+      },
+      "end": {
+        "date": null,
+        "date_time": "2026-11-05T18:00:00Z",
+        "time_zone": "America/Los_Angeles"
+      },
+      "attendees": []
+    }
+  ],
+  "next_page_token": null,
+  "time_zone": "America/Los_Angeles"
+}
+```
+
+Calendar routes in this phase expose no event mutation operation. The
+FreeBusy `POST` only calls Google's read-only `freeBusy.query` method.
 
 ## Repository layout
 
@@ -141,7 +199,7 @@ before changing write behavior.
 - A PostgreSQL connection suitable for this application. The backend requires
   `DATABASE_URL` and sets `sslmode=require` if no SSL mode is present.
 - LLM credentials and model names for AI features. Google OAuth credentials
-  are additionally required for Gmail.
+  are additionally required for Gmail and Calendar.
 
 ### 1. Create and configure the backend environment
 

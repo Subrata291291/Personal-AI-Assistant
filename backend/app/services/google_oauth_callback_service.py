@@ -129,7 +129,7 @@ class GoogleOAuthCallbackService:
             # Check whether previously stored credentials contain
             # a refresh token.
             existing_credentials = (
-                self.credential_service.get_credentials(
+                self.credential_service.get_credentials_for_update(
                     user_id=user_id,
                     connection_id=connection["id"],
                 )
@@ -139,6 +139,11 @@ class GoogleOAuthCallbackService:
                 existing_credentials.get("refresh_token")
                 if existing_credentials
                 else None
+            )
+            existing_scopes = (
+                existing_credentials.get("scopes") or []
+                if existing_credentials
+                else []
             )
 
             # Google may omit a refresh token during reconnection.
@@ -163,7 +168,7 @@ class GoogleOAuthCallbackService:
                 refresh_token=refresh_token,
                 token_type=token_type,
                 expires_at=expires_at,
-                scopes=scopes,
+                scopes=list(dict.fromkeys([*existing_scopes, *scopes])),
             )
 
             # Both connection and credentials are committed together.

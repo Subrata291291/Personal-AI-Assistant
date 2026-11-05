@@ -7,6 +7,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.workflows.chat_state import ChatContext, ChatState
 from app.workflows.chat_nodes import (
+    capabilities_node,
     integration_unavailable_node,
     llm_node,
 )
@@ -15,6 +16,7 @@ from app.workflows.gmail_agent_nodes import (
     gmail_intent_router_node,
     route_after_assistant_intent,
 )
+from app.workflows.calendar_agent_node import calendar_agent_node
 from app.workflows.memory_retrieval_node import (
     memory_retrieval_node,
 )
@@ -26,9 +28,10 @@ logger = logging.getLogger(__name__)
 ASSISTANT_ROUTE_NODES = {
     "general": "memory_retrieval",
     "daily_planning": "memory_retrieval",
+    "capabilities": "capabilities",
     "gmail": "gmail_agent",
     "google_drive": "integration_unavailable",
-    "google_calendar": "integration_unavailable",
+    "google_calendar": "calendar_agent",
     "google_contacts": "integration_unavailable",
     "tasks": "integration_unavailable",
 }
@@ -83,8 +86,18 @@ def build_chat_graph():
     )
 
     builder.add_node(
+        "capabilities",
+        _timed_node("capabilities", capabilities_node),
+    )
+
+    builder.add_node(
         "gmail_agent",
         _timed_node("gmail_agent", gmail_agent_node),
+    )
+
+    builder.add_node(
+        "calendar_agent",
+        _timed_node("calendar_agent", calendar_agent_node),
     )
 
     builder.add_node(
@@ -116,6 +129,16 @@ def build_chat_graph():
 
     builder.add_edge(
         "gmail_agent",
+        END,
+    )
+
+    builder.add_edge(
+        "calendar_agent",
+        END,
+    )
+
+    builder.add_edge(
+        "capabilities",
         END,
     )
 

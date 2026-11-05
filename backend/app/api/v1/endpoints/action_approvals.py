@@ -152,6 +152,23 @@ async def create_gmail_draft_send_approval(
             request_id(),
             exc.status_code,
         )
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Google authorization is no longer valid. Reconnect "
+                    "Gmail in Connected Apps, then try again. No approval "
+                    "proposal was created."
+                ),
+            ) from exc
+        if exc.retryable or exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Google is temporarily unavailable. No approval "
+                    "proposal was created."
+                ),
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=(

@@ -42,6 +42,8 @@ function Connectors() {
   const [searchParams, setSearchParams] = useSearchParams()
 
   const [notice, setNotice] = useState(null)
+  const [isUpdatingCalendarDefault, setIsUpdatingCalendarDefault] =
+    useState(false)
 
   const userId = user?.id
 
@@ -92,27 +94,63 @@ function Connectors() {
   const gmailConnections = connectedGoogleConnections.filter(
     (connection) => connection.capabilities?.gmail === true,
   )
+  const calendarCapabilities =
+    connectionsQuery.data?.calendar_capabilities || {}
+  const isCalendarApiComplete = calendarCapabilities.api_complete === true
+  const calendarNeedsConsent =
+    calendarCapabilities.permissions_need_consent === true
   const configuredDefaultConnectionId =
-    user?.user_metadata?.default_gmail_connection_id
+    user?.user_metadata?.default_calendar_connection_id
   const isGmailConnected = gmailConnections.length > 0
 
-  async function clearDefaultGmailPreference(connectionIds) {
-    if (!connectionIds.includes(configuredDefaultConnectionId)) return false
+  async function clearDisconnectedPreferences(connectionIds) {
+    const metadata = {}
+    if (connectionIds.includes(
+      user?.user_metadata?.default_gmail_connection_id,
+    )) {
+      metadata.default_gmail_connection_id = null
+    }
+    if (connectionIds.includes(configuredDefaultConnectionId)) {
+      metadata.default_calendar_connection_id = null
+    }
+    if (Object.keys(metadata).length === 0) return false
 
     try {
-      await updateUserMetadata({
-        default_gmail_connection_id: null,
-      })
+      await updateUserMetadata(metadata)
       return false
     } catch {
       return true
     }
   }
 
+  async function handleDefaultCalendarChange(event) {
+    const connectionId = event.target.value || null
+    setIsUpdatingCalendarDefault(true)
+    setNotice(null)
+    try {
+      await updateUserMetadata({
+        default_calendar_connection_id: connectionId,
+      })
+      setNotice({
+        type: 'success',
+        message: connectionId
+          ? 'Default Calendar account updated.'
+          : 'Calendar account selection will be automatic when unambiguous.',
+      })
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: error.message || 'Unable to update the default Calendar account.',
+      })
+    } finally {
+      setIsUpdatingCalendarDefault(false)
+    }
+  }
+
   // Connect Google account
   const connectMutation = useMutation({
-    mutationFn: () =>
-      api.post('/api/v1/oauth/google/connect'),
+    mutationFn: (service) =>
+      api.post(`/api/v1/oauth/google/connect?service=${service}`),
 
     onSuccess: (result) => {
       if (!result?.authorization_url) {
@@ -129,7 +167,7 @@ function Connectors() {
     onError: (error) => {
       setNotice({
         type: 'error',
-        message: error.message || 'Unable to connect Google.',
+        message: error.message || 'Unable to connect Google service.',
       })
     },
   })
@@ -162,7 +200,7 @@ function Connectors() {
 
     onSuccess: async (_result, disconnectedConnectionIds) => {
       const defaultPreferenceError =
-        await clearDefaultGmailPreference(disconnectedConnectionIds)
+        await clearDisconnectedPreferences(disconnectedConnectionIds)
 
       await queryClient.invalidateQueries({
         queryKey: CONNECTIONS_KEY(userId),
@@ -187,7 +225,7 @@ function Connectors() {
     onError: async (error) => {
       const disconnectedConnectionIds =
         error.disconnectedConnectionIds || []
-      const defaultPreferenceError = await clearDefaultGmailPreference(
+      const defaultPreferenceError = await clearDisconnectedPreferences(
         disconnectedConnectionIds,
       )
 
@@ -249,10 +287,19 @@ function Connectors() {
       : [connectionIds]
     if (ids.length === 0) return
 
+    const affectedServices = new Set(
+      connectedGoogleConnections
+        .filter((connection) => ids.includes(connection.id))
+        .flatMap((connection) => [
+          ...(connection.capabilities?.gmail ? ['Gmail'] : []),
+          ...(connection.capabilities?.calendar ? ['Google Calendar'] : []),
+        ]),
+    )
+    const servicesText = [...affectedServices].join(' and ') || 'Google services'
     const confirmed = window.confirm(
       ids.length === 1
-        ? 'Disconnect this Google account? Its stored OAuth credentials will be removed from this app.'
-        : `Disconnect Gmail from all ${ids.length} connected Google accounts? Their stored OAuth credentials will be removed from this app.`,
+        ? `Disconnect this shared Google account from this app? This removes its stored credentials and disables ${servicesText} for this account. It does not revoke access in your Google Account settings.`
+        : `Disconnect these shared Google accounts from this app? This removes their stored credentials and disables ${servicesText} for these accounts. It does not revoke access in your Google Account settings.`,
     )
 
     if (!confirmed) return
@@ -261,16 +308,11 @@ function Connectors() {
     disconnectMutation.mutate(ids)
   }
 
-  function handleGmailToggle() {
+  function handleConnect(service) {
     if (connectionsQuery.isLoading || connectionsQuery.isError) return
 
-    if (isGmailConnected) {
-      handleDisconnect(gmailConnections.map((connection) => connection.id))
-      return
-    }
-
     setNotice(null)
-    connectMutation.mutate()
+    connectMutation.mutate(service)
   }
 
   return (
@@ -333,28 +375,32 @@ function Connectors() {
               name: 'Gmail',
               description: 'Connect your account to access Gmail in your workspace.',
               available: true,
+              connected: isGmailConnected,
             },
             {
               id: 'calendar',
               name: 'Google Calendar',
-              description: 'Manage your events and schedule.',
-              available: false,
+              description: 'Use read-only Calendar event search, schedules, event details, and optional free/busy checks in chat.',
+              available: true,
+              connected: isCalendarApiComplete,
+              partial: calendarNeedsConsent,
             },
             {
               id: 'drive',
               name: 'Google Drive',
               description: 'Access and organize your files.',
               available: false,
+              connected: false,
             },
             {
               id: 'contacts',
               name: 'Google Contacts',
               description: 'Access and manage your contacts.',
               available: false,
+              connected: false,
             },
           ].map((service) => {
-            const isGmail = service.id === 'gmail'
-            const isConnected = isGmail && isGmailConnected
+            const isConnected = service.connected
             const toggleDisabled = !service.available
               || connectionsQuery.isLoading
               || connectionsQuery.isError
@@ -382,34 +428,10 @@ function Connectors() {
                     </p>
                   </div>
 
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-label={`${service.name} connection`}
-                    aria-checked={Boolean(isConnected)}
-                    aria-disabled={toggleDisabled}
-                    disabled={toggleDisabled}
-                    onClick={() => {
-                      if (isGmail) handleGmailToggle()
-                    }}
-                    className={`relative mt-1 inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2 ${
-                      isConnected
-                        ? 'bg-violet-600'
-                        : isDark
-                          ? 'bg-slate-700'
-                          : 'bg-slate-300'
-                    } ${toggleDisabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
-                  >
-                    <span
-                      className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
-                        isConnected ? 'translate-x-6' : 'translate-x-1'
-                      }`}
-                    />
-                  </button>
                 </div>
 
                 <div className="mt-auto pt-5">
-                  {isGmail ? (
+                  {service.available ? (
                     <>
                       <p className={`text-xs font-medium ${
                         isConnected ? 'text-emerald-500' : colors.muted
@@ -418,50 +440,49 @@ function Connectors() {
                           ? 'Checking connection...'
                           : connectMutation.isPending
                             ? 'Connecting...'
-                            : disconnectMutation.isPending
-                              ? 'Disconnecting...'
-                              : isConnected
-                                ? 'Connected'
-                                : 'Not connected'}
+                            : service.id === 'calendar'
+                              && !calendarCapabilities.connected
+                              ? 'Not connected'
+                            : service.partial
+                              ? 'Permissions incomplete'
+                            : isConnected
+                              ? 'Connected'
+                              : 'Not connected'}
                       </p>
 
-                      {connectedGoogleConnections.some(
-                        (connection) => connection.capabilities?.gmail !== true,
-                      ) && !isConnected && (
+                      {connectedGoogleConnections.length > 0 && !isConnected && (
                         <p className={`mt-2 text-xs ${colors.muted}`}>
-                          Gmail access is not enabled for this account.
+                          {service.partial
+                            ? calendarCapabilities.connected
+                              ? 'Calendar is connected with partial access. Grant the missing read-only permissions to enable the requested Calendar operations.'
+                              : 'Calendar is not connected. Grant Calendar event-read and, if needed, separate free/busy permission in Connected Apps.'
+                            : `A Google account is connected, but ${service.name} permission has not been granted.`}
                         </p>
                       )}
 
-                      {connectedGoogleConnections.map((connection) => (
-                        <div
-                          key={connection.id}
-                          className={`mt-3 flex items-center justify-between gap-3 border-t pt-3 ${colors.divider}`}
-                        >
-                          <div className="min-w-0">
-                            <p className={`truncate text-sm font-medium ${colors.heading}`}>
-                              {connection.email || 'Google account'}
-                            </p>
-                            <p className={`mt-1 text-xs ${colors.muted}`}>
-                              {connection.capabilities?.gmail === true
-                                ? `Connected ${formatDate(connection.connected_at)}`
-                                : 'Gmail access unavailable'}
-                            </p>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => handleDisconnect(connection.id)}
-                            disabled={disconnectMutation.isPending}
-                            className={`shrink-0 rounded-lg border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                              isDark
-                                ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
-                                : 'border-slate-200 text-slate-600 hover:bg-slate-50'
-                            }`}
-                          >
-                            Disconnect
-                          </button>
-                        </div>
-                      ))}
+                      {service.id === 'calendar'
+                        && calendarCapabilities.google_connection_available && (
+                        <p className={`mt-2 text-xs ${colors.muted}`}>
+                          Calendar event-read: {calendarCapabilities.events_read ? 'available' : 'not granted'} · FreeBusy: {calendarCapabilities.freebusy ? 'available' : 'not granted'} · Calendar chat: {calendarCapabilities.chat_available ? 'available' : 'not available'} · Calendar writes: not available.
+                        </p>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => handleConnect(service.id)}
+                        disabled={toggleDisabled || isConnected}
+                        className={`mt-3 rounded-lg border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                          isDark
+                            ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                            : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        {isConnected
+                          ? `${service.name} connected`
+                          : service.partial
+                            ? 'Grant missing Calendar permissions'
+                            : `Connect ${service.name}`}
+                      </button>
                     </>
                   ) : (
                     <div className="flex items-center justify-between">
@@ -479,6 +500,103 @@ function Connectors() {
           })}
         </div>
       </section>
+
+      {connectedGoogleConnections.length > 0 && (
+        <section aria-labelledby="google-accounts-heading">
+          <h2
+            id="google-accounts-heading"
+            className={`mb-4 text-xl font-semibold ${colors.heading}`}
+          >
+            Connected Google accounts
+          </h2>
+          <div className="space-y-3">
+            {connectedGoogleConnections.map((connection) => (
+              <article
+                key={connection.id}
+                className={`flex flex-wrap items-center justify-between gap-4 rounded-xl border p-4 ${colors.service}`}
+              >
+                <div className="min-w-0">
+                  <p className={`truncate text-sm font-medium ${colors.heading}`}>
+                    {connection.email || 'Google account'}
+                  </p>
+                  <p className={`mt-1 text-xs ${colors.muted}`}>
+                    Gmail: {connection.capabilities?.gmail ? 'Connected' : 'Not connected'}
+                    {' · '}
+                    Google Calendar: {connection.capabilities?.calendar ? 'Connected' : 'Not connected'}
+                  </p>
+                  <p className={`mt-1 text-xs ${colors.muted}`}>
+                    Calendar API: Events {connection.capabilities?.calendar_events_read ? 'available' : 'not granted'}
+                    {' · '}
+                    FreeBusy {connection.capabilities?.calendar_freebusy ? 'available' : 'not granted'}
+                    {' · '}
+                    Calendar chat: {connection.capabilities?.calendar_chat_available ? 'available' : 'not available'}
+                    {' · '}
+                    Calendar writes: not available
+                  </p>
+                  <p className={`mt-1 text-xs ${colors.muted}`}>
+                    Connected {formatDate(connection.connected_at)}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleDisconnect(connection.id)}
+                  disabled={disconnectMutation.isPending}
+                  className={`shrink-0 rounded-lg border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                    isDark
+                      ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                      : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  Disconnect Google account
+                </button>
+              </article>
+            ))}
+          </div>
+          <div className={`mt-5 rounded-xl border p-4 ${colors.service}`}>
+            <label
+              htmlFor="default-calendar-account"
+              className={`block text-sm font-medium ${colors.heading}`}
+            >
+              Default Calendar account
+            </label>
+            <p className={`mt-1 text-xs ${colors.muted}`}>
+              Calendar reads and availability checks use this account when
+              selected. If you leave it unset, an account is chosen only when
+              the requested permission is unambiguous. Missing permissions on
+              your selected account will not fall back to another account.
+            </p>
+            <select
+              id="default-calendar-account"
+              value={configuredDefaultConnectionId || ''}
+              onChange={handleDefaultCalendarChange}
+              disabled={isUpdatingCalendarDefault}
+              className={`mt-3 w-full rounded-lg border px-3 py-2 text-sm ${
+                isDark
+                  ? 'border-slate-700 bg-[#11131c] text-slate-200'
+                  : 'border-slate-200 bg-white text-slate-700'
+              }`}
+            >
+              <option value="">
+                Automatically select when unambiguous
+              </option>
+              {connectedGoogleConnections.map((connection) => (
+                <option key={connection.id} value={connection.id}>
+                  {connection.email || 'Google account'}
+                  {connection.capabilities?.calendar_events_read
+                    ? ' — event access'
+                    : ''}
+                  {connection.capabilities?.calendar_freebusy
+                    ? ' — free/busy access'
+                    : ''}
+                </option>
+              ))}
+            </select>
+          </div>
+          <p className={`mt-3 text-xs ${colors.muted}`}>
+            Disconnect removes the shared credentials from this app, so all enabled Google services for that account stop working. It does not revoke the app’s authorization in Google Account settings.
+          </p>
+        </section>
+      )}
 
       {/* Background refresh indicator */}
       {connectionsQuery.isFetching &&

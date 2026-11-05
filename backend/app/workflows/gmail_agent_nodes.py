@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from datetime import date, datetime, timedelta
+from datetime import time as datetime_time
 from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -23,7 +24,6 @@ from app.schemas.gmail_agent import (
     GmailReadPlan,
     GmailUnavailableActionPlan,
     IntegrationPlan,
-    MeetingDiscoveryPlan,
     MeetingExtractionResponse,
     SearchEmailsPlan,
     SummarizeAttentionPlan,
@@ -38,6 +38,8 @@ from app.schemas.email_draft import (
     EmailDraftPreview,
     normalize_email_address,
 )
+from app.services.gmail_action_executor import GmailActionExecutor
+from app.services.gmail_service import GmailService
 from app.workflows.chat_state import ChatContext, ChatState
 from app.workflows.gmail_tools import execute_gmail_read
 
@@ -58,6 +60,15 @@ SUPPORTED_READ_INTENTS = {
     "summarize_attention",
     "summarize_today",
     "summarize_latest_thread",
+}
+SUPPORTED_DRAFT_INTENTS = {
+    "draft_email",
+    "gmail_compose",
+    "gmail_save_draft",
+    "gmail_send",
+    "gmail_reply",
+    "gmail_reply_all",
+    "gmail_forward",
 }
 
 SAFE_CLARIFICATION = (
@@ -80,6 +91,87 @@ UNSUPPORTED_GMAIL_RESPONSE = (
 )
 
 
+def build_runtime_capabilities(
+    granted_scopes: set[str],
+    unavailable_routes: set[str],
+    calendar_capabilities: dict[str, bool] | None = None,
+) -> dict[str, Any]:
+    """Build safe capability flags from grants and executable workflows."""
+    send_scope = GmailService.REQUIRED_SEND_SCOPE
+    draft_scope = GmailService.REQUIRED_MODIFY_SCOPE
+    read_scope = GmailService.REQUIRED_READ_SCOPE
+    full_mail_scope = GmailService.REQUIRED_PERMANENT_DELETE_SCOPE
+    send_actions_registered = bool(
+        GmailActionExecutor.SUPPORTED_ACTION_TYPES
+        & {"gmail.send", "gmail.send_draft"}
+    )
+    gmail_connected = bool(
+        granted_scopes
+        & {read_scope, draft_scope, send_scope, full_mail_scope}
+    )
+    integration_labels = {
+        "google_calendar": "Google Calendar",
+        "google_drive": "Google Drive",
+        "google_contacts": "Google Contacts",
+        "tasks": "Tasks and reminders",
+    }
+    calendar = calendar_capabilities or {}
+    calendar_chat_available = (
+        "google_calendar" not in unavailable_routes
+        and bool(calendar.get("api_available", False))
+    )
+
+    return {
+        "gmail": {
+            "connected": gmail_connected,
+            "read": bool(SUPPORTED_READ_INTENTS)
+            and bool(granted_scopes & {read_scope, full_mail_scope}),
+            "draft_preview": bool(SUPPORTED_DRAFT_INTENTS),
+            "save_draft": (
+                bool(SUPPORTED_DRAFT_INTENTS)
+                and bool(granted_scopes & {draft_scope, full_mail_scope})
+            ),
+            "send": (
+                send_actions_registered
+                and bool(SUPPORTED_DRAFT_INTENTS)
+                and bool(granted_scopes & {send_scope, full_mail_scope})
+            ),
+        },
+        "google_calendar": {
+            "connected": bool(calendar.get("connected", False)),
+            "google_connection_available": bool(
+                calendar.get("google_connection_available", False)
+            ),
+            "events_read": bool(calendar.get("events_read", False)),
+            "freebusy": bool(calendar.get("freebusy", False)),
+            "api_available": bool(calendar.get("api_available", False)),
+            "api_complete": bool(calendar.get("api_complete", False)),
+            "chat_available": calendar_chat_available,
+            "selection_required": bool(
+                calendar.get("selection_required", False)
+            ),
+            "default_connection_invalid": bool(
+                calendar.get("default_connection_invalid", False)
+            ),
+            "default_connection_selected": bool(
+                calendar.get("default_connection_selected", False)
+            ),
+            "selected_event_scope_missing": bool(
+                calendar.get("selected_event_scope_missing", False)
+            ),
+            "selected_freebusy_scope_missing": bool(
+                calendar.get("selected_freebusy_scope_missing", False)
+            ),
+            "write_available": False,
+        },
+        "unavailable_integrations": [
+            label
+            for route, label in integration_labels.items()
+            if route in unavailable_routes
+        ],
+    }
+
+
 def _plan_prompt(state: ChatState) -> str:
     timezone = state.get("user_timezone", "UTC")
     try:
@@ -87,6 +179,9 @@ def _plan_prompt(state: ChatState) -> str:
     except (ValueError, ZoneInfoNotFoundError):
         timezone = "UTC"
         local_now = datetime.now(ZoneInfo("UTC"))
+    calendar_capabilities = (
+        (state.get("assistant_capabilities") or {}).get("google_calendar", {})
+    )
     prompt = (
         "Classify the user's latest request and return exactly one JSON object. "
         "Do not include markdown or extra text. Supported intents are: "
@@ -102,19 +197,38 @@ def _plan_prompt(state: ChatState) -> str:
         f"{local_now.isoformat(timespec='minutes')} ({timezone}). "
         "Use daily_planning for making or adjusting a personal day schedule; "
         "use conversation history later in the chat workflow for constraints. "
-        "Use discover_meetings for finding existing meetings, interviews, "
-        "appointments, invitations, or calendar events on a specified date; "
-        "this uses Gmail as a fallback because Calendar event access is not "
-        "implemented. Set target_date to YYYY-MM-DD. Use approval_workflow "
+        "Use google_calendar for read-only Calendar requests. For that intent, "
+        "select calendar_tool from list_calendar_events, get_calendar_event, "
+        "get_today_schedule, get_calendar_schedule, "
+        "check_calendar_availability, or clarify, and provide only that tool's "
+        "arguments in calendar_arguments. list_calendar_events accepts "
+        "time_min, time_max, query, attendee, time_zone, max_results, and "
+        "page_token; attendee must be an explicitly known email address. "
+        "get_calendar_event accepts event_id and calendar_id. "
+        "get_today_schedule accepts time_zone and calendar_id. "
+        "get_calendar_schedule accepts date, period (day or week), time_zone, "
+        "and calendar_id. check_calendar_availability accepts aware time_min "
+        "and time_max, time_zone, and calendar_ids. Never include a user ID, "
+        "connection ID, credentials, or extra fields. Use an explicit IANA timezone from "
+        "the runtime. Use check_calendar_availability only for explicit time "
+        "ranges; if the request does not identify a date and interval, clarify. "
+        "Calendar access is read-only. Never claim access to Calendar data "
+        "without a usable stored grant. Runtime Calendar capabilities are "
+        f"{json.dumps(calendar_capabilities, sort_keys=True)}. Only plan a "
+        "Calendar operation marked available; never infer or combine grants "
+        "from account IDs. Convert relative and weekday dates using the "
+        "current local date above and the supplied IANA timezone. Use "
+        "YYYY-MM-DD dates and timezone-aware timestamps; if a date, time, or "
+        "DST interpretation is ambiguous, select clarify rather than guess. "
+        "Use approval_workflow "
         "only when the user asks to approve, reject, or execute an existing "
         "approval proposal; include operation as approve, reject, or execute. "
         "Never create a proposal or execute an action from a planner decision. "
         "Use general for "
-        "non-integration requests. Use google_drive, google_calendar, "
-        "google_contacts, or tasks only when the user explicitly asks the "
-        "Assistant to retrieve or manage information in that integration; "
-        "those integrations are not implemented and must not pretend to "
-        "access data. Use unsupported for Gmail changes not covered by an "
+        "non-integration requests. Use google_drive, google_contacts, or tasks "
+        "only when the user explicitly asks the Assistant to retrieve or manage "
+        "information in that integration; those integrations are not "
+        "implemented and must not pretend to access data. Use unsupported for Gmail changes not covered by an "
         "editable draft preview or the separate approval workflow. Classify "
         "new-email requests as gmail_compose, gmail_save_draft, or gmail_send "
         "as appropriate. All three produce an editable preview, never send "
@@ -181,6 +295,218 @@ def _validated_timezone(state: ChatState) -> str:
     except (ValueError, ZoneInfoNotFoundError):
         return "UTC"
     return timezone
+
+
+def _calendar_plan(
+    tool: str,
+    arguments: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    plan = IntegrationPlan(
+        intent="google_calendar",
+        calendar_tool=tool,
+        calendar_arguments=arguments,
+    )
+    return plan.model_dump(mode="json"), "google_calendar"
+
+
+def _calendar_local_datetime(
+    date_value: date,
+    time_value: datetime_time,
+    timezone: str,
+) -> datetime | None:
+    zone = ZoneInfo(timezone)
+    naive = datetime.combine(date_value, time_value)
+    first = naive.replace(tzinfo=zone, fold=0)
+    second = naive.replace(tzinfo=zone, fold=1)
+    if first.utcoffset() != second.utcoffset():
+        return None
+    if first.astimezone(ZoneInfo("UTC")).astimezone(zone).replace(
+        tzinfo=None
+    ) != naive:
+        return None
+    return first
+
+
+def _deterministic_calendar_plan(
+    state: ChatState,
+) -> tuple[dict[str, Any], str] | None:
+    text = state["user_message"].strip()
+    lowered = text.casefold()
+    timezone = _validated_timezone(state)
+    iana_match = re.search(
+        r"\b[A-Za-z_+-]+/[A-Za-z_+-]+\b",
+        text,
+    )
+    if iana_match:
+        try:
+            ZoneInfo(iana_match.group(0))
+            timezone = iana_match.group(0)
+        except (ValueError, ZoneInfoNotFoundError):
+            return _calendar_plan("clarify")
+    zone = ZoneInfo(timezone)
+    today = datetime.now(zone).date()
+    date_match = re.search(r"\b(today|tomorrow)\b", lowered)
+    explicit_date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    target_date = (
+        today + timedelta(days=1)
+        if date_match and date_match.group(1) == "tomorrow"
+        else today
+    )
+    if explicit_date_match:
+        try:
+            target_date = date.fromisoformat(explicit_date_match.group(1))
+        except ValueError:
+            return _calendar_plan("clarify")
+
+    creation_request = bool(re.search(
+        r"\b(?:create|add|book|schedule|cancel|delete|remove|update|edit|"
+        r"change|modify|invite|rsvp)\b.{0,60}\b(?:meetings?|events?|calendar)\b|"
+        r"\b(?:meetings?|events?)\b.{0,60}\b(?:cancel|delete|remove|update|"
+        r"edit|change|modify)\b",
+        lowered,
+    ))
+    if creation_request:
+        return _calendar_plan("clarify")
+
+    explicit_availability = bool(re.search(
+        r"\b(?:free|available|availability|freebusy)\b",
+        lowered,
+    ))
+    if explicit_availability:
+        if re.search(
+            r"\b(?:utc|gmt|pst|pdt|mst|mdt|cst|cdt|est|edt|bst)\b",
+            lowered,
+        ):
+            return _calendar_plan("clarify")
+        clock_text = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", " ", lowered)
+        clock_matches = list(re.finditer(
+            r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b",
+            clock_text,
+        ))
+        if not date_match and not explicit_date_match:
+            return _calendar_plan("clarify")
+        if not clock_matches or len(clock_matches) > 2:
+            return _calendar_plan("clarify")
+
+        parsed_times: list[datetime_time] = []
+        for match in clock_matches:
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            meridiem = (match.group(3) or "").replace(".", "")
+            if minute > 59:
+                return _calendar_plan("clarify")
+            if meridiem:
+                if hour < 1 or hour > 12:
+                    return _calendar_plan("clarify")
+                hour = hour % 12 + (12 if meridiem == "pm" else 0)
+            elif hour > 23:
+                return _calendar_plan("clarify")
+            parsed_times.append(datetime_time(hour, minute))
+        start = _calendar_local_datetime(target_date, parsed_times[0], timezone)
+        if start is None:
+            return _calendar_plan("clarify")
+        if len(parsed_times) == 2:
+            end_date = target_date
+            if parsed_times[1] <= parsed_times[0]:
+                return _calendar_plan("clarify")
+            end = _calendar_local_datetime(end_date, parsed_times[1], timezone)
+        else:
+            end_naive = start.replace(tzinfo=None) + timedelta(hours=1)
+            end = _calendar_local_datetime(
+                end_naive.date(),
+                end_naive.time(),
+                timezone,
+            )
+        if end is None or end <= start:
+            return _calendar_plan("clarify")
+        return _calendar_plan(
+            "check_calendar_availability",
+            {
+                "time_min": start.isoformat(),
+                "time_max": end.isoformat(),
+                "time_zone": timezone,
+                "calendar_ids": ["primary"],
+            },
+        )
+
+    event_id = re.search(
+        r"\b(?:event|meeting)\s+(?:id\s+)?([A-Za-z0-9_-]{8,})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if (
+        event_id
+        and not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", event_id.group(1))
+        and re.search(r"\b(?:details?|show|get|open)\b", lowered)
+    ):
+        return _calendar_plan(
+            "get_calendar_event",
+            {"event_id": event_id.group(1), "calendar_id": "primary"},
+        )
+
+    if re.search(r"\b(?:weekly|week|this week|next week)\b", lowered) and (
+        re.search(r"\b(?:schedule|meetings?|events?|calendar)\b", lowered)
+    ):
+        week_date = today + timedelta(days=7) if "next week" in lowered else today
+        return _calendar_plan(
+            "get_calendar_schedule",
+            {
+                "date": week_date.isoformat(),
+                "period": "week",
+                "time_zone": timezone,
+                "calendar_id": "primary",
+            },
+        )
+
+    if date_match or explicit_date_match:
+        if re.search(r"\b(?:schedule|meetings?|events?|calendar)\b", lowered):
+            return _calendar_plan(
+                "get_today_schedule" if target_date == today and
+                not explicit_date_match else "get_calendar_schedule",
+                (
+                    {"time_zone": timezone, "calendar_id": "primary"}
+                    if target_date == today and not explicit_date_match
+                    else {
+                        "date": target_date.isoformat(),
+                        "period": "day",
+                        "time_zone": timezone,
+                        "calendar_id": "primary",
+                    }
+                ),
+            )
+
+    next_person_match = re.search(
+        r"\b(?:next|upcoming)\s+(?:meeting|event)\s+with\s+(.+?)[?.!]*$",
+        text,
+        re.IGNORECASE,
+    )
+    if next_person_match:
+        return _calendar_plan(
+            "list_calendar_events",
+            {
+                "query": next_person_match.group(1).strip(),
+                "time_zone": timezone,
+                "max_results": 1,
+            },
+        )
+
+    if re.search(
+        r"\b(?:show|list|find|what are|what's|what is)\b.{0,40}"
+        r"\b(?:upcoming|next)\s+(?:meetings?|events?)\b|"
+        r"\b(?:upcoming|next)\s+(?:meetings?|events?)\b",
+        lowered,
+    ):
+        return _calendar_plan(
+            "list_calendar_events",
+            {"time_zone": timezone, "max_results": 10},
+        )
+
+    if re.search(r"\b(?:overlapping|conflicts?)\b", lowered) and re.search(
+        r"\b(?:meetings?|events?|calendar|schedule)\b",
+        lowered,
+    ):
+        return _calendar_plan("clarify")
+    return None
 
 
 def _deterministic_draft_plan(state: ChatState) -> dict[str, Any] | None:
@@ -334,8 +660,18 @@ def _deterministic_assistant_plan(
         )
 
     if (
+        re.search(r"\b(?:gmail|inbox|e-?mails?|mail|messages?)\b", lowered)
+        and re.search(r"\b(?:meetings?|events?|schedule|availability)\b", lowered)
+        and not re.search(r"\bcalendar\b", lowered)
+    ):
+        gmail_read_plan = _deterministic_read_plan(text)
+        if gmail_read_plan is not None:
+            return gmail_read_plan, "gmail"
+        return _fallback_plan(), "gmail"
+
+    if (
         re.search(
-            r"\b(?:plan|make|create|build|organize|structure|generate|schedule)\b",
+            r"\b(?:plan|make|create|build|organize|structure|generate)\b",
             lowered,
         )
         and re.search(
@@ -343,6 +679,8 @@ def _deterministic_assistant_plan(
             r"workday|time blocks|day plan)\b",
             lowered,
         )
+    ) or (
+        re.search(r"\bschedule\b.{0,30}\b(?:my day|workday|day plan)\b", lowered)
     ) or re.search(
         r"\b(?:make|create|build|generate)\s+(?:me\s+)?a\s+schedule\b|"
         r"\b(?:daily schedule|day schedule)\b",
@@ -353,38 +691,9 @@ def _deterministic_assistant_plan(
             "daily_planning",
         )
 
-    has_discovery_verb = bool(re.search(
-        r"\b(?:any|have|check|find|look for|show|list|what|when|is there|"
-        r"tell me about)\b",
-        lowered,
-    ))
-    has_meeting_subject = bool(re.search(
-        r"\b(?:meetings?|interviews?|appointments?|calendar events?|"
-        r"calendar invitations?)\b",
-        lowered,
-    ))
-    has_relative_date = bool(re.search(r"\b(?:today|tomorrow)\b", lowered))
-    is_event_creation = bool(re.search(
-        r"\b(?:schedule|create|add|book|set up)\s+(?:a\s+)?"
-        r"(?:meeting|interview|appointment|event)\b",
-        lowered,
-    ))
-    if (
-        has_meeting_subject
-        and has_relative_date
-        and (has_discovery_verb or "calendar" in lowered)
-        and not is_event_creation
-    ):
-        timezone = _validated_timezone(state)
-        local_date = datetime.now(ZoneInfo(timezone)).date()
-        target_date = local_date + (
-            timedelta(days=1) if "tomorrow" in lowered else timedelta()
-        )
-        plan = MeetingDiscoveryPlan(
-            intent="discover_meetings",
-            target_date=target_date,
-        ).model_dump(mode="json")
-        return plan, "gmail"
+    calendar_plan = _deterministic_calendar_plan(state)
+    if calendar_plan is not None:
+        return calendar_plan
 
     approval_match = re.search(
         r"\b(approve|reject|execute)\b.{0,60}\b"
@@ -549,10 +858,61 @@ def _requires_intent_planning(user_message: str) -> bool:
     return bool(re.search(
         r"\b(?:gmail|inbox|e-?mails?|messages?|mail|google|drive|files?|"
         r"documents?|spreadsheets?|calendar|meetings?|events?|schedule|"
-        r"contacts?|address book|reminders?|to-?dos?|tasks?)\b",
+        r"contacts?|address book|reminders?|to-?dos?|tasks?|"
+        r"availability|freebusy)\b",
         user_message,
         re.IGNORECASE,
     ))
+
+
+def _is_calendar_request(user_message: str) -> bool:
+    lowered = user_message.casefold()
+    asks_calendar = bool(re.search(
+        r"\b(?:calendar|meetings?|events?|appointments?)\b",
+        lowered,
+    ))
+    has_action = bool(re.search(
+        r"\b(?:show|list|find|get|open|check|what|when|do i have|"
+        r"am i|are we|is there|tell me|schedule)\b",
+        lowered,
+    ))
+    return (
+        asks_calendar and has_action
+        or bool(re.search(
+            r"\b(?:am i|are we|is it)\b.{0,30}\b(?:free|available)\b",
+            lowered,
+        ))
+    )
+
+
+def _calendar_fallback(state: ChatState) -> dict[str, Any] | None:
+    if not _is_calendar_request(state["user_message"]):
+        return None
+    return IntegrationPlan(
+        intent="google_calendar",
+        calendar_tool="clarify",
+    ).model_dump(mode="json")
+
+
+def _is_mixed_gmail_calendar_request(user_message: str) -> bool:
+    lowered = user_message.casefold()
+    asks_gmail = bool(re.search(
+        r"\b(?:gmail|inbox|e-?mails?|mail|messages?)\b",
+        lowered,
+    ))
+    has_calendar_task = bool(re.search(
+        r"\b(?:calendar|availability|freebusy)\b|"
+        r"\b(?:show|list|find|get|check|when|"
+        r"what\s+(?:is|are)|do\s+i\s+have|am\s+i)\s+"
+        r"(?:my\s+)?(?:upcoming\s+|next\s+)?"
+        r"(?:meetings?|events?|schedule)\b",
+        lowered,
+    ))
+    has_task_separator = bool(re.search(
+        r"\b(?:and|also|then|plus)\b",
+        lowered,
+    ))
+    return asks_gmail and has_calendar_task and has_task_separator
 
 
 def _fallback_plan() -> dict[str, Any]:
@@ -598,6 +958,27 @@ def _ambiguous_source_request(state: ChatState) -> bool:
 
 def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
     """Produce one strict, validated assistant intent decision."""
+    if re.search(
+        r"\bwhat\s+(?:can|could)\s+you\s+(?:do|help\s+me\s+with)\b|"
+        r"\bwhat\s+are\s+your\s+(?:capabilities|features)\b|"
+        r"\bwhat\s+integrations\s+(?:do\s+you\s+support|are\s+available)\b",
+        state["user_message"],
+        re.IGNORECASE,
+    ):
+        return {
+            "gmail_plan": {"intent": "capabilities"},
+            "assistant_route": "capabilities",
+        }
+
+    if _is_mixed_gmail_calendar_request(state["user_message"]):
+        return {
+            "gmail_plan": {
+                "intent": "clarify",
+                "clarification_reason": "mixed_gmail_calendar",
+            },
+            "assistant_route": "gmail",
+        }
+
     deterministic_plan = _deterministic_assistant_plan(state)
     if deterministic_plan is not None:
         plan, route = deterministic_plan
@@ -648,7 +1029,12 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             type(exc).__name__,
         )
         return {
-            "gmail_plan": _fallback_plan(),
+            "gmail_plan": _calendar_fallback(state) or _fallback_plan(),
+            "assistant_route": (
+                "google_calendar"
+                if _calendar_fallback(state) is not None
+                else "gmail"
+            ),
         }
 
     if response.output_limited:
@@ -660,8 +1046,12 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             response.usage.completion_tokens if response.usage else None,
         )
         return {
-            "gmail_plan": _fallback_plan(),
-            "assistant_route": "gmail",
+            "gmail_plan": _calendar_fallback(state) or _fallback_plan(),
+            "assistant_route": (
+                "google_calendar"
+                if _calendar_fallback(state) is not None
+                else "gmail"
+            ),
         }
 
     try:
@@ -671,8 +1061,12 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             "Gmail intent plan did not match the supported schema."
         )
         return {
-            "gmail_plan": _fallback_plan(),
-            "assistant_route": "gmail",
+            "gmail_plan": _calendar_fallback(state) or _fallback_plan(),
+            "assistant_route": (
+                "google_calendar"
+                if _calendar_fallback(state) is not None
+                else "gmail"
+            ),
         }
 
     return {
@@ -698,6 +1092,7 @@ def route_after_assistant_intent(state: ChatState) -> str:
     if selected_route in {
         "general",
         "gmail",
+        "capabilities",
         "google_drive",
         "google_calendar",
         "google_contacts",
@@ -709,6 +1104,8 @@ def route_after_assistant_intent(state: ChatState) -> str:
     intent = (state.get("gmail_plan") or {}).get("intent")
     if intent == "general":
         return "general"
+    if intent == "google_calendar":
+        return "google_calendar"
     return "gmail"
 
 
@@ -719,15 +1116,7 @@ def gmail_agent_node(
     plan_data = state.get("gmail_plan") or {}
     intent = plan_data.get("intent", "")
 
-    if intent in {
-        "draft_email",
-        "gmail_compose",
-        "gmail_save_draft",
-        "gmail_send",
-        "gmail_reply",
-        "gmail_reply_all",
-        "gmail_forward",
-    }:
+    if intent in SUPPORTED_DRAFT_INTENTS:
         if (
             state.get("available_email_draft")
             and intent in {"gmail_save_draft", "gmail_send"}
@@ -787,6 +1176,14 @@ def gmail_agent_node(
         )
 
     if intent == "clarify":
+        if plan_data.get("clarification_reason") == "mixed_gmail_calendar":
+            return gmail_response_node(
+                state,
+                direct_response=(
+                    "This request includes both Gmail and Google Calendar. "
+                    "Which task would you like me to do first?"
+                ),
+            )
         if re.search(
             r"\b(?:delete|trash|archive)\b",
             state["user_message"],

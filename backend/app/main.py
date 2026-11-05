@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.endpoints.memory import router as memory_router
 from app.api.v1.endpoints.memory_reviews import router as memory_reviews_router
 from app.api.v1.endpoints.gmail import router as gmail_router
+from app.api.v1.endpoints.calendar import router as calendar_router
 from app.api.v1.endpoints.action_approvals import (
     router as action_approvals_router,
 )
@@ -150,6 +151,12 @@ app.include_router(
     gmail_router,
     prefix=f"{settings.API_V1_PREFIX}/gmail",
     tags=["Gmail"],
+)
+
+app.include_router(
+    calendar_router,
+    prefix=f"{settings.API_V1_PREFIX}/calendar",
+    tags=["Google Calendar"],
 )
 
 app.include_router(

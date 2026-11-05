@@ -42,6 +42,22 @@ def llm_node(state: ChatState) -> dict:
             f"{local_now.isoformat(timespec='minutes')} ({timezone}).\n\n"
         )
 
+    capability_guidance = ""
+    assistant_capabilities = state.get("assistant_capabilities")
+    if assistant_capabilities:
+        capability_guidance = (
+            "The following runtime capability data was computed by the "
+            "backend for the authenticated user and selected account. Treat "
+            "it as authoritative. Never claim access to an integration or "
+            "operation marked unavailable. Gmail sending is possible only "
+            "through a review proposal, explicit human approval, and a "
+            "separate execution action; never imply that chat sends email "
+            "automatically.\n"
+            "<runtime_capabilities>\n"
+            f"{json.dumps(assistant_capabilities, sort_keys=True)}\n"
+            "</runtime_capabilities>\n\n"
+        )
+
     request_messages = [
         LLMMessage(
             role="system",
@@ -51,6 +67,7 @@ def llm_node(state: ChatState) -> dict:
                 "the user's previous messages. "
                 "Answer clearly and accurately.\n\n"
                 f"{planning_guidance}"
+                f"{capability_guidance}"
                 "Format useful responses in Markdown: use concise headings "
                 "for long answers, short paragraphs, bullets for related "
                 "items, and numbered steps for procedures. Use compact tables "
@@ -139,6 +156,145 @@ def llm_node(state: ChatState) -> dict:
         "messages": [
             current_user_message,
             assistant_message,
+        ],
+    }
+
+
+def capabilities_node(state: ChatState) -> dict:
+    """Answer capability questions from server-validated runtime state."""
+    capabilities = state.get("assistant_capabilities") or {}
+    gmail = capabilities.get("gmail") or {}
+
+    sections = [
+        "I can answer general questions, help with planning, and use relevant "
+        "information from your conversation and saved memories."
+    ]
+
+    if gmail.get("read"):
+        sections.append(
+            "For your connected Gmail account, I can search, read, and "
+            "summarize messages."
+        )
+    else:
+        sections.append(
+            "Gmail search and reading are not available in this chat yet. "
+            "Connect or select your Google account in Connected Apps and "
+            "grant Gmail read access."
+        )
+
+    if gmail.get("draft_preview"):
+        sections.append(
+            "I can prepare editable new-email and reply/forward draft previews."
+        )
+    if gmail.get("save_draft"):
+        sections.append(
+            "You can save a reviewed draft to Gmail using its Save Draft action."
+        )
+    elif gmail.get("draft_preview"):
+        sections.append(
+            "Saving to Gmail requires a connected account with Gmail draft "
+            "permission."
+        )
+    if gmail.get("send"):
+        sections.append(
+            "Email sending is available only through a review proposal, your "
+            "explicit approval, and a separate execution action. I never send "
+            "automatically from chat."
+        )
+    elif gmail.get("draft_preview"):
+        sections.append(
+            "Sending requires Gmail send permission and always uses a review "
+            "proposal, explicit approval, and separate execution."
+        )
+
+    calendar = capabilities.get("google_calendar") or {}
+    if calendar.get("default_connection_invalid"):
+        sections.append(
+            "Your saved default Google Calendar account is no longer available. "
+            "Choose a connected account in Connected Apps before using Calendar."
+        )
+    elif calendar.get("selection_required"):
+        sections.append(
+            "More than one Google Calendar account can perform this operation. "
+            "Choose your default Calendar account in Connected Apps to use it."
+        )
+    elif calendar.get("chat_available") and calendar.get("events_read"):
+        if calendar.get("freebusy"):
+            sections.append(
+                "Google Calendar is available in chat for read-only event "
+                "search, event details, daily and weekly schedules, and "
+                "free/busy checks."
+            )
+        else:
+            sections.append(
+                "Google Calendar is available in chat for read-only event "
+                "search, event details, and daily and weekly schedules. "
+                "Free/busy checks require the separate Calendar free/busy "
+                "permission."
+            )
+    elif calendar.get("chat_available") and calendar.get("freebusy"):
+        sections.append(
+            "Google Calendar free/busy checks are available in chat. "
+            "Reading event details and schedules requires the separate "
+            "Calendar event-read permission."
+        )
+    elif calendar.get("default_connection_selected") and (
+        calendar.get("selected_event_scope_missing")
+        or calendar.get("selected_freebusy_scope_missing")
+    ):
+        missing = []
+        if calendar.get("selected_event_scope_missing"):
+            missing.append("event-read")
+        if calendar.get("selected_freebusy_scope_missing"):
+            missing.append("free/busy")
+        sections.append(
+            "Your selected Google Calendar account needs the "
+            f"{' and '.join(missing)} permission. Re-consent to Calendar "
+            "access for that account in Connected Apps; I will not switch "
+            "to another account automatically."
+        )
+    elif calendar.get("connected") and calendar.get("api_available"):
+        calendar_access = []
+        if calendar.get("events_read"):
+            calendar_access.append("event reading")
+        if calendar.get("freebusy"):
+            calendar_access.append("free/busy availability")
+        sections.append(
+            "Your connected Google accounts currently grant "
+            f"{' and '.join(calendar_access)} through the Calendar API."
+        )
+    elif calendar.get("connected"):
+        sections.append(
+            "Google Calendar is connected, but the required read-only "
+            "Calendar API permissions are incomplete."
+        )
+    elif calendar.get("google_connection_available"):
+        sections.append(
+            "A Google account is connected, but Calendar permissions have "
+            "not been granted. Grant Calendar event-read and, if needed, "
+            "the separate free/busy permission in Connected Apps."
+        )
+    else:
+        sections.append(
+            "Google Calendar is not connected. Connect a Google account with "
+            "Calendar access in Connected Apps to use read-only Calendar "
+            "features in chat."
+        )
+
+    unavailable = capabilities.get("unavailable_integrations") or []
+    if unavailable:
+        sections.append(
+            f"{', '.join(unavailable)} operations are not implemented yet."
+        )
+
+    answer = " ".join(sections)
+    return {
+        "assistant_response": answer,
+        "provider": "",
+        "model": "",
+        "messages": [
+            {"role": "user", "content": state["user_message"]},
+            {"role": "assistant", "content": answer},
         ],
     }
 

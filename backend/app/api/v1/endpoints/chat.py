@@ -31,6 +31,7 @@ from app.services.chat_service import (
 )
 from app.services.message_service import MessageService
 from app.services.user_settings_service import UserSettingsService
+from app.services.user_connection_service import UserConnectionService
 
 
 router = APIRouter()
@@ -56,6 +57,7 @@ def get_chat_service(
         message_service=message_service,
         user_settings_service=user_settings_service,
         memory_pipeline=memory_pipeline,
+        user_connection_service=UserConnectionService(db),
     )
 
 
@@ -80,6 +82,7 @@ def chat(
     ],
 ):
     try:
+        user_metadata = user.get("user_metadata")
         return service.send_message(
             user_id=UUID(str(user["id"])),
             conversation_id=payload.conversation_id,
@@ -87,6 +90,13 @@ def chat(
             idempotency_key=idempotency_key,
             gmail_connection_id=payload.gmail_connection_id,
             user_timezone=payload.user_timezone,
+            default_calendar_connection_id=(
+                user_metadata.get(
+                    "default_calendar_connection_id"
+                )
+                if isinstance(user_metadata, dict)
+                else None
+            ),
         )
 
     except LookupError:
@@ -136,11 +146,17 @@ def chat(
             "Chat request failed during a Google API call | status=%s",
             exc.status_code,
         )
-        if exc.status_code == status.HTTP_403_FORBIDDEN:
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
             response_status = status.HTTP_403_FORBIDDEN
             detail = (
-                "Gmail access was denied. Check the connected account's "
-                "Gmail permissions."
+                "Google authorization is no longer valid. Reconnect the "
+                "affected Google service in Connected Apps."
+            )
+        elif exc.status_code == status.HTTP_403_FORBIDDEN:
+            response_status = status.HTTP_403_FORBIDDEN
+            detail = (
+                "Google access was denied. Check the connected account's "
+                "permissions in Connected Apps."
             )
         elif exc.status_code == status.HTTP_404_NOT_FOUND:
             response_status = status.HTTP_404_NOT_FOUND
@@ -151,7 +167,7 @@ def chat(
             or exc.status_code >= 500
         ):
             response_status = status.HTTP_503_SERVICE_UNAVAILABLE
-            detail = "Gmail is temporarily unavailable. Please try again later."
+            detail = "Google is temporarily unavailable. Please try again later."
         else:
             response_status = status.HTTP_502_BAD_GATEWAY
             detail = "Gmail could not complete the request. Please try again."
