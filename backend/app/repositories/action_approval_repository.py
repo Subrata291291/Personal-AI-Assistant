@@ -136,7 +136,7 @@ _INSERT_PROPOSAL = text("""
                 'action_type', :action_type,
                 'parameters', CAST(:parameters AS jsonb),
                 'connection_id', CAST(:connection_id AS uuid)::text,
-                'account_email', :account_email,
+                'account_email', CAST(:account_email AS text),
                 'created_at', proposal_clock.created_at::text,
                 'expires_at',
                     (
@@ -273,7 +273,7 @@ _INSERT_GMAIL_DRAFT_PROPOSAL = text("""
                 'action_type', 'gmail.send_draft',
                 'parameters', CAST(:parameters AS jsonb),
                 'connection_id', CAST(:connection_id AS uuid)::text,
-                'account_email', :account_email,
+                'account_email', CAST(:account_email AS text),
                 'created_at', proposal_clock.created_at::text,
                 'expires_at',
                     (
