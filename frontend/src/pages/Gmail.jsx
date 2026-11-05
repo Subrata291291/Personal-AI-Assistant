@@ -58,6 +58,11 @@ function getDraftApprovalStorageKey(userId, connectionId, messageId) {
   return `gmail-draft-send-approval:${userId}:${connectionId}:${messageId}`
 }
 
+function isMissingDraftApproval(error) {
+  return error?.status === 404 &&
+    error.message === 'No approval proposal was created for this request.'
+}
+
 function readSessionValue(key) {
   try {
     const storage = globalThis.sessionStorage
@@ -342,10 +347,10 @@ export default function Gmail() {
       setDraftReviewError('')
     },
     onError: (error) => {
-      if (error?.status === 404) {
+      if (isMissingDraftApproval(error)) {
         setDraftApprovalStatusUncertain(false)
         setDraftReviewError(
-          'The server confirmed that no approval proposal was created. You can safely continue again.',
+          'No proposal was found for this operation ID. You may retry proposal creation using the same operation ID; this does not approve or send the email.',
         )
         return
       }
@@ -386,10 +391,10 @@ export default function Gmail() {
         setDraftApprovalStatusUncertain(false)
         setDraftReviewError('')
       } catch (statusError) {
-        if (statusError?.status === 404) {
+        if (isMissingDraftApproval(statusError)) {
           setDraftApprovalStatusUncertain(false)
           setDraftReviewError(
-            `The server confirmed that no approval proposal was created. You can safely continue again. ${formatRequestError(error)}`,
+            `No proposal was found for this operation ID. You may retry proposal creation using the same operation ID; this does not approve or send the email. ${formatRequestError(error)}`,
           )
         } else {
           setDraftApprovalStatusUncertain(true)

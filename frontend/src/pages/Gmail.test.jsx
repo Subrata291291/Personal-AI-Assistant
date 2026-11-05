@@ -593,9 +593,9 @@ describe('Gmail archive flow', () => {
       if (url.includes('/gmail-drafts/approval/')) {
         statusChecks += 1
         if (statusChecks === 1) throw statusError
-        const notFound = new Error(
-          'No approval proposal was created for this request.',
-        )
+        const notFound = statusChecks === 2
+          ? new Error('Not Found')
+          : new Error('No approval proposal was created for this request.')
         notFound.status = 404
         throw notFound
       }
@@ -642,8 +642,20 @@ describe('Gmail archive flow', () => {
     fireEvent.click(screen.getByRole('button', {
       name: 'Check approval status',
     }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Do not retry until status is checked.',
+    )
+    expect(screen.getByRole('button', { name: 'Continue to approval' }))
+      .toBeDisabled()
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Check approval status',
+    }))
     expect(await screen.findByText(
-      /server confirmed that no approval proposal was created/,
+      /No proposal was found for this operation ID/,
+    )).toBeInTheDocument()
+    expect(await screen.findByText(
+      /this does not approve or send the email/,
     )).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Continue to approval' }))
       .toBeEnabled()
@@ -678,7 +690,9 @@ describe('Gmail archive flow', () => {
     })
     api.get.mockImplementation(async (url) => {
       if (url.includes('/gmail-drafts/approval/')) {
-        const notFound = new Error('No approval proposal was created.')
+        const notFound = new Error(
+          'No approval proposal was created for this request.',
+        )
         notFound.status = 404
         throw notFound
       }

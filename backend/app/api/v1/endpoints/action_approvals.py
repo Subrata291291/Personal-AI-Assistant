@@ -60,6 +60,20 @@ async def create_gmail_draft_send_approval(
     db: Session = Depends(get_db),
 ):
     user_id = UUID(str(user["id"]))
+    approval_id = ActionApprovalService._gmail_draft_proposal_id(
+        user_id,
+        idempotency_key,
+    )
+    logger.info(
+        "gmail_draft_approval_creation_started | request_id=%s "
+        "| user_id=%s | connection_id=%s | idempotency_key=%s "
+        "| approval_id=%s",
+        request_id(),
+        user_id,
+        payload.connection_id,
+        idempotency_key,
+        approval_id,
+    )
     request_parameters = {
         "message_id": message_id,
         "to": [str(address) for address in payload.to],
@@ -76,8 +90,12 @@ async def create_gmail_draft_send_approval(
     except Exception as exc:
         logger.error(
             "gmail_draft_approval_status_lookup_failed | request_id=%s "
-            "| error_type=%s",
+            "| user_id=%s | idempotency_key=%s | approval_id=%s "
+            "| lookup_result=error | http_status=503 | error_type=%s",
             request_id(),
+            user_id,
+            idempotency_key,
+            approval_id,
             type(exc).__name__,
         )
         raise HTTPException(
@@ -88,6 +106,15 @@ async def create_gmail_draft_send_approval(
             ),
         ) from exc
     if existing is not None:
+        logger.info(
+            "gmail_draft_approval_status_lookup_completed | request_id=%s "
+            "| user_id=%s | idempotency_key=%s | approval_id=%s "
+            "| lookup_result=found | http_status=200",
+            request_id(),
+            user_id,
+            idempotency_key,
+            existing.proposal_id,
+        )
         try:
             service.validate_gmail_draft_request_match(
                 proposal=existing,
@@ -101,6 +128,15 @@ async def create_gmail_draft_send_approval(
                 detail=str(exc),
             ) from exc
         return ActionApprovalResponse(proposal=existing)
+    logger.info(
+        "gmail_draft_approval_status_lookup_completed | request_id=%s "
+        "| user_id=%s | idempotency_key=%s | approval_id=%s "
+        "| lookup_result=missing | http_status=404",
+        request_id(),
+        user_id,
+        idempotency_key,
+        approval_id,
+    )
 
     gmail_service = GmailService(db)
     try:
@@ -193,8 +229,14 @@ async def create_gmail_draft_send_approval(
     except Exception as exc:
         logger.error(
             "gmail_draft_approval_creation_failed | request_id=%s "
-            "| error_type=%s",
+            "| user_id=%s | connection_id=%s | idempotency_key=%s "
+            "| approval_id=%s | database_transaction=not_confirmed "
+            "| http_status=503 | error_type=%s",
             request_id(),
+            user_id,
+            payload.connection_id,
+            idempotency_key,
+            approval_id,
             type(exc).__name__,
         )
         raise HTTPException(
@@ -204,6 +246,17 @@ async def create_gmail_draft_send_approval(
                 "status before retrying."
             ),
         ) from exc
+    logger.info(
+        "gmail_draft_approval_creation_confirmed | request_id=%s "
+        "| user_id=%s | connection_id=%s | idempotency_key=%s "
+        "| approval_id=%s | database_transaction=committed "
+        "| http_status=201",
+        request_id(),
+        user_id,
+        payload.connection_id,
+        idempotency_key,
+        proposal.proposal_id,
+    )
     return ActionApprovalResponse(proposal=proposal)
 
 
@@ -216,16 +269,25 @@ def get_gmail_draft_send_approval_status(
     user: CurrentUser,
     service: ActionApprovalServiceDependency,
 ):
+    user_id = UUID(str(user["id"]))
+    proposal_id = ActionApprovalService._gmail_draft_proposal_id(
+        user_id,
+        idempotency_key,
+    )
     try:
         proposal = service.get_gmail_draft_proposal(
-            user_id=UUID(str(user["id"])),
+            user_id=user_id,
             idempotency_key=idempotency_key,
         )
     except Exception as exc:
         logger.error(
             "gmail_draft_approval_status_lookup_failed | request_id=%s "
-            "| error_type=%s",
+            "| user_id=%s | idempotency_key=%s | approval_id=%s "
+            "| lookup_result=error | http_status=503 | error_type=%s",
             request_id(),
+            user_id,
+            idempotency_key,
+            proposal_id,
             type(exc).__name__,
         )
         raise HTTPException(
@@ -236,10 +298,28 @@ def get_gmail_draft_send_approval_status(
             ),
         ) from exc
     if proposal is None:
+        logger.info(
+            "gmail_draft_approval_status_lookup_completed | request_id=%s "
+            "| user_id=%s | idempotency_key=%s | approval_id=%s "
+            "| lookup_result=missing | http_status=404",
+            request_id(),
+            user_id,
+            idempotency_key,
+            proposal_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No approval proposal was created for this request.",
         )
+    logger.info(
+        "gmail_draft_approval_status_lookup_completed | request_id=%s "
+        "| user_id=%s | idempotency_key=%s | approval_id=%s "
+        "| lookup_result=found | http_status=200",
+        request_id(),
+        user_id,
+        idempotency_key,
+        proposal.proposal_id,
+    )
     return proposal
 
 

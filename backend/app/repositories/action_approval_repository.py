@@ -5,7 +5,12 @@ from uuid import UUID
 
 from sqlalchemy import Engine, text
 
+from app.core.logging import get_logger
+from app.core.request_metrics import request_id
 from app.db.session import engine
+
+
+logger = get_logger(__name__)
 
 
 _INSERT_PROPOSAL = text("""
@@ -357,32 +362,58 @@ class ActionApprovalRepository:
             "account_email": account_email,
             "expiration_minutes": expiration_minutes,
         }
-        with self.engine.begin() as connection:
-            connection.execute(
-                _LOCK_PROPOSAL_IDEMPOTENCY,
-                {"lock_key": str(proposal_id)},
-            )
-            existing = (
+        try:
+            with self.engine.begin() as connection:
                 connection.execute(
-                    _GET_PROPOSAL,
-                    {
-                        "user_id": str(user_id),
-                        "proposal_id": str(proposal_id),
-                    },
+                    _LOCK_PROPOSAL_IDEMPOTENCY,
+                    {"lock_key": str(proposal_id)},
                 )
-                .mappings()
-                .first()
-            )
-            if existing is not None:
-                return self._proposal_row(existing)
-            row = (
-                connection.execute(
-                    _INSERT_GMAIL_DRAFT_PROPOSAL,
-                    params,
+                existing = (
+                    connection.execute(
+                        _GET_PROPOSAL,
+                        {
+                            "user_id": str(user_id),
+                            "proposal_id": str(proposal_id),
+                        },
+                    )
+                    .mappings()
+                    .first()
                 )
-                .mappings()
-                .first()
+                if existing is not None:
+                    row = self._proposal_row(existing)
+                    transaction_outcome = "reused"
+                else:
+                    row = (
+                        connection.execute(
+                            _INSERT_GMAIL_DRAFT_PROPOSAL,
+                            params,
+                        )
+                        .mappings()
+                        .first()
+                    )
+                    transaction_outcome = "inserted"
+        except Exception as exc:
+            logger.error(
+                "gmail_draft_approval_database_transaction_failed "
+                "| request_id=%s | user_id=%s | approval_id=%s "
+                "| transaction_outcome=unknown | http_status=503 "
+                "| error_type=%s",
+                request_id(),
+                user_id,
+                proposal_id,
+                type(exc).__name__,
             )
+            raise
+
+        logger.info(
+            "gmail_draft_approval_database_transaction_completed "
+            "| request_id=%s | user_id=%s | approval_id=%s "
+            "| transaction_outcome=committed | result=%s",
+            request_id(),
+            user_id,
+            proposal_id,
+            transaction_outcome if row is not None else "no_proposal_returned",
+        )
         if row is None:
             raise RuntimeError("Gmail draft approval could not be stored.")
         return self._proposal_row(row, account_email)
