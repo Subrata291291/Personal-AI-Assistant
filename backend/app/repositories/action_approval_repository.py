@@ -133,7 +133,7 @@ _INSERT_PROPOSAL = text("""
                 'source_message_id', CAST(:source_message_id AS uuid)::text,
                 'user_id', CAST(:user_id AS uuid)::text,
                 'conversation_id', conversation.id::text,
-                'action_type', :action_type,
+                'action_type', CAST(:action_type AS text),
                 'parameters', CAST(:parameters AS jsonb),
                 'connection_id', CAST(:connection_id AS uuid)::text,
                 'account_email', CAST(:account_email AS text),
@@ -351,7 +351,7 @@ _TRANSITION = text("""
         (approval_message.metadata->'action_approval')
             || CAST(:patch AS jsonb)
             || CASE
-                WHEN :timestamp_field IS NULL THEN '{}'::jsonb
+                WHEN CAST(:timestamp_field AS text) IS NULL THEN '{}'::jsonb
                 ELSE jsonb_build_object(
                     CAST(:timestamp_field AS text),
                     clock_timestamp()::text
