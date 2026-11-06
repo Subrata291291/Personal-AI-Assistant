@@ -15,6 +15,7 @@ import { useAuth } from '../context/AuthContext'
 import GoogleServiceIcon from '../components/GoogleServiceIcon'
 import { requireConnectionsResponse } from '../lib/responseValidation'
 import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
+import { isGoogleServiceEnabled } from '../lib/googleServiceCapabilities.js'
 
 const GC_TIME = 30 * 60 * 1000
 
@@ -35,6 +36,16 @@ function formatDate(value) {
   return date.toLocaleString()
 }
 
+function writeCapabilityStatus(capabilities, action) {
+  if (capabilities?.[`calendar_${action}_execution_available`]) {
+    return 'available'
+  }
+  if (capabilities?.[`calendar_${action}_feature_enabled`]) {
+    return 'permission missing'
+  }
+  return 'disabled'
+}
+
 function removeDisconnectedConnections(data, connectionIds) {
   if (!data) return data
 
@@ -51,6 +62,27 @@ function removeDisconnectedConnections(data, connectionIds) {
   )
   const eventsRead = capabilities.some((item) => item.calendar_events_read)
   const freebusy = capabilities.some((item) => item.calendar_freebusy)
+  const writePermissionGranted = capabilities.some(
+    (item) => item.calendar_write_permission_granted,
+  )
+  const createAvailable = capabilities.some(
+    (item) => item.calendar_create_execution_available,
+  )
+  const updateAvailable = capabilities.some(
+    (item) => item.calendar_update_execution_available,
+  )
+  const deleteAvailable = capabilities.some(
+    (item) => item.calendar_delete_execution_available,
+  )
+  const createFeatureEnabled = capabilities.some(
+    (item) => item.calendar_create_feature_enabled,
+  )
+  const updateFeatureEnabled = capabilities.some(
+    (item) => item.calendar_update_feature_enabled,
+  )
+  const deleteFeatureEnabled = capabilities.some(
+    (item) => item.calendar_delete_feature_enabled,
+  )
 
   return {
     ...data,
@@ -66,11 +98,17 @@ function removeDisconnectedConnections(data, connectionIds) {
       google_connection_available: googleConnections.length > 0,
       permissions_need_consent: googleConnections.length > 0 &&
         !(eventsRead && freebusy),
-      write_permission_granted: capabilities.some(
-        (item) => item.calendar_write_permission_granted,
-      ),
-      write_execution_available: false,
-      write_available: false,
+      write_permission_granted: writePermissionGranted,
+      create_execution_available: createAvailable,
+      update_execution_available: updateAvailable,
+      delete_execution_available: deleteAvailable,
+      create_feature_enabled: createFeatureEnabled,
+      update_feature_enabled: updateFeatureEnabled,
+      delete_feature_enabled: deleteFeatureEnabled,
+      write_execution_available:
+        createAvailable || updateAvailable || deleteAvailable,
+      write_available:
+        createAvailable || updateAvailable || deleteAvailable,
     },
   }
 }
@@ -195,6 +233,22 @@ function Connectors() {
 
   function handleIntegrationToggle(integration, enabled) {
     setNotice(null)
+    const service = integration === 'gmail'
+      ? 'gmail'
+      : 'calendar'
+    const connected = service === 'gmail'
+      ? isGmailConnected
+      : isCalendarEventReadAvailable
+    if (enabled && !connected) {
+      integrationPreferenceMutation.mutate({
+        integration,
+        enabled: true,
+        preference: `${integration}_enabled`,
+      }, {
+        onSuccess: () => connectMutation.mutate({ service }),
+      })
+      return
+    }
     integrationPreferenceMutation.mutate({
       integration,
       enabled,
@@ -204,8 +258,11 @@ function Connectors() {
 
   // Connect Google account
   const connectMutation = useMutation({
-    mutationFn: (service) =>
-      api.post(`/api/v1/oauth/google/connect?service=${service}`),
+    mutationFn: ({ service, connectionId }) => {
+      const params = new URLSearchParams({ service })
+      if (connectionId) params.set('connection_id', connectionId)
+      return api.post(`/api/v1/oauth/google/connect?${params.toString()}`)
+    },
 
     onSuccess: (result) => {
       if (!result?.authorization_url) {
@@ -369,7 +426,7 @@ function Connectors() {
     if (connectionsQuery.isLoading || connectionsQuery.isError) return
 
     setNotice(null)
-    connectMutation.mutate(service)
+    connectMutation.mutate({ service })
   }
 
   return (
@@ -433,7 +490,7 @@ function Connectors() {
               description: 'Connect your account to access Gmail in your workspace.',
               available: true,
               connected: isGmailConnected,
-              enabled: user?.user_metadata?.gmail_enabled !== false,
+              enabled: isGoogleServiceEnabled('gmail', user?.user_metadata),
             },
             {
               id: 'calendar',
@@ -442,7 +499,7 @@ function Connectors() {
               available: true,
               connected: isCalendarEventReadAvailable,
               partial: calendarNeedsConsent,
-              enabled: user?.user_metadata?.calendar_enabled !== false,
+              enabled: isGoogleServiceEnabled('calendar', user?.user_metadata),
             },
             {
               id: 'drive',
@@ -462,6 +519,23 @@ function Connectors() {
             },
           ].map((service) => {
             const isConnected = service.connected
+            const serviceEnabled = service.enabled
+            const serviceStatusColor = service.partial
+              ? SEMANTIC_STATUS_STYLES.warning.text
+              : isConnected && serviceEnabled
+                ? SEMANTIC_STATUS_STYLES.positive.text
+                : SEMANTIC_STATUS_STYLES.neutral.text
+            const serviceStatus = connectionsQuery.isLoading
+              ? 'Checking connection...'
+              : connectMutation.isPending
+                ? 'Connecting...'
+                : service.partial
+                  ? 'Permissions incomplete'
+                  : !isConnected
+                    ? 'Disconnected'
+                    : serviceEnabled
+                      ? 'Connected · Enabled'
+                      : 'Connected · Disabled'
             const toggleDisabled = !service.available
               || connectionsQuery.isLoading
               || connectionsQuery.isError
@@ -495,25 +569,8 @@ function Connectors() {
                 <div className="mt-auto pt-5">
                   {service.available ? (
                     <>
-                      <p className={`text-xs font-medium ${
-                        service.partial
-                          ? SEMANTIC_STATUS_STYLES.warning.text
-                          : isConnected
-                            ? SEMANTIC_STATUS_STYLES.positive.text
-                            : SEMANTIC_STATUS_STYLES.neutral.text
-                      }`}>
-                        {connectionsQuery.isLoading
-                          ? 'Checking connection...'
-                          : connectMutation.isPending
-                            ? 'Connecting...'
-                            : service.id === 'calendar'
-                              && !calendarCapabilities.connected
-                              ? 'Not connected'
-                            : service.partial
-                              ? 'Permissions incomplete'
-                            : isConnected
-                              ? 'Connected'
-                              : 'Not connected'}
+                      <p className={`text-xs font-medium ${serviceStatusColor}`}>
+                        {serviceStatus}
                       </p>
 
                       {connectedGoogleConnections.length > 0 && !isConnected && (
@@ -554,7 +611,7 @@ function Connectors() {
                           <span
                             aria-live="polite"
                             className={`min-w-8 text-right text-xs font-bold tracking-wide ${
-                              service.enabled
+                              serviceEnabled
                                 ? SEMANTIC_STATUS_STYLES.positive.text
                                 : isDark
                                   ? 'text-slate-400'
@@ -567,20 +624,20 @@ function Connectors() {
                             type="button"
                             role="switch"
                             aria-label={`Enable ${service.name}`}
-                            aria-checked={service.enabled}
+                            aria-checked={serviceEnabled}
                             aria-busy={integrationPreferenceMutation.isPending}
-                            title={`${service.name} ${service.enabled ? 'ON' : 'OFF'}`}
+                            title={`${service.name} ${serviceEnabled ? 'ON' : 'OFF'}`}
                             disabled={toggleDisabled}
                             onClick={() => handleIntegrationToggle(
                               service.id,
-                              !service.enabled,
+                              !serviceEnabled,
                             )}
                             className={`group relative inline-flex h-7 w-[3.25rem] shrink-0 cursor-pointer items-center rounded-full p-1 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-60 ${
                               isDark
                                 ? 'focus-visible:ring-offset-slate-900'
                                 : 'focus-visible:ring-offset-white'
                             } ${
-                              service.enabled
+                              serviceEnabled
                                 ? SEMANTIC_STATUS_STYLES.positive.toggle
                                 : isDark
                                   ? 'bg-slate-700 hover:bg-slate-600'
@@ -594,7 +651,7 @@ function Connectors() {
                                   ? 'animate-pulse'
                                   : ''
                               } ${
-                                service.enabled
+                                serviceEnabled
                                   ? 'translate-x-5'
                                   : 'translate-x-0'
                               }`}
@@ -650,12 +707,37 @@ function Connectors() {
                     {' · '}
                     Calendar chat: {connection.capabilities?.calendar_chat_available ? 'available' : 'not available'}
                     {' · '}
-                    Calendar writes: not available
+                    Calendar writes: {connection.capabilities?.calendar_write_permission_granted
+                      ? 'permission granted'
+                      : 'permission not granted'}
+                    {' · '}
+                    Create {writeCapabilityStatus(connection.capabilities, 'create')}
+                    {' · '}
+                    Update {writeCapabilityStatus(connection.capabilities, 'update')}
+                    {' · '}
+                    Delete {writeCapabilityStatus(connection.capabilities, 'delete')}
                   </p>
                   <p className={`mt-1 text-xs ${colors.muted}`}>
                     Connected {formatDate(connection.connected_at)}
                   </p>
                 </div>
+                {!connection.capabilities?.calendar_write_permission_granted && (
+                  <button
+                    type="button"
+                    onClick={() => connectMutation.mutate({
+                      service: 'calendar_write',
+                      connectionId: connection.id,
+                    })}
+                    disabled={connectMutation.isPending}
+                    className={`shrink-0 rounded-lg border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                      isDark
+                        ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                        : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    Grant Calendar write access
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => handleDisconnect(connection.id)}

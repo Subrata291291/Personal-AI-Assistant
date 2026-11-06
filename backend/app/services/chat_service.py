@@ -645,6 +645,42 @@ class ChatService:
                     and
                     calendar_access.get("calendar_write_execution_available")
                 ),
+                "create_execution_available": bool(
+                    calendar_enabled
+                    and calendar_access.get(
+                        "calendar_create_execution_available"
+                    )
+                ),
+                "update_execution_available": bool(
+                    calendar_enabled
+                    and calendar_access.get(
+                        "calendar_update_execution_available"
+                    )
+                ),
+                "delete_execution_available": bool(
+                    calendar_enabled
+                    and calendar_access.get(
+                        "calendar_delete_execution_available"
+                    )
+                ),
+                "create_feature_enabled": bool(
+                    calendar_enabled
+                    and calendar_access.get(
+                        "calendar_create_feature_enabled"
+                    )
+                ),
+                "update_feature_enabled": bool(
+                    calendar_enabled
+                    and calendar_access.get(
+                        "calendar_update_feature_enabled"
+                    )
+                ),
+                "delete_feature_enabled": bool(
+                    calendar_enabled
+                    and calendar_access.get(
+                        "calendar_delete_feature_enabled"
+                    )
+                ),
             }
             assistant_capabilities = build_runtime_capabilities(
                 granted_scopes=granted_gmail_scopes or set(),
@@ -878,26 +914,48 @@ class ChatService:
                     if assistant_message is None:
                         raise
 
-            calendar_parameters = result.get(
-                "calendar_create_event_proposal"
-            )
-            if calendar_parameters is not None:
+            calendar_action = result.get("calendar_action_proposal")
+            if calendar_action is None:
+                calendar_parameters = result.get(
+                    "calendar_create_event_proposal"
+                )
+                if calendar_parameters is not None:
+                    calendar_action = {
+                        "action_type": "calendar.create_event",
+                        "parameters": calendar_parameters,
+                    }
+            if calendar_action is not None:
                 try:
                     write_connection_id = calendar_access.get(
                         "write_connection_id"
                     )
                     if (
-                        not isinstance(calendar_parameters, dict)
+                        not isinstance(calendar_action, dict)
                         or not write_connection_id
                         or self.user_connection_service is None
                     ):
                         raise RuntimeError(
                             "Calendar proposal context is unavailable."
                         )
+                    action_type = calendar_action.get("action_type")
+                    calendar_parameters = calendar_action.get("parameters")
+                    if (
+                        action_type
+                        not in {
+                            "calendar.create_event",
+                            "calendar.update_event",
+                            "calendar.delete_event",
+                        }
+                        or not isinstance(calendar_parameters, dict)
+                    ):
+                        raise ValueError(
+                            "Calendar proposal payload is invalid."
+                        )
                     source_message_id = UUID(str(assistant_message["id"]))
                     stable_proposal_id = uuid5(
                         NAMESPACE_URL,
-                        f"calendar-create-proposal:{user_id}:{request_id}",
+                        f"calendar-action-proposal:{user_id}:{request_id}:"
+                        f"{action_type}",
                     )
                     proposal = ActionApprovalService(
                         self.user_connection_service.db
@@ -908,7 +966,7 @@ class ChatService:
                             "conversation_id": conversation_id,
                             "source_message_id": source_message_id,
                             "connection_id": UUID(str(write_connection_id)),
-                            "action_type": "calendar.create_event",
+                            "action_type": action_type,
                             "parameters": calendar_parameters,
                         }),
                     )

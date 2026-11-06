@@ -15,7 +15,11 @@ from pydantic import (
 )
 
 from app.schemas.email_draft import normalize_email_address
-from app.schemas.calendar_approval import CalendarCreateEventParameters
+from app.schemas.calendar_approval import (
+    CalendarCreateEventParameters,
+    CalendarDeleteEventParameters,
+    CalendarUpdateEventParameters,
+)
 
 
 ActionType = Literal[
@@ -87,13 +91,22 @@ ACTION_PARAMETER_FIELDS: dict[str, tuple[set[str], set[str]]] = {
     "drive.delete_file": ({"file_id"}, set()),
     "calendar.create_event": (
         {"calendar_id", "summary", "start", "end", "all_day"},
-        {"description", "time_zone", "location", "attendees"},
+        {"description", "time_zone", "location", "attendees", "reminders"},
     ),
     "calendar.update_event": (
-        {"calendar_id", "event_id"},
-        {"title", "starts_at", "ends_at", "time_zone", "attendees"},
+        {
+            "calendar_id",
+            "event_id",
+            "expected_etag",
+            "current_event",
+            "changes",
+        },
+        set(),
     ),
-    "calendar.delete_event": ({"calendar_id", "event_id"}, set()),
+    "calendar.delete_event": (
+        {"calendar_id", "event_id", "expected_etag", "current_event"},
+        set(),
+    ),
     "contacts.create_contact": (
         {"display_name"},
         {"email", "phone"},
@@ -143,6 +156,18 @@ class ApprovalProposalCreate(BaseModel):
     def validate_action_parameters(self) -> "ApprovalProposalCreate":
         if self.action_type == "calendar.create_event":
             validated = CalendarCreateEventParameters.model_validate(
+                self.parameters
+            )
+            self.parameters = validated.model_dump(mode="json")
+            return self
+        if self.action_type == "calendar.update_event":
+            validated = CalendarUpdateEventParameters.model_validate(
+                self.parameters
+            )
+            self.parameters = validated.model_dump(mode="json")
+            return self
+        if self.action_type == "calendar.delete_event":
+            validated = CalendarDeleteEventParameters.model_validate(
                 self.parameters
             )
             self.parameters = validated.model_dump(mode="json")
@@ -273,10 +298,6 @@ class ApprovalProposalCreate(BaseModel):
             set(self.parameters) - {"file_id"}
         ):
             raise ValueError("At least one file change is required.")
-        if self.action_type == "calendar.update_event" and not (
-            set(self.parameters) - {"event_id"}
-        ):
-            raise ValueError("At least one event change is required.")
         if self.action_type == "contacts.update_contact" and not (
             set(self.parameters) - {"contact_id"}
         ):

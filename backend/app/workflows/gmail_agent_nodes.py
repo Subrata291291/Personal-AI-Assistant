@@ -171,6 +171,24 @@ def build_runtime_capabilities(
             "write_execution_available": bool(
                 calendar.get("write_execution_available", False)
             ),
+            "create_execution_available": bool(
+                calendar.get("create_execution_available", False)
+            ),
+            "update_execution_available": bool(
+                calendar.get("update_execution_available", False)
+            ),
+            "delete_execution_available": bool(
+                calendar.get("delete_execution_available", False)
+            ),
+            "create_feature_enabled": bool(
+                calendar.get("create_feature_enabled", False)
+            ),
+            "update_feature_enabled": bool(
+                calendar.get("update_feature_enabled", False)
+            ),
+            "delete_feature_enabled": bool(
+                calendar.get("delete_feature_enabled", False)
+            ),
             "write_available": False,
         },
         "unavailable_integrations": [
@@ -209,20 +227,34 @@ def _plan_prompt(state: ChatState) -> str:
         "Use google_calendar for Calendar requests. For read operations select "
         "the matching read tool. For a request to create one event, use "
         "create_calendar_event_proposal only when runtime "
-        "write_execution_available is true; this prepares an approval "
+        "create_execution_available is true; this prepares an approval "
         "proposal only and never executes a mutation. Its arguments must be "
         "calendar_id, summary, start, end, all_day, and optionally "
-        "description, location, attendees, time_zone. Use a valid RFC3339 "
+        "description, location, attendees, reminders, time_zone. Use a valid RFC3339 "
         "offset-aware timestamp with an explicit IANA time_zone for timed "
         "events. For all-day events use YYYY-MM-DD start/end with exclusive "
         "end date and set time_zone to null. Ask clarification when details "
-        "or timezone are ambiguous. Never mix Calendar creation with Gmail "
-        "actions. For that intent, "
-        "select calendar_tool from list_calendar_events, get_calendar_event, "
+        "or timezone are ambiguous. Never mix Calendar writes with Gmail. "
+        "For Calendar requests, select calendar_tool from "
+        "list_calendar_events, get_calendar_event, "
         "get_today_schedule, get_calendar_schedule, "
         "check_calendar_availability, create_calendar_event_proposal, "
-        "or clarify, and provide only that tool's "
-        "arguments in calendar_arguments. list_calendar_events accepts "
+        "update_calendar_event_proposal, delete_calendar_event_proposal, "
+        "or clarify. Provide only that tool's arguments in calendar_arguments. "
+        "For updates use update_calendar_event_proposal only when "
+        "update_execution_available is true; supply calendar_id, event_query "
+        "or a live event_id from the current request, and changes containing "
+        "only summary, description, location, start/end together, or attendees. "
+        "For deletions use delete_calendar_event_proposal only when "
+        "delete_execution_available is true and supply calendar_id plus an "
+        "event_query or current-request event_id. Never invent an event ID, "
+        "and never use IDs from stale conversation history. Each write intent "
+        "creates an approval proposal only; never execute it from the planner. "
+        "If the corresponding capability is unavailable, choose that write "
+        "tool so the Calendar agent can explain the limitation without "
+        "collecting details. Do not select Gmail for a Calendar change. "
+        "For supported reads select the matching read tool. "
+        "list_calendar_events accepts "
         "time_min, time_max, query, attendee, time_zone, max_results, and "
         "page_token; attendee must be an explicitly known email address. "
         "get_calendar_event accepts event_id and calendar_id. "
@@ -233,11 +265,13 @@ def _plan_prompt(state: ChatState) -> str:
         "connection ID, credentials, or extra fields. Use an explicit IANA timezone from "
         "the runtime. Use check_calendar_availability only for explicit time "
         "ranges; if the request does not identify a date and interval, clarify. "
-        "Calendar access is read-only. Never claim access to Calendar data "
+        "Calendar changes are approval-gated and execution is controlled by "
+        "separate feature flags. Never claim access to Calendar data "
         "without a usable stored grant. Runtime Calendar capabilities are "
         f"{json.dumps(calendar_capabilities, sort_keys=True)}. Only plan a "
-        "Calendar operation marked available; never infer or combine grants "
-        "from account IDs. Convert relative and weekday dates using the "
+        "Calendar operation marked available; for disabled write intents, "
+        "select the matching write proposal tool only to explain unavailability. "
+        "Never infer or combine grants from account IDs. Convert relative and weekday dates using the "
         "current local date above and the supplied IANA timezone. Use "
         "YYYY-MM-DD dates and timezone-aware timestamps; if a date, time, or "
         "DST interpretation is ambiguous, select clarify rather than guess. "
@@ -406,6 +440,17 @@ def _calendar_create_request(text: str) -> bool:
     ))
 
 
+def _calendar_event_creation_request(text: str) -> bool:
+    lowered = text.casefold()
+    return bool(re.search(
+        r"\b(?:create|add|book|schedule)\b.{0,60}"
+        r"\b(?:meetings?|events?|appointments?|calendar)\b|"
+        r"\b(?:meetings?|events?|appointments?)\b.{0,60}"
+        r"\b(?:create|add|book|schedule)\b",
+        lowered,
+    ))
+
+
 def _deterministic_calendar_plan(
     state: ChatState,
 ) -> tuple[dict[str, Any], str] | None:
@@ -413,6 +458,44 @@ def _deterministic_calendar_plan(
     lowered = text.casefold()
     if not _is_calendar_request(text):
         return None
+    calendar_capabilities = (
+        (state.get("assistant_capabilities") or {}).get(
+            "google_calendar",
+            {},
+        )
+    )
+    if (
+        _calendar_event_creation_request(text)
+        and not calendar_capabilities.get(
+            "create_execution_available",
+            calendar_capabilities.get("write_execution_available", False),
+        )
+    ):
+        return _calendar_plan("create_calendar_event_proposal")
+
+    update_request = bool(re.search(
+        r"\b(?:move|reschedule|update|edit|change|modify)\b.{0,80}"
+        r"\b(?:meeting|event|appointment|calendar)\b|"
+        r"\b(?:meeting|event|appointment)\b.{0,80}"
+        r"\b(?:move|reschedule|update|edit|change|modify)\b",
+        lowered,
+    ))
+    delete_request = bool(re.search(
+        r"\b(?:delete|remove|cancel)\b.{0,80}"
+        r"\b(?:meeting|event|appointment|calendar)\b|"
+        r"\b(?:meeting|event|appointment)\b.{0,80}"
+        r"\b(?:delete|remove|cancel)\b",
+        lowered,
+    ))
+    if update_request:
+        if not calendar_capabilities.get("update_execution_available"):
+            return _calendar_plan("update_calendar_event_proposal")
+        return None
+    if delete_request:
+        if not calendar_capabilities.get("delete_execution_available"):
+            return _calendar_plan("delete_calendar_event_proposal")
+        return None
+
     timezone = _validated_timezone(state)
     iana_match = re.search(
         r"\b[A-Za-z_+-]+/[A-Za-z_+-]+\b",
@@ -483,12 +566,6 @@ def _deterministic_calendar_plan(
                     timezone,
                 ) is None:
                     return _calendar_plan("clarify")
-        calendar_capabilities = (
-            (state.get("assistant_capabilities") or {}).get(
-                "google_calendar",
-                {},
-            )
-        )
         if (
             _calendar_create_request(lowered)
             and calendar_capabilities.get("write_execution_available")
@@ -711,6 +788,21 @@ def _deterministic_calendar_plan(
             "list_calendar_events",
             {
                 "query": title_match.group(1).strip()[:500],
+                "time_zone": timezone,
+                "max_results": 10,
+            },
+        )
+
+    if re.search(
+        r"\b(?:show|get|find|tell me|what is|what's)\b.{0,50}"
+        r"\bdetails?\b.{0,40}\b(?:next|upcoming)\s+(?:meeting|event)\b|"
+        r"\bdetails?\b.{0,40}\b(?:next|upcoming)\s+(?:meeting|event)\b",
+        lowered,
+    ):
+        return _calendar_plan(
+            "list_calendar_events",
+            {
+                "time_min": request_now.isoformat(),
                 "time_zone": timezone,
                 "max_results": 10,
             },

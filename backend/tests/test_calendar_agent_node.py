@@ -44,6 +44,15 @@ def _runtime(**context):
     return SimpleNamespace(context=context)
 
 
+def _event(event_id, summary, start, end):
+    return {
+        "id": event_id,
+        "summary": summary,
+        "start": {"date_time": start, "date": None},
+        "end": {"date_time": end, "date": None},
+    }
+
+
 def test_event_tool_uses_server_selected_identity_and_renders_grounded_result(
     monkeypatch,
 ):
@@ -64,6 +73,7 @@ def test_event_tool_uses_server_selected_identity_and_renders_grounded_result(
                 },
                 "attendees": [{"display_name": "Alex", "email": "alex@example.com"}],
                 "location": "Room 2",
+                "description": "Review the launch plan.",
             }],
         },
     })
@@ -83,6 +93,7 @@ def test_event_tool_uses_server_selected_identity_and_renders_grounded_result(
     assert "Planning" in result["assistant_response"]
     assert "Alex" in result["assistant_response"]
     assert "Room 2" in result["assistant_response"]
+    assert "Review the launch plan." in result["assistant_response"]
     factory.assert_called_once_with(
         user_id=USER_ID,
         connection_id=EVENT_CONNECTION_ID,
@@ -92,6 +103,103 @@ def test_event_tool_uses_server_selected_identity_and_renders_grounded_result(
     )
     assert tool.arguments == {"query": "Planning"}
     assert "access token" not in result["assistant_response"].casefold()
+
+
+def test_next_meeting_selects_earliest_upcoming_event_across_timezone_fold(
+    monkeypatch,
+):
+    tool = FakeTool("list_calendar_events", {
+        "ok": True,
+        "data": {
+            "events": [
+                _event(
+                    "later-event",
+                    "Later occurrence",
+                    "2026-11-01T01:15:00-08:00",
+                    "2026-11-01T02:00:00-08:00",
+                ),
+                _event(
+                    "past-event",
+                    "Past occurrence",
+                    "2026-11-01T01:15:00-07:00",
+                    "2026-11-01T01:25:00-07:00",
+                ),
+                _event(
+                    "next-event",
+                    "Next occurrence",
+                    "2026-11-01T01:45:00-07:00",
+                    "2026-11-01T02:00:00-07:00",
+                ),
+            ],
+            "time_zone": "America/Los_Angeles",
+        },
+    })
+    factory = Mock(return_value=[tool])
+    monkeypatch.setattr(calendar_agent_node, "create_calendar_tools", factory)
+    state = _state("list_calendar_events", {})
+    state["user_message"] = "Show details of my next meeting."
+    state["user_timezone"] = "America/Los_Angeles"
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            request_time="2026-11-01T08:30:00Z",
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+
+    assert "Next occurrence" in result["assistant_response"]
+    assert "Later occurrence" not in result["assistant_response"]
+    assert "Past occurrence" not in result["assistant_response"]
+    assert tool.arguments == {
+        "time_min": "2026-11-01T01:30:00-07:00",
+        "time_zone": "America/Los_Angeles",
+        "max_results": 10,
+    }
+
+
+def test_next_meeting_reports_verified_empty_upcoming_result(monkeypatch):
+    tool = FakeTool("list_calendar_events", {
+        "ok": True,
+        "data": {
+            "events": [
+                _event(
+                    "past-event",
+                    "Past occurrence",
+                    "2026-11-01T01:15:00-07:00",
+                    "2026-11-01T01:25:00-07:00",
+                ),
+            ],
+            "time_zone": "America/Los_Angeles",
+        },
+    })
+    factory = Mock(return_value=[tool])
+    monkeypatch.setattr(calendar_agent_node, "create_calendar_tools", factory)
+    state = _state("list_calendar_events", {
+        "time_min": "1999-01-01T00:00:00Z",
+        "max_results": 100,
+    })
+    state["user_message"] = "Show details of my next meeting."
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            request_time="2026-11-01T08:30:00Z",
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+
+    assert result["assistant_response"] == (
+        "There are no upcoming events on your Google Calendar."
+    )
+    assert tool.arguments["time_min"] == "2026-11-01T01:30:00-07:00"
+    assert tool.arguments["max_results"] == 10
 
 
 def test_calendar_tool_receives_authenticated_account_and_request_time(monkeypatch):
@@ -346,6 +454,95 @@ def test_calendar_write_requests_are_refused_without_tool_execution(monkeypatch)
     assert "read your Google Calendar" in result["assistant_response"]
     assert "not created or modified" in result["assistant_response"]
     factory.assert_not_called()
+
+
+def test_disabled_calendar_create_capability_returns_immediately_without_execution(
+    monkeypatch,
+):
+    factory = Mock()
+    monkeypatch.setattr(calendar_agent_node, "create_calendar_tools", factory)
+    state = _state("create_calendar_event_proposal", None)
+    state["user_message"] = "Create a calendar event."
+    state["assistant_capabilities"] = {
+        "google_calendar": {"write_execution_available": False},
+    }
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_enabled=True,
+            google_connection_available=True,
+        ),
+    )
+
+    assert result["assistant_response"] == (
+        "I can read your Google Calendar, but creating events is currently "
+        "unavailable. I haven't created or modified anything."
+    )
+    assert "calendar_create_event_proposal" not in result
+    factory.assert_not_called()
+
+
+def test_calendar_update_and_delete_requests_are_refused_without_execution(
+    monkeypatch,
+):
+    factory = Mock()
+    monkeypatch.setattr(calendar_agent_node, "create_calendar_tools", factory)
+
+    for text, tool_name in (
+        ("Move my meeting to tomorrow.", "update_calendar_event_proposal"),
+        ("Delete my calendar event.", "delete_calendar_event_proposal"),
+    ):
+        state = _state(tool_name, {})
+        state["user_message"] = text
+        state["assistant_capabilities"] = {
+            "google_calendar": {
+                "update_execution_available": False,
+                "delete_execution_available": False,
+            },
+        }
+        result = run_node(
+            state,
+            _runtime(
+                user_id=USER_ID,
+                calendar_enabled=True,
+                google_connection_available=True,
+            ),
+        )
+        assert "Calendar changes are currently unavailable" in (
+            result["assistant_response"]
+        )
+        assert "haven't created or modified anything" in (
+            result["assistant_response"]
+        )
+
+    factory.assert_not_called()
+
+
+def test_calendar_write_consent_is_requested_only_for_selected_account():
+    state = _state("update_calendar_event_proposal", {})
+    state["assistant_capabilities"] = {
+        "google_calendar": {
+            "update_feature_enabled": True,
+            "update_execution_available": False,
+        },
+    }
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_enabled=True,
+            google_connection_available=True,
+            calendar_selected_write_scope_missing=True,
+        ),
+    )
+
+    assert "selected google account is missing calendar write permission" in (
+        result["assistant_response"].casefold()
+    )
+    assert "nothing was changed" in result["assistant_response"].casefold()
 
 
 def test_chat_graph_routes_upcoming_events_to_calendar_tool(monkeypatch):

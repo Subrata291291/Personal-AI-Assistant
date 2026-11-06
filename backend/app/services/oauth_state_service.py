@@ -65,6 +65,8 @@ class OAuthStateService:
         user_id: UUID,
         provider: str,
         redirect_uri: str,
+        service: str | None = None,
+        target_connection_id: UUID | None = None,
     ) -> dict[str, Any]:
         """
         Generate OAuth state and PKCE values,
@@ -78,6 +80,12 @@ class OAuthStateService:
 
         if not redirect_uri or not redirect_uri.strip():
             raise ValueError("Redirect URI cannot be empty.")
+        if service not in {None, "gmail", "calendar", "calendar_write"}:
+            raise ValueError("Unsupported Google OAuth service.")
+        if service == "calendar_write" and target_connection_id is None:
+            raise ValueError(
+                "Calendar write consent must target an existing connection."
+            )
 
         original_state = self._generate_state()
         state_hash = self._hash_state(original_state)
@@ -103,6 +111,8 @@ class OAuthStateService:
                 code_verifier_encrypted=encrypted_verifier,
                 redirect_uri=redirect_uri.strip(),
                 expires_at=expires_at,
+                service=service,
+                target_connection_id=target_connection_id,
             )
 
             self.db.commit()
@@ -159,6 +169,8 @@ class OAuthStateService:
             stored_redirect_uri = oauth_state.redirect_uri
             consumed_at = oauth_state.consumed_at
             stored_state_hash = oauth_state.state_hash
+            stored_service = oauth_state.service
+            stored_target_connection_id = oauth_state.target_connection_id
 
             # Commit before decryption to prevent state replay.
             self.db.commit()
@@ -176,6 +188,8 @@ class OAuthStateService:
             "redirect_uri": stored_redirect_uri,
             "consumed_at": consumed_at,
             "state_hash": stored_state_hash,
+            "service": stored_service,
+            "target_connection_id": stored_target_connection_id,
         }
 
     def lock_consumed_state_for_callback(

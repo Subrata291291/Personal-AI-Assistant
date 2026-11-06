@@ -432,8 +432,9 @@ async def get_action_approval(
                 proposal_id=proposal_id,
             )
         elif (
-            proposal.action_type == "calendar.create_event"
+            proposal.action_type in CalendarActionExecutor.SUPPORTED_ACTION_TYPES
             and proposal.status in {"execution_uncertain", "executing"}
+            and is_integration_enabled(user, "calendar")
         ):
             proposal = await CalendarActionExecutor(
                 db=db,

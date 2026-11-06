@@ -26,6 +26,8 @@ class OAuthStateRepository:
         code_verifier_encrypted: str,
         redirect_uri: str,
         expires_at: datetime,
+        service: str | None = None,
+        target_connection_id: UUID | None = None,
     ) -> OAuthState:
         """
         Create a new OAuth state record.
@@ -41,6 +43,8 @@ class OAuthStateRepository:
             code_verifier_encrypted=code_verifier_encrypted,
             redirect_uri=redirect_uri,
             expires_at=expires_at,
+            service=service,
+            target_connection_id=target_connection_id,
         )
 
         self.db.add(oauth_state)

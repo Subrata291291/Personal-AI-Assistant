@@ -27,6 +27,9 @@ def test_fresh_user_has_empty_google_connections_and_calendar_capabilities():
         "google_connection_available": False,
         "permissions_need_consent": False,
         "write_permission_granted": False,
+        "create_execution_available": False,
+        "update_execution_available": False,
+        "delete_execution_available": False,
         "write_execution_available": False,
         "write_available": False,
     }

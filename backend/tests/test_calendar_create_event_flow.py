@@ -72,6 +72,7 @@ def test_calendar_create_proposal_is_not_prepared_without_write_capability(
         context={
             "user_id": str(USER_ID),
             "calendar_write_connection_id": str(CONNECTION_ID),
+            "google_connection_available": True,
         }
     )
 
@@ -104,6 +105,7 @@ def test_calendar_create_proposal_preflights_access_and_returns_payload(
         context={
             "user_id": str(USER_ID),
             "calendar_write_connection_id": str(CONNECTION_ID),
+            "google_connection_available": True,
         }
     )
 

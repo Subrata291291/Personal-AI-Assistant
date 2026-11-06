@@ -142,8 +142,18 @@ def build_calendar_operation_identity(
     event_id = (
         calendar_create_event_id(operation_id, fingerprint)
         if action_type == "calendar.create_event"
+        else parameters.get("event_id")
+        if action_type in {
+            "calendar.update_event",
+            "calendar.delete_event",
+        }
         else None
     )
+    if event_id is not None and (
+        not isinstance(event_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9._:-]{1,1024}", event_id)
+    ):
+        raise ValueError("Invalid Calendar event ID.")
     return CalendarOperationIdentity(
         proposal_id=proposal_id,
         operation_id=operation_id,

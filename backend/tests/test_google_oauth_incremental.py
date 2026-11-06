@@ -98,6 +98,15 @@ def test_refresh_token_errors_are_classified_without_exposing_provider_data(
                 "https://www.googleapis.com/auth/calendar",
             ],
         ),
+        (
+            "calendar_write",
+            [GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE],
+            [
+                GoogleOAuthClient.CALENDAR_EVENTS_READ_SCOPE,
+                GoogleOAuthClient.CALENDAR_FREEBUSY_SCOPE,
+                "https://www.googleapis.com/auth/gmail.readonly",
+            ],
+        ),
     ],
 )
 def test_google_authorization_requests_scopes_for_only_selected_service(
@@ -140,6 +149,46 @@ def test_google_authorization_requests_scopes_for_only_selected_service(
 def test_google_authorization_rejects_unknown_service():
     with pytest.raises(ValueError, match="Unsupported Google service"):
         GoogleOAuthClient.scopes_for_service("drive")
+
+
+def test_oauth_state_binds_incremental_calendar_consent_to_connection(
+    monkeypatch,
+):
+    from app.services.oauth_state_service import OAuthStateService
+
+    user_id = uuid4()
+    connection_id = uuid4()
+    db = Mock()
+    service = OAuthStateService(db)
+    service.repository = Mock()
+    monkeypatch.setattr(
+        "app.services.oauth_state_service.encrypt_data",
+        lambda value: f"encrypted:{value}",
+    )
+
+    result = service.create_state(
+        user_id=user_id,
+        provider="google",
+        redirect_uri="https://example.test/callback",
+        service="calendar_write",
+        target_connection_id=connection_id,
+    )
+
+    assert result["state"]
+    service.repository.create.assert_called_once()
+    assert service.repository.create.call_args.kwargs[
+        "service"
+    ] == "calendar_write"
+    assert service.repository.create.call_args.kwargs[
+        "target_connection_id"
+    ] == connection_id
+    with pytest.raises(ValueError, match="must target an existing connection"):
+        service.create_state(
+            user_id=user_id,
+            provider="google",
+            redirect_uri="https://example.test/callback",
+            service="calendar_write",
+        )
 
 
 @pytest.mark.parametrize(
@@ -346,6 +395,65 @@ def test_disconnect_cancels_an_in_flight_oauth_callback():
             )
         )
 
+    service.connection_service.connect_account.assert_not_called()
+    service.credential_service.save_credentials.assert_not_called()
+
+
+def test_calendar_write_callback_is_bound_to_the_selected_google_account(
+    monkeypatch,
+):
+    user_id = uuid4()
+    connection_id = uuid4()
+    service = GoogleOAuthCallbackService(db=Mock())
+    service.state_service = Mock()
+    service.state_service.consume_state.return_value = {
+        "user_id": user_id,
+        "code_verifier": "verifier",
+        "redirect_uri": "https://example.test/callback",
+        "service": "calendar_write",
+        "target_connection_id": connection_id,
+    }
+    service.state_service.lock_consumed_state_for_callback.return_value = True
+    service.oauth_client = Mock()
+    service.oauth_client.exchange_authorization_code = AsyncMock(
+        return_value={
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "scope": "https://www.googleapis.com/auth/calendar.events",
+        }
+    )
+    service.oauth_client.get_user_info = AsyncMock(
+        return_value={
+            "provider_account_id": "different-google-account",
+            "email": "other@example.com",
+        }
+    )
+    connection_repository = Mock()
+    connection_repository.get_by_id.return_value = SimpleNamespace(
+        provider="google",
+        status="connected",
+        provider_account_id="selected-google-account",
+    )
+    monkeypatch.setattr(
+        "app.services.google_oauth_callback_service.UserConnectionRepository",
+        lambda _db: connection_repository,
+    )
+    service.connection_service = Mock()
+    service.credential_service = Mock()
+
+    with pytest.raises(ValueError, match="does not match the selected"):
+        asyncio.run(
+            service.handle_callback(
+                code="authorization-code",
+                state="opaque-state",
+            )
+        )
+
+    connection_repository.get_by_id.assert_called_once_with(
+        user_id=user_id,
+        connection_id=connection_id,
+    )
     service.connection_service.connect_account.assert_not_called()
     service.credential_service.save_credentials.assert_not_called()
 

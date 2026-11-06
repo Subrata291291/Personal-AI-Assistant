@@ -51,6 +51,8 @@ class IntegrationPlan(GmailPlanBase):
         "get_calendar_schedule",
         "check_calendar_availability",
         "create_calendar_event_proposal",
+        "update_calendar_event_proposal",
+        "delete_calendar_event_proposal",
         "clarify",
     ] | None = None
     calendar_arguments: dict[str, object] | None = None

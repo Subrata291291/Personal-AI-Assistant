@@ -163,8 +163,43 @@ class UserConnectionService:
                     "calendar_write_permission_granted": (
                         self.CALENDAR_EVENTS_WRITE_SCOPE in granted_scopes
                     ),
-                    "calendar_write_execution_available": False,
-                    "calendar_write_available": False,
+                    "calendar_create_feature_enabled": (
+                        settings.CALENDAR_CREATE_EVENT_ENABLED
+                    ),
+                    "calendar_update_feature_enabled": (
+                        settings.CALENDAR_UPDATE_EVENT_ENABLED
+                    ),
+                    "calendar_delete_feature_enabled": (
+                        settings.CALENDAR_DELETE_EVENT_ENABLED
+                    ),
+                    "calendar_create_execution_available": (
+                        self.CALENDAR_EVENTS_WRITE_SCOPE in granted_scopes
+                        and settings.CALENDAR_CREATE_EVENT_ENABLED
+                    ),
+                    "calendar_update_execution_available": (
+                        self.CALENDAR_EVENTS_WRITE_SCOPE in granted_scopes
+                        and settings.CALENDAR_UPDATE_EVENT_ENABLED
+                    ),
+                    "calendar_delete_execution_available": (
+                        self.CALENDAR_EVENTS_WRITE_SCOPE in granted_scopes
+                        and settings.CALENDAR_DELETE_EVENT_ENABLED
+                    ),
+                    "calendar_write_execution_available": (
+                        self.CALENDAR_EVENTS_WRITE_SCOPE in granted_scopes
+                        and any((
+                            settings.CALENDAR_CREATE_EVENT_ENABLED,
+                            settings.CALENDAR_UPDATE_EVENT_ENABLED,
+                            settings.CALENDAR_DELETE_EVENT_ENABLED,
+                        ))
+                    ),
+                    "calendar_write_available": (
+                        self.CALENDAR_EVENTS_WRITE_SCOPE in granted_scopes
+                        and any((
+                            settings.CALENDAR_CREATE_EVENT_ENABLED,
+                            settings.CALENDAR_UPDATE_EVENT_ENABLED,
+                            settings.CALENDAR_DELETE_EVENT_ENABLED,
+                        ))
+                    ),
                 },
             })
 
@@ -216,8 +251,26 @@ class UserConnectionService:
             "permissions_need_consent": bool(google_connections)
             and not (events_read and freebusy),
             "write_permission_granted": write_permission_granted,
-            "write_execution_available": False,
-            "write_available": False,
+            "create_execution_available": any(
+                item.get("calendar_create_execution_available", False)
+                for item in capabilities
+            ),
+            "update_execution_available": any(
+                item.get("calendar_update_execution_available", False)
+                for item in capabilities
+            ),
+            "delete_execution_available": any(
+                item.get("calendar_delete_execution_available", False)
+                for item in capabilities
+            ),
+            "write_execution_available": any(
+                item.get("calendar_write_execution_available", False)
+                for item in capabilities
+            ),
+            "write_available": any(
+                item.get("calendar_write_execution_available", False)
+                for item in capabilities
+            ),
         }
 
     def get_user_calendar_access(
@@ -337,7 +390,14 @@ class UserConnectionService:
                 )
                 for item in connections
             ),
-            "write_execution_available": False,
+            "write_execution_available": (
+                bool(write_connection)
+                and any((
+                    settings.CALENDAR_CREATE_EVENT_ENABLED,
+                    settings.CALENDAR_UPDATE_EVENT_ENABLED,
+                    settings.CALENDAR_DELETE_EVENT_ENABLED,
+                ))
+            ),
         }
         return {
             "google_connection_available": bool(connections),
@@ -375,13 +435,57 @@ class UserConnectionService:
                 bool(selected_connection)
                 and not selected_connection["capabilities"]["calendar_freebusy"]
             ),
-            "calendar_write_available": False,
+            "calendar_write_available": (
+                bool(write_connection)
+                and any((
+                    settings.CALENDAR_CREATE_EVENT_ENABLED,
+                    settings.CALENDAR_UPDATE_EVENT_ENABLED,
+                    settings.CALENDAR_DELETE_EVENT_ENABLED,
+                ))
+            ),
             "calendar_write_permission_granted": (
                 bool(write_connection)
             ),
-            "calendar_write_execution_available": (
+            "calendar_create_feature_enabled": (
+                settings.CALENDAR_CREATE_EVENT_ENABLED
+            ),
+            "calendar_update_feature_enabled": (
+                settings.CALENDAR_UPDATE_EVENT_ENABLED
+            ),
+            "calendar_delete_feature_enabled": (
+                settings.CALENDAR_DELETE_EVENT_ENABLED
+            ),
+            "calendar_create_execution_available": (
                 bool(write_connection)
                 and settings.CALENDAR_CREATE_EVENT_ENABLED
+            ),
+            "calendar_update_execution_available": (
+                bool(write_connection)
+                and settings.CALENDAR_UPDATE_EVENT_ENABLED
+            ),
+            "calendar_delete_execution_available": (
+                bool(write_connection)
+                and settings.CALENDAR_DELETE_EVENT_ENABLED
+            ),
+            "calendar_write_execution_available": (
+                bool(write_connection)
+                and any((
+                    settings.CALENDAR_CREATE_EVENT_ENABLED,
+                    settings.CALENDAR_UPDATE_EVENT_ENABLED,
+                    settings.CALENDAR_DELETE_EVENT_ENABLED,
+                ))
+            ),
+            "calendar_write_create_enabled": (
+                bool(write_connection)
+                and settings.CALENDAR_CREATE_EVENT_ENABLED
+            ),
+            "calendar_write_update_enabled": (
+                bool(write_connection)
+                and settings.CALENDAR_UPDATE_EVENT_ENABLED
+            ),
+            "calendar_write_delete_enabled": (
+                bool(write_connection)
+                and settings.CALENDAR_DELETE_EVENT_ENABLED
             ),
             "calendar_write_selection_required": (
                 not default_connection_id and len(write_candidates) > 1

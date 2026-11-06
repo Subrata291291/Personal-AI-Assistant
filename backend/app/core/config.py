@@ -85,6 +85,8 @@ class Settings(BaseSettings):
     GOOGLE_OAUTH_ACCESS_TYPE: str = "offline"
     GOOGLE_OAUTH_PROMPT: str = "consent"
     CALENDAR_CREATE_EVENT_ENABLED: bool = False
+    CALENDAR_UPDATE_EVENT_ENABLED: bool = False
+    CALENDAR_DELETE_EVENT_ENABLED: bool = False
 
     # Frontend and Backend
     FRONTEND_URL: str = "http://localhost:5173"

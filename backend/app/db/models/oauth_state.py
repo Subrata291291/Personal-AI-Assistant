@@ -3,6 +3,7 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import (
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -21,6 +22,10 @@ class OAuthState(Base):
     __tablename__ = "pa_oauth_states"
 
     __table_args__ = (
+        CheckConstraint(
+            "service IS NULL OR service IN ('gmail', 'calendar', 'calendar_write')",
+            name="ck_pa_oauth_states_service",
+        ),
         UniqueConstraint(
             "state_hash",
             name="uq_pa_oauth_states_state_hash",
@@ -69,6 +74,17 @@ class OAuthState(Base):
     redirect_uri: Mapped[str] = mapped_column(
         String(2048),
         nullable=False,
+    )
+
+    service: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+
+    target_connection_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("pa_user_connections.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     expires_at: Mapped[datetime] = mapped_column(

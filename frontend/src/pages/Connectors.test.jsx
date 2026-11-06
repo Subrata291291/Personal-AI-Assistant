@@ -90,6 +90,10 @@ function connectedResponse(connections, calendarCapabilities) {
 describe('Connected Apps', () => {
   beforeEach(() => {
     updateUserMetadata.mockReset()
+    updateUserMetadata.mockImplementation(async (metadata) => {
+      userMetadata.current = { ...userMetadata.current, ...metadata }
+      return { user_metadata: userMetadata.current }
+    })
     userMetadata.current = {}
     api.get.mockResolvedValue(connectedResponse([]))
     api.post.mockResolvedValue({
@@ -124,9 +128,9 @@ describe('Connected Apps', () => {
       .getByRole('heading', { name: 'Google Services' })
       .closest('section')
     const [gmailCard, calendarCard] = within(services).getAllByRole('article')
-    expect(within(gmailCard).getByText('Not connected'))
+    expect(within(gmailCard).getByText('Disconnected'))
       .toBeInTheDocument()
-    expect(await within(calendarCard).findByText('Not connected'))
+    expect(await within(calendarCard).findByText('Disconnected'))
       .toBeInTheDocument()
   })
 
@@ -160,6 +164,23 @@ describe('Connected Apps', () => {
     })
   })
 
+  it('starts OAuth instead of enabling a disconnected service as connected', async () => {
+    userMetadata.current = { gmail_enabled: false }
+    renderConnectors()
+
+    const gmailSwitch = await screen.findByRole('switch', { name: 'Enable Gmail' })
+    expect(await screen.findAllByText('Disconnected')).toHaveLength(2)
+    fireEvent.click(gmailSwitch)
+
+    await waitFor(() => {
+    expect(updateUserMetadata).toHaveBeenCalledWith({ gmail_enabled: true })
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/oauth/google/connect?service=gmail',
+    )
+    })
+    expect(screen.getAllByText('Disconnected')).toHaveLength(2)
+  })
+
   it('requests Calendar scopes independently', async () => {
     renderConnectors()
 
@@ -172,6 +193,41 @@ describe('Connected Apps', () => {
     await waitFor(() => {
       expect(api.post).toHaveBeenCalledWith(
         '/api/v1/oauth/google/connect?service=calendar',
+      )
+    })
+  })
+
+  it('requests write consent for the exact connected Google account', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        ...googleConnection.capabilities,
+        calendar: true,
+        calendar_events_read: true,
+        calendar_write_permission_granted: false,
+        calendar_create_execution_available: false,
+        calendar_update_execution_available: false,
+        calendar_delete_execution_available: false,
+      },
+    }], {
+      ...noCalendarCapabilities,
+      connected: true,
+      events_read: true,
+      api_available: true,
+      google_connection_available: true,
+    }))
+    api.post.mockResolvedValue({
+      authorization_url: 'https://accounts.google.test/authorize',
+    })
+    renderConnectors()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Grant Calendar write access',
+    }))
+
+    await waitFor(() => {
+      expect(api.post).toHaveBeenCalledWith(
+        `/api/v1/oauth/google/connect?service=calendar_write&connection_id=${googleConnection.id}`,
       )
     })
   })
@@ -190,7 +246,7 @@ describe('Connected Apps', () => {
     const calendarCard = screen.getByRole('heading', {
       name: 'Google Calendar',
     }).closest('article')
-    expect(await within(calendarCard).findByText('Not connected'))
+    expect(await within(calendarCard).findByText('Disconnected'))
       .toBeInTheDocument()
     expect(within(calendarCard).getByText(
       'A Google account is connected, but Google Calendar permission has not been granted.',
@@ -231,7 +287,7 @@ describe('Connected Apps', () => {
     const calendarCard = screen.getByRole('heading', {
       name: 'Google Calendar',
     }).closest('article')
-    expect(await within(calendarCard).findByText('Connected'))
+    expect(await within(calendarCard).findByText('Connected · Enabled'))
       .toBeInTheDocument()
     expect(screen.getByText(
       'Calendar event-read: available · FreeBusy: not granted · Calendar chat: available · Calendar writes: not available.',
@@ -511,6 +567,8 @@ describe('Connected Apps', () => {
       })
     })
     expect(api.delete).not.toHaveBeenCalled()
+    expect(await screen.findByText('Connected · Disabled'))
+      .toBeInTheDocument()
     expect(screen.getByText('Gmail: Connected · Google Calendar: Connected'))
       .toBeInTheDocument()
   })
@@ -548,6 +606,8 @@ describe('Connected Apps', () => {
       })
     })
     expect(api.delete).not.toHaveBeenCalled()
+    expect(await screen.findByText('Connected · Disabled'))
+      .toBeInTheDocument()
     expect(screen.getByRole('button', {
       name: 'Disconnect Google account',
     })).toBeInTheDocument()

@@ -4,6 +4,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.integrations.google.oauth_client import GoogleOAuthClient
+from app.repositories.user_connection_repository import (
+    UserConnectionRepository,
+)
 from app.services.oauth_credential_service import OAuthCredentialService
 from app.services.oauth_state_service import OAuthStateService
 from app.services.user_connection_service import UserConnectionService
@@ -126,6 +129,30 @@ class GoogleOAuthCallbackService:
                 raise ValueError(
                     "Google authorization was canceled by disconnect."
                 )
+
+            target_connection_id = state_data.get("target_connection_id")
+            if state_data.get("service") == "calendar_write":
+                if target_connection_id is None:
+                    raise ValueError(
+                        "Calendar write consent has no selected account."
+                    )
+                target_connection = UserConnectionRepository(
+                    self.db
+                ).get_by_id(
+                    user_id=user_id,
+                    connection_id=target_connection_id,
+                )
+                if (
+                    target_connection is None
+                    or target_connection.provider != "google"
+                    or target_connection.status != "connected"
+                    or target_connection.provider_account_id
+                    != google_user["provider_account_id"]
+                ):
+                    raise ValueError(
+                        "The authorized Google account does not match the "
+                        "selected connection."
+                    )
 
             # Create or reconnect the user's Google account.
             connection = self.connection_service.connect_account(

@@ -1,8 +1,9 @@
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import quote
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
@@ -17,7 +18,11 @@ from app.repositories.action_approval_repository import (
     CalendarActionOperationRepository,
 )
 from app.schemas.action_approval import ActionApprovalProposal
-from app.schemas.calendar_approval import CalendarCreateEventParameters
+from app.schemas.calendar_approval import (
+    CalendarCreateEventParameters,
+    CalendarDeleteEventParameters,
+    CalendarUpdateEventParameters,
+)
 from app.services.action_approval_service import (
     ActionApprovalService,
     ApprovalConflictError,
@@ -39,7 +44,11 @@ class CalendarExecutionStatePersistenceError(Exception):
 
 
 class CalendarActionExecutor:
-    SUPPORTED_ACTION_TYPES = frozenset({"calendar.create_event"})
+    SUPPORTED_ACTION_TYPES = frozenset({
+        "calendar.create_event",
+        "calendar.update_event",
+        "calendar.delete_event",
+    })
     RECONCILE_AFTER_SECONDS = 120
 
     def __init__(
@@ -65,22 +74,30 @@ class CalendarActionExecutor:
         user_id: UUID,
         proposal_id: UUID,
     ) -> ActionApprovalProposal:
-        if not settings.CALENDAR_CREATE_EVENT_ENABLED:
-            raise PermissionError(
-                "Google Calendar event creation is not enabled."
-            )
         proposal = self.approval_service.get_proposal(user_id, proposal_id)
+        enabled_flag = {
+            "calendar.create_event": settings.CALENDAR_CREATE_EVENT_ENABLED,
+            "calendar.update_event": settings.CALENDAR_UPDATE_EVENT_ENABLED,
+            "calendar.delete_event": settings.CALENDAR_DELETE_EVENT_ENABLED,
+        }.get(proposal.action_type, False)
+        if not enabled_flag:
+            raise PermissionError(
+                "This Google Calendar change is not currently enabled."
+            )
         if proposal.action_type not in self.SUPPORTED_ACTION_TYPES:
             raise PermissionError(
-                "Only Calendar event creation can be executed."
+                "This Calendar action cannot be executed."
             )
         if proposal.status != "approved":
             raise ApprovalConflictError(
                 "Only an approved Calendar event proposal can be executed."
             )
-        parameters = CalendarCreateEventParameters.model_validate(
-            proposal.parameters
-        )
+        parameter_model = {
+            "calendar.create_event": CalendarCreateEventParameters,
+            "calendar.update_event": CalendarUpdateEventParameters,
+            "calendar.delete_event": CalendarDeleteEventParameters,
+        }[proposal.action_type]
+        parameters = parameter_model.model_validate(proposal.parameters)
         identity = build_calendar_operation_identity(
             proposal_id=proposal.proposal_id,
             user_id=user_id,
@@ -97,6 +114,51 @@ class CalendarActionExecutor:
                 "Calendar approval integrity verification failed."
             )
 
+        if proposal.action_type != "calendar.create_event":
+            current_event = await self.calendar_service.validate_event_write_access(
+                user_id=user_id,
+                connection_id=proposal.connection_id,
+                calendar_id=parameters.calendar_id,
+                event_id=parameters.event_id,
+            )
+            if (
+                self._event_snapshot(current_event)
+                != parameters.current_event
+                or current_event.get("etag") != parameters.expected_etag
+            ):
+                self.approval_service.claim_calendar_execution(
+                    user_id=user_id,
+                    proposal_id=proposal_id,
+                )
+                self._finish(
+                    user_id=user_id,
+                    proposal_id=proposal_id,
+                    expected_state="executing",
+                    state="failed",
+                    classification="rejected",
+                    reconciliation="not_required",
+                    result={
+                        "outcome": "rejected",
+                        "reason": "event_changed_before_execution",
+                    },
+                )
+                raise ApprovalConflictError(
+                    "The Calendar event changed after this proposal was created. "
+                    "Review the latest event before approving a new proposal."
+                )
+            claimed = self.approval_service.claim_calendar_execution(
+                user_id=user_id,
+                proposal_id=proposal_id,
+            )
+            return await self._mutate_event(
+                user_id=user_id,
+                proposal=claimed,
+                identity=identity,
+                parameters=parameters,
+            )
+
+        if not isinstance(parameters, CalendarCreateEventParameters):
+            raise ValueError("Invalid Calendar create proposal.")
         await self.calendar_service.validate_create_event_access(
             user_id=user_id,
             connection_id=proposal.connection_id,
@@ -112,6 +174,344 @@ class CalendarActionExecutor:
             identity=identity,
             parameters=parameters,
         )
+
+    @staticmethod
+    def _event_snapshot(event: dict[str, Any]) -> dict[str, Any]:
+        def normalize_time(value: object) -> dict[str, str] | None:
+            if not isinstance(value, dict):
+                return None
+            event_date = value.get("date")
+            if isinstance(event_date, date):
+                return {"date": event_date.isoformat()}
+            event_time = value.get("date_time")
+            if not isinstance(event_time, datetime):
+                return None
+            zone = value.get("time_zone")
+            if isinstance(zone, str):
+                result = {
+                    "dateTime": event_time.astimezone(ZoneInfo(zone)).isoformat()
+                }
+                result["timeZone"] = zone
+                return result
+            return {"dateTime": event_time.isoformat()}
+
+        attendees = event.get("attendees") or []
+        return {
+            "summary": event.get("summary"),
+            "description": event.get("description"),
+            "location": event.get("location"),
+            "start": normalize_time(event.get("start")),
+            "end": normalize_time(event.get("end")),
+            "attendees": sorted(
+                item["email"].casefold()
+                for item in attendees
+                if isinstance(item, dict)
+                and isinstance(item.get("email"), str)
+            ),
+            "etag": event.get("etag"),
+        }
+
+    async def _mutate_event(
+        self,
+        *,
+        user_id: UUID,
+        proposal: ActionApprovalProposal,
+        identity: CalendarOperationIdentity,
+        parameters: CalendarUpdateEventParameters | CalendarDeleteEventParameters,
+    ) -> ActionApprovalProposal:
+        method = (
+            "PATCH"
+            if proposal.action_type == "calendar.update_event"
+            else "DELETE"
+        )
+        url = (
+            f"{CalendarService.CALENDAR_API_BASE}/calendars/"
+            f"{quote(parameters.calendar_id, safe='')}/events/"
+            f"{quote(parameters.event_id, safe='')}"
+        )
+        body = (
+            self._update_body(parameters)
+            if isinstance(parameters, CalendarUpdateEventParameters)
+            else None
+        )
+        api_db = SessionLocal()
+        try:
+            await self.api_client.request_mutation(
+                db=api_db,
+                user_id=str(user_id),
+                connection_id=str(proposal.connection_id),
+                method=method,
+                url=url,
+                params={
+                    "sendUpdates": (
+                        "all"
+                        if isinstance(parameters, CalendarUpdateEventParameters)
+                        and "attendees" in parameters.changes
+                        else "none"
+                    ),
+                },
+                json_data=body,
+                headers={"If-Match": parameters.expected_etag},
+            )
+        except GoogleAPIMutationError as exc:
+            if exc.outcome_unknown:
+                return await self._reconcile_mutation(
+                    user_id=user_id,
+                    proposal=proposal,
+                    identity=identity,
+                    parameters=parameters,
+                    request_accepted=False,
+                    cause=exc,
+                )
+            return self._finish(
+                user_id=user_id,
+                proposal_id=proposal.proposal_id,
+                expected_state="executing",
+                state="failed",
+                classification=(
+                    "not_transmitted"
+                    if exc.reason == "request_not_transmitted"
+                    else "rejected"
+                ),
+                reconciliation="not_required",
+                result={
+                    "outcome": "rejected",
+                    "reason": (
+                        "event_changed"
+                        if exc.status_code == 412
+                        else "provider_rejected"
+                    ),
+                    "provider_status_code": exc.status_code,
+                },
+            )
+        except GoogleAPIError as exc:
+            return self._finish(
+                user_id=user_id,
+                proposal_id=proposal.proposal_id,
+                expected_state="executing",
+                state="failed",
+                classification="rejected",
+                reconciliation="not_required",
+                result={
+                    "outcome": "rejected",
+                    "provider_status_code": exc.status_code,
+                },
+            )
+        except Exception as exc:
+            logger.exception(
+                "Calendar event mutation outcome could not be recorded "
+                "| proposal_id=%s",
+                proposal.proposal_id,
+            )
+            return await self._reconcile_mutation(
+                user_id=user_id,
+                proposal=proposal,
+                identity=identity,
+                parameters=parameters,
+                request_accepted=False,
+                cause=exc,
+            )
+        finally:
+            api_db.close()
+
+        return await self._reconcile_mutation(
+            user_id=user_id,
+            proposal=proposal,
+            identity=identity,
+            parameters=parameters,
+            request_accepted=True,
+        )
+
+    @staticmethod
+    def _update_body(
+        parameters: CalendarUpdateEventParameters,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        for key in ("summary", "description", "location"):
+            if key in parameters.changes:
+                body[key] = parameters.changes[key]
+        if "start" in parameters.changes:
+            body["start"] = parameters.changes["start"]
+            body["end"] = parameters.changes["end"]
+        if "attendees" in parameters.changes:
+            body["attendees"] = [
+                {"email": address}
+                for address in parameters.changes["attendees"]
+            ]
+        return body
+
+    async def _read_event_for_reconciliation(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        calendar_id: str,
+        event_id: str,
+    ) -> dict[str, Any] | None:
+        try:
+            raw_event = await self.calendar_service._google_get(
+                user_id=user_id,
+                connection_id=connection_id,
+                endpoint=(
+                    f"calendars/{quote(calendar_id, safe='')}/events/"
+                    f"{quote(event_id, safe='')}"
+                ),
+                params={},
+            )
+        except GoogleAPIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        if not isinstance(raw_event, dict):
+            raise GoogleAPIError(
+                status_code=502,
+                message="Google Calendar returned an invalid event.",
+            )
+        return self.calendar_service._normalize_event(raw_event)
+
+    async def _reconcile_mutation(
+        self,
+        *,
+        user_id: UUID,
+        proposal: ActionApprovalProposal,
+        identity: CalendarOperationIdentity,
+        parameters: CalendarUpdateEventParameters | CalendarDeleteEventParameters,
+        request_accepted: bool,
+        cause: Exception | None = None,
+    ) -> ActionApprovalProposal:
+        try:
+            event = await self._read_event_for_reconciliation(
+                user_id=user_id,
+                connection_id=proposal.connection_id,
+                calendar_id=parameters.calendar_id,
+                event_id=parameters.event_id,
+            )
+        except GoogleAPIError as exc:
+            logger.warning(
+                "Calendar mutation reconciliation read failed "
+                "| proposal_id=%s | status=%s",
+                proposal.proposal_id,
+                exc.status_code,
+            )
+            event = None
+            read_failed = True
+        else:
+            read_failed = False
+
+        if isinstance(parameters, CalendarDeleteEventParameters):
+            if event is None and request_accepted and not read_failed:
+                return self._finish(
+                    user_id=user_id,
+                    proposal_id=proposal.proposal_id,
+                    expected_state="executing",
+                    state="completed",
+                    classification="confirmed",
+                    reconciliation="confirmed",
+                    result={
+                        "outcome": "deleted",
+                        "google_event_id": parameters.event_id,
+                    },
+                )
+            if event is None and not request_accepted and not read_failed:
+                reason = "delete_outcome_unconfirmed"
+            else:
+                reason = "event_still_exists" if event is not None else "read_failed"
+        else:
+            matched = (
+                event is not None
+                and self._event_matches_update(
+                    event,
+                    parameters.changes,
+                )
+            )
+            if matched:
+                return self._finish(
+                    user_id=user_id,
+                    proposal_id=proposal.proposal_id,
+                    expected_state="executing",
+                    state="completed",
+                    classification="confirmed",
+                    reconciliation="confirmed",
+                    result={
+                        "outcome": "updated",
+                        "google_event_id": parameters.event_id,
+                        "html_link": self._safe_event_link(
+                            event.get("html_link")
+                        ),
+                    },
+                )
+            reason = (
+                "event_state_unconfirmed"
+                if event is not None
+                else "read_failed" if read_failed else "event_not_found"
+            )
+
+        if cause is not None:
+            logger.warning(
+                "Calendar mutation read-back did not confirm the provider "
+                "result | proposal_id=%s | cause=%s",
+                proposal.proposal_id,
+                type(cause).__name__,
+            )
+        return self._finish(
+            user_id=user_id,
+            proposal_id=proposal.proposal_id,
+            expected_state="executing",
+            state="execution_uncertain",
+            classification="outcome_unknown",
+            reconciliation="manual_review" if reason != "read_failed" else "pending",
+            result={
+                "outcome": "unconfirmed",
+                "reason": reason,
+            },
+        )
+
+    @classmethod
+    def _event_matches_update(
+        cls,
+        event: dict[str, Any],
+        changes: dict[str, Any],
+    ) -> bool:
+        for key in ("summary", "description", "location"):
+            if key in changes and event.get(key) != changes[key]:
+                return False
+        if "attendees" in changes:
+            actual = {
+                attendee.get("email", "").casefold()
+                for attendee in event.get("attendees", [])
+                if isinstance(attendee, dict)
+                and isinstance(attendee.get("email"), str)
+            }
+            expected = {
+                address.casefold() for address in changes["attendees"]
+            }
+            if actual != expected:
+                return False
+        if "start" in changes:
+            for key, actual in (
+                ("start", event.get("start")),
+                ("end", event.get("end")),
+            ):
+                requested = changes[key]
+                if not isinstance(requested, dict) or not isinstance(actual, dict):
+                    return False
+                if "date" in requested:
+                    if (
+                        not isinstance(actual.get("date"), date)
+                        or actual["date"].isoformat() != requested["date"]
+                    ):
+                        return False
+                elif (
+                    not isinstance(actual.get("date_time"), datetime)
+                    or cls._utc_datetime(requested.get("dateTime"))
+                    != actual["date_time"].astimezone(timezone.utc)
+                    or (
+                        requested.get("timeZone") is not None
+                        and requested.get("timeZone") != actual.get("time_zone")
+                    )
+                ):
+                    return False
+        return True
 
     async def _insert_and_reconcile(
         self,
@@ -249,6 +649,11 @@ class CalendarActionExecutor:
             event["attendees"] = [
                 {"email": address} for address in parameters.attendees
             ]
+        if parameters.reminders is not None:
+            event["reminders"] = {
+                "useDefault": False,
+                "overrides": parameters.reminders,
+            }
         return event
 
     async def _reconcile_after_attempt(
@@ -362,9 +767,9 @@ class CalendarActionExecutor:
         proposal_id: UUID,
     ) -> ActionApprovalProposal:
         proposal = self.approval_service.get_proposal(user_id, proposal_id)
-        if proposal.action_type != "calendar.create_event":
+        if proposal.action_type not in self.SUPPORTED_ACTION_TYPES:
             raise PermissionError(
-                "Only Calendar event creation can be reconciled."
+                "This Calendar action cannot be reconciled."
             )
         if proposal.status not in {"execution_uncertain", "executing"}:
             return proposal
@@ -383,6 +788,15 @@ class CalendarActionExecutor:
             )
             if proposal is None:
                 return self.approval_service.get_proposal(user_id, proposal_id)
+
+        if proposal.action_type in {
+            "calendar.update_event",
+            "calendar.delete_event",
+        }:
+            return await self._reconcile_update_or_delete(
+                user_id=user_id,
+                proposal=proposal,
+            )
 
         parameters = CalendarCreateEventParameters.model_validate(
             proposal.parameters
@@ -429,6 +843,79 @@ class CalendarActionExecutor:
                 "google_event_id": identity.event_id or "",
                 "html_link": self._safe_event_link(event.get("htmlLink")),
             },
+        )
+
+    async def _reconcile_update_or_delete(
+        self,
+        *,
+        user_id: UUID,
+        proposal: ActionApprovalProposal,
+    ) -> ActionApprovalProposal:
+        parameter_model = (
+            CalendarUpdateEventParameters
+            if proposal.action_type == "calendar.update_event"
+            else CalendarDeleteEventParameters
+        )
+        parameters = parameter_model.model_validate(proposal.parameters)
+        try:
+            event = await self._read_event_for_reconciliation(
+                user_id=user_id,
+                connection_id=proposal.connection_id,
+                calendar_id=parameters.calendar_id,
+                event_id=parameters.event_id,
+            )
+        except GoogleAPIError as exc:
+            logger.warning(
+                "Calendar action reconciliation read failed "
+                "| proposal_id=%s | status=%s",
+                proposal.proposal_id,
+                exc.status_code,
+            )
+            self.operation_repository.update_uncertain_reconciliation(
+                user_id=user_id,
+                proposal_id=proposal.proposal_id,
+                reconciliation_status="pending",
+            )
+            return self.approval_service.get_proposal(
+                user_id,
+                proposal.proposal_id,
+            )
+
+        if isinstance(parameters, CalendarDeleteEventParameters):
+            reconciliation_status = (
+                "manual_review" if event is None else "pending"
+            )
+        elif event is not None and self._event_matches_update(
+            event,
+            parameters.changes,
+        ):
+            return self._finish(
+                user_id=user_id,
+                proposal_id=proposal.proposal_id,
+                expected_state="execution_uncertain",
+                state="completed",
+                classification="confirmed",
+                reconciliation="confirmed",
+                result={
+                    "outcome": "updated",
+                    "google_event_id": parameters.event_id,
+                    "html_link": self._safe_event_link(
+                        event.get("html_link")
+                    ),
+                },
+            )
+        else:
+            reconciliation_status = (
+                "pending" if event is None else "manual_review"
+            )
+        self.operation_repository.update_uncertain_reconciliation(
+            user_id=user_id,
+            proposal_id=proposal.proposal_id,
+            reconciliation_status=reconciliation_status,
+        )
+        return self.approval_service.get_proposal(
+            user_id,
+            proposal.proposal_id,
         )
 
     @staticmethod

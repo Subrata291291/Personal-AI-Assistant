@@ -289,6 +289,7 @@ class CalendarService:
             "description": raw.get("description"),
             "location": raw.get("location"),
             "status": raw.get("status"),
+            "etag": raw.get("etag"),
             "html_link": raw.get("htmlLink"),
             "start": cls._normalize_event_time(raw.get("start")),
             "end": cls._normalize_event_time(raw.get("end")),
@@ -477,6 +478,36 @@ class CalendarService:
             ),
             params={"maxResults": 1},
         )
+
+    async def validate_event_write_access(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        calendar_id: str,
+        event_id: str,
+    ) -> dict[str, Any]:
+        self._validate_connection(
+            user_id,
+            connection_id,
+            frozenset({google_scopes.CALENDAR_EVENTS_WRITE_SCOPE}),
+        )
+        calendar_id = self._validate_resource_id(
+            calendar_id,
+            "calendar_id",
+        )
+        event_id = self._validate_resource_id(event_id, "event_id")
+        event = await self.get_event(
+            user_id=user_id,
+            connection_id=connection_id,
+            event_id=event_id,
+            calendar_id=calendar_id,
+        )
+        if not isinstance(event.get("etag"), str) or not event["etag"]:
+            raise GoogleAPIError(
+                status_code=502,
+                message="Google Calendar event has no concurrency token.",
+            )
+        return event
 
     async def get_schedule(
         self,

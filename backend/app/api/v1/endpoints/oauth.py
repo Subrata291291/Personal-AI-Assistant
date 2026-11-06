@@ -59,6 +59,7 @@ def connect_google(
     current_user: CurrentUser,
     db: Session = Depends(get_db),
     service: Literal["gmail", "calendar", "calendar_write"] = "gmail",
+    connection_id: UUID | None = None,
 ):
     """
     Start Google OAuth authorization for an authenticated user.
@@ -79,12 +80,36 @@ def connect_google(
     try:
         user_id = UUID(str(current_user["id"]))
 
+        if service == "calendar_write":
+            if connection_id is None:
+                raise ValueError(
+                    "Choose the connected Google account to authorize."
+                )
+            target_connection = UserConnectionService(db).repository.get_by_id(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            if (
+                target_connection is None
+                or target_connection.provider != "google"
+                or target_connection.status != "connected"
+            ):
+                raise ValueError(
+                    "The selected Google account is not connected."
+                )
+        elif connection_id is not None:
+            raise ValueError(
+                "A target account is supported only for Calendar write consent."
+            )
+
         state_service = OAuthStateService(db)
 
         state_data = state_service.create_state(
             user_id=user_id,
             provider="google",
             redirect_uri=settings.GOOGLE_REDIRECT_URI,
+            service=service,
+            target_connection_id=connection_id,
         )
 
         oauth_client = GoogleOAuthClient()
@@ -101,12 +126,18 @@ def connect_google(
             "expires_at": state_data["expires_at"],
         }
 
-    except (KeyError, ValueError) as exc:
+    except KeyError as exc:
         db.rollback()
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unable to identify the authenticated user.",
+        ) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
         ) from exc
 
     except Exception as exc:

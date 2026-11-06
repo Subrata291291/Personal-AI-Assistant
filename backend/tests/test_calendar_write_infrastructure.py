@@ -59,14 +59,26 @@ PARAMETERS = {
 
 
 @pytest.mark.parametrize(
-    "service",
-    ["calendar", "calendar_write"],
+    ("service", "expected_scopes"),
+    [
+        (
+            "calendar",
+            {
+                GoogleOAuthClient.CALENDAR_EVENTS_READ_SCOPE,
+                GoogleOAuthClient.CALENDAR_FREEBUSY_SCOPE,
+                *GoogleOAuthClient.IDENTITY_SCOPES,
+            },
+        ),
+        (
+            "calendar_write",
+            {GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE},
+        ),
+    ],
 )
-def test_calendar_oauth_keeps_read_and_freebusy_scopes(service):
+def test_calendar_oauth_requests_only_service_scopes(service, expected_scopes):
     scopes = GoogleOAuthClient.scopes_for_service(service)
 
-    assert GoogleOAuthClient.CALENDAR_EVENTS_READ_SCOPE in scopes
-    assert GoogleOAuthClient.CALENDAR_FREEBUSY_SCOPE in scopes
+    assert set(scopes) == expected_scopes
     assert "https://www.googleapis.com/auth/gmail.readonly" not in scopes
     assert "https://www.googleapis.com/auth/calendar" not in scopes
 
@@ -77,7 +89,7 @@ def test_calendar_write_oauth_is_separate_incremental_consent():
 
     assert GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE not in read_scopes
     assert GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE in write_scopes
-    assert set(read_scopes).issubset(write_scopes)
+    assert write_scopes == [GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE]
 
 
 def test_write_grant_is_reported_but_execution_remains_unavailable():
@@ -807,6 +819,12 @@ def test_calendar_create_schema_normalizes_and_limits_attendees():
 def test_calendar_create_event_body_has_stable_id_and_private_markers():
     parameters = CalendarCreateEventParameters.model_validate(
         _create_event_parameters(attendees=["guest@example.com"])
+        | {
+            "reminders": [
+                {"method": "popup", "minutes": 10},
+                {"method": "email", "minutes": 60},
+            ],
+        }
     )
     identity = build_calendar_operation_identity(
         proposal_id=PROPOSAL_ID,
@@ -828,3 +846,25 @@ def test_calendar_create_event_body_has_stable_id_and_private_markers():
         "personal_ai_payload_fingerprint": identity.payload_fingerprint,
     }
     assert body["attendees"] == [{"email": "guest@example.com"}]
+    assert body["reminders"] == {
+        "useDefault": False,
+        "overrides": [
+            {"method": "popup", "minutes": 10},
+            {"method": "email", "minutes": 60},
+        ],
+    }
+
+
+def test_calendar_create_rejects_invalid_reminder_values():
+    with pytest.raises(ValueError):
+        CalendarCreateEventParameters.model_validate(
+            _create_event_parameters(
+                reminders=[{"method": "sms", "minutes": 10}],
+            )
+        )
+    with pytest.raises(ValueError):
+        CalendarCreateEventParameters.model_validate(
+            _create_event_parameters(
+                reminders=[{"method": "popup", "minutes": True}],
+            )
+        )

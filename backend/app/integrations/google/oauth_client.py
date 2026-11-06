@@ -175,12 +175,7 @@ class GoogleOAuthClient:
                 cls.CALENDAR_FREEBUSY_SCOPE,
             ]
         elif service == "calendar_write":
-            requested_scopes = [
-                *cls.IDENTITY_SCOPES,
-                cls.CALENDAR_EVENTS_READ_SCOPE,
-                cls.CALENDAR_FREEBUSY_SCOPE,
-                cls.CALENDAR_EVENTS_WRITE_SCOPE,
-            ]
+            requested_scopes = [cls.CALENDAR_EVENTS_WRITE_SCOPE]
         elif service == "gmail":
             configured_scopes = settings.google_oauth_scopes_list
             gmail_scopes = [

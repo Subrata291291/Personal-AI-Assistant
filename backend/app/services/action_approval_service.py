@@ -3,6 +3,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.repositories.action_approval_repository import (
     ActionApprovalRepository,
     CalendarActionOperationRepository,
@@ -18,7 +19,11 @@ from app.schemas.action_approval import (
     ApprovalProposalCreate,
     validate_safe_result,
 )
-from app.schemas.calendar_approval import CalendarCreateEventParameters
+from app.schemas.calendar_approval import (
+    CalendarCreateEventParameters,
+    CalendarDeleteEventParameters,
+    CalendarUpdateEventParameters,
+)
 from app.services.calendar_action_identity import (
     CalendarOperationConflictError,
     build_calendar_operation_identity,
@@ -113,14 +118,22 @@ class ActionApprovalService:
         payload: ApprovalProposalCreate,
         proposal_id: UUID | None = None,
     ) -> ActionApprovalProposal:
-        if payload.action_type.startswith("calendar.") and (
-            payload.action_type != "calendar.create_event"
-        ):
-            raise PermissionError(
-                "Only Calendar event creation proposals are available."
-            )
-        if payload.action_type == "calendar.create_event":
-            parameters = CalendarCreateEventParameters.model_validate(
+        if payload.action_type.startswith("calendar."):
+            feature_flag = {
+                "calendar.create_event": settings.CALENDAR_CREATE_EVENT_ENABLED,
+                "calendar.update_event": settings.CALENDAR_UPDATE_EVENT_ENABLED,
+                "calendar.delete_event": settings.CALENDAR_DELETE_EVENT_ENABLED,
+            }[payload.action_type]
+            if not feature_flag:
+                raise PermissionError(
+                    "This Calendar change is not currently enabled."
+                )
+            parameter_models = {
+                "calendar.create_event": CalendarCreateEventParameters,
+                "calendar.update_event": CalendarUpdateEventParameters,
+                "calendar.delete_event": CalendarDeleteEventParameters,
+            }
+            parameters = parameter_models[payload.action_type].model_validate(
                 payload.parameters
             )
             payload.parameters = parameters.model_dump(mode="json")
@@ -397,9 +410,13 @@ class ActionApprovalService:
         proposal_id: UUID,
     ) -> ActionApprovalProposal:
         proposal = self.get_proposal(user_id, proposal_id)
-        if proposal.action_type != "calendar.create_event":
+        if proposal.action_type not in {
+            "calendar.create_event",
+            "calendar.update_event",
+            "calendar.delete_event",
+        }:
             raise PermissionError(
-                "Only Calendar event creation can be executed."
+                "This Calendar action cannot be executed."
             )
         if proposal.status != "approved":
             raise ApprovalConflictError(

@@ -60,6 +60,32 @@ function createCalendarProposal(status = 'pending') {
   }
 }
 
+function createCalendarMutationProposal(actionType, status = 'pending') {
+  const isUpdate = actionType === 'calendar.update_event'
+  return {
+    proposal_id: `calendar-${isUpdate ? 'update' : 'delete'}-proposal`,
+    action_type: actionType,
+    status,
+    connection_id: 'connection-1',
+    account_email: 'owner@example.com',
+    parameters: {
+      calendar_id: 'primary',
+      event_id: 'event-1',
+      expected_etag: '"etag-1"',
+      current_event: {
+        summary: 'Design review',
+        start: { dateTime: '2026-06-10T10:00:00+00:00', timeZone: 'UTC' },
+        end: { dateTime: '2026-06-10T11:00:00+00:00', timeZone: 'UTC' },
+        attendees: [],
+        etag: '"etag-1"',
+      },
+      ...(isUpdate ? { changes: { summary: 'Updated design review' } } : {}),
+    },
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    result: null,
+  }
+}
+
 function renderProposalCard(proposal) {
   const message = {
     id: 'approval-message-1',
@@ -184,10 +210,77 @@ describe('ActionApprovalCard Gmail send safety', () => {
     fireEvent.click(screen.getByRole('button', {
       name: 'Create Calendar event',
     }))
-    expect(await screen.findByRole('button', { name: 'Check event status' }))
+    expect(await screen.findByRole('button', {
+      name: 'Check Calendar change status',
+    }))
       .toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Create Calendar event' }))
       .not.toBeInTheDocument()
     expect(actionApprovalService.execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows and executes a Calendar update proposal after approval', async () => {
+    const proposal = createCalendarMutationProposal('calendar.update_event')
+    actionApprovalService.approve.mockResolvedValue({
+      proposal: { ...proposal, status: 'approved' },
+    })
+    actionApprovalService.execute.mockResolvedValue({
+      proposal: {
+        ...proposal,
+        status: 'completed',
+        result: { outcome: 'updated', google_event_id: 'event-1' },
+      },
+    })
+    renderProposalCard(proposal)
+
+    expect(screen.getByText(/Updated design review/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => {
+      expect(actionApprovalService.approve).toHaveBeenCalledWith(
+        'calendar-update-proposal',
+      )
+    })
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Update Calendar event',
+    }))
+    await waitFor(() => {
+      expect(actionApprovalService.execute).toHaveBeenCalledWith(
+        'calendar-update-proposal',
+      )
+    })
+    expect(await screen.findByText(/confirmed the event was updated/))
+      .toBeInTheDocument()
+  })
+
+  it('shows and executes a Calendar delete proposal after approval', async () => {
+    const proposal = createCalendarMutationProposal('calendar.delete_event')
+    actionApprovalService.approve.mockResolvedValue({
+      proposal: { ...proposal, status: 'approved' },
+    })
+    actionApprovalService.execute.mockResolvedValue({
+      proposal: {
+        ...proposal,
+        status: 'completed',
+        result: { outcome: 'deleted', google_event_id: 'event-1' },
+      },
+    })
+    renderProposalCard(proposal)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => {
+      expect(actionApprovalService.approve).toHaveBeenCalledWith(
+        'calendar-delete-proposal',
+      )
+    })
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Delete Calendar event',
+    }))
+    await waitFor(() => {
+      expect(actionApprovalService.execute).toHaveBeenCalledWith(
+        'calendar-delete-proposal',
+      )
+    })
+    expect(await screen.findByText(/confirmed the event was deleted/))
+      .toBeInTheDocument()
   })
 })

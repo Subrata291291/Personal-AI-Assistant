@@ -125,27 +125,67 @@ def test_calendar_and_gmail_requests_route_to_their_service():
         (
             "I want to add a meeting in my calendar today at 11 PM with my friend.",
             "google_calendar",
-            "clarify",
+            "create_calendar_event_proposal",
         ),
         (
             "Add an event to my Google Calendar tomorrow.",
             "google_calendar",
-            "clarify",
+            "create_calendar_event_proposal",
         ),
         (
             "Schedule a meeting today at 11 PM.",
             "google_calendar",
-            "clarify",
+            "create_calendar_event_proposal",
         ),
         (
             "Book an appointment in my calendar tomorrow at 9 AM.",
             "google_calendar",
-            "clarify",
+            "create_calendar_event_proposal",
+        ),
+        (
+            "What is on my Google Calendar today?",
+            "google_calendar",
+            "get_today_schedule",
         ),
         (
             "Show my calendar this month.",
             "google_calendar",
             "list_calendar_events",
+        ),
+        (
+            "Show my Google Calendar this month.",
+            "google_calendar",
+            "list_calendar_events",
+        ),
+        (
+            "What meetings do I have tomorrow?",
+            "google_calendar",
+            "get_calendar_schedule",
+        ),
+        (
+            "Find my events for next week.",
+            "google_calendar",
+            "get_calendar_schedule",
+        ),
+        (
+            "Am I free tomorrow between 2 PM and 4 PM?",
+            "google_calendar",
+            "check_calendar_availability",
+        ),
+        (
+            "Show details of my next meeting.",
+            "google_calendar",
+            "list_calendar_events",
+        ),
+        (
+            "Move my meeting to tomorrow.",
+            "google_calendar",
+            "update_calendar_event_proposal",
+        ),
+        (
+            "Delete my calendar event.",
+            "google_calendar",
+            "delete_calendar_event_proposal",
         ),
         ("Search my emails.", "gmail", "search_emails"),
         ("Find emails from Google.", "gmail", "search_emails"),
@@ -162,6 +202,13 @@ def test_calendar_and_gmail_requests_route_to_their_service():
         if expected_route == "google_calendar":
             assert routed["gmail_plan"]["calendar_tool"] == expected_tool
             assert routed["gmail_plan"]["intent"] == "google_calendar"
+            if text == "Show details of my next meeting.":
+                assert routed["gmail_plan"]["calendar_arguments"]["max_results"] == 10
+                assert routed["gmail_plan"]["calendar_arguments"]["time_min"] == (
+                    "2026-11-04T09:00:00-08:00"
+                )
+            if text == "Am I free tomorrow between 2 PM and 4 PM?":
+                assert routed["gmail_plan"]["calendar_arguments"]["time_zone"] == "America/Los_Angeles"
         else:
             assert routed["gmail_plan"]["intent"] == expected_tool
 
@@ -180,15 +227,88 @@ def test_calendar_create_request_is_never_sent_to_gmail_or_claimed_successful():
             **_state(text),
             "gmail_plan": routed["gmail_plan"],
         },
-        SimpleNamespace(context={}),
+        SimpleNamespace(context={
+            "calendar_enabled": True,
+            "google_connection_available": True,
+        }),
     )["assistant_response"]
 
     assert routed["assistant_route"] == "google_calendar"
-    assert routed["gmail_plan"]["calendar_tool"] == "clarify"
-    assert "Calendar changes are not available" in response
-    assert "I have not created or modified anything" in response
+    assert routed["gmail_plan"]["calendar_tool"] == "create_calendar_event_proposal"
+    assert response == (
+        "I can read your Google Calendar, but creating events is currently "
+        "unavailable. I haven't created or modified anything."
+    )
     assert "created successfully" not in response.casefold()
     assert "gmail_search" not in str(routed["gmail_plan"])
+
+
+def test_calendar_create_intents_short_circuit_without_requesting_more_details():
+    cases = (
+        "Add a meeting to my calendar today at 11 PM.",
+        "Create a calendar event.",
+        "Book an appointment in my calendar.",
+    )
+    for text in cases:
+        routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+            text,
+            user_timezone="Asia/Kolkata",
+            request_time=datetime(
+                2026, 11, 6, 14, 30, tzinfo=ZoneInfo("UTC")
+            ),
+        ))
+        result = calendar_agent_node(
+            {
+                **_state(text),
+                "gmail_plan": routed["gmail_plan"],
+                "assistant_capabilities": {
+                    "google_calendar": {
+                        "write_execution_available": False,
+                    },
+                },
+            },
+            SimpleNamespace(context={
+                "calendar_enabled": True,
+                "google_connection_available": True,
+            }),
+        )
+
+        assert routed["assistant_route"] == "google_calendar"
+        assert routed["gmail_plan"]["calendar_tool"] == (
+            "create_calendar_event_proposal"
+        )
+        assert result["assistant_response"] == (
+            "I can read your Google Calendar, but creating events is "
+            "currently unavailable. I haven't created or modified anything."
+        )
+        assert "calendar_create_event_proposal" not in result
+
+
+def test_calendar_create_request_when_disconnected_reports_connection_state():
+    text = "Add a meeting to my calendar today at 11 PM."
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        text,
+        user_timezone="Asia/Kolkata",
+        request_time=datetime(
+            2026, 11, 6, 14, 30, tzinfo=ZoneInfo("UTC")
+        ),
+    ))
+    result = calendar_agent_node(
+        {
+            **_state(text),
+            "gmail_plan": routed["gmail_plan"],
+        },
+        SimpleNamespace(context={
+            "calendar_enabled": True,
+            "google_connection_available": False,
+        }),
+    )
+    assert routed["assistant_route"] == "google_calendar"
+    assert result["assistant_response"] == (
+        "Google Calendar is not connected. Connect a Google account in "
+        "Connected Apps. No event was created."
+    )
+    assert "calendar_create_event_proposal" not in result
 
 
 def test_calendar_month_plan_uses_request_time_and_selected_timezone():
@@ -289,6 +409,12 @@ def test_calendar_tools_are_reported_when_scopes_and_route_are_available():
         "selected_freebusy_scope_missing": False,
         "write_permission_granted": False,
         "write_execution_available": False,
+        "create_execution_available": False,
+        "update_execution_available": False,
+        "delete_execution_available": False,
+        "create_feature_enabled": False,
+        "update_feature_enabled": False,
+        "delete_feature_enabled": False,
         "write_available": False,
     }
     assert "read-only event search" in result["assistant_response"]
@@ -622,12 +748,16 @@ def test_llm_calendar_plans_validate_as_strict_tool_intents():
     assert plan.calendar_arguments["period"] == "week"
 
 
-def test_calendar_changes_are_never_planned_as_read_operations():
-    routed = gmail_agent_nodes.gmail_intent_router_node(
-        _state("Schedule a meeting with John tomorrow.")
+def test_calendar_changes_route_to_approval_proposals_never_read_operations():
+    cases = (
+        ("Move my meeting to tomorrow.", "update_calendar_event_proposal"),
+        ("Delete my calendar event.", "delete_calendar_event_proposal"),
+        ("Update my calendar meeting.", "update_calendar_event_proposal"),
     )
-    assert routed["assistant_route"] == "google_calendar"
-    assert routed["gmail_plan"]["calendar_tool"] == "clarify"
+    for text, expected_tool in cases:
+        routed = gmail_agent_nodes.gmail_intent_router_node(_state(text))
+        assert routed["assistant_route"] == "google_calendar"
+        assert routed["gmail_plan"]["calendar_tool"] == expected_tool
 
 
 def test_calendar_create_reaches_llm_planner_only_with_write_capability(
