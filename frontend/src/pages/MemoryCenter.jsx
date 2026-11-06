@@ -1,5 +1,10 @@
 
-import { useMemo, useState } from 'react'
+import {
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { useOutletContext } from 'react-router-dom'
 import {
   useMutation,
@@ -10,7 +15,14 @@ import {
 import { useAuth } from '../context/AuthContext'
 import MemorySettingControl from '../components/MemorySettingControl.jsx'
 import { memoryService } from '../services/memoryService'
-import { api } from '../lib/api.js'
+import {
+  api,
+  getApiAuthRevision,
+} from '../lib/api.js'
+import {
+  memoryReviewQueryKey,
+  memoryReviewQueryPrefix,
+} from '../lib/queryKeys'
 
 
 const MEMORY_TYPES = [
@@ -26,8 +38,49 @@ export default function MemoryCenter() {
   const { user } = useAuth()
   const userId = user?.id
 
-  const { isDark } = useOutletContext()
+  return (
+    <MemoryCenterContent
+      key={userId || 'signed-out'}
+      userId={userId}
+    />
+  )
+}
 
+function MemoryCenterContent({ userId }) {
+  const scopeActiveRef = useRef(true)
+
+  function isCurrentUserScope(scopeUserId) {
+    return scopeActiveRef.current && scopeUserId === userId
+  }
+
+  function createMutationAuthContext() {
+    return Object.freeze({
+      userId,
+      authRevision: getApiAuthRevision(),
+    })
+  }
+
+  function assertCurrentMutationAuthContext(authContext) {
+    if (
+      !isCurrentUserScope(authContext?.userId) ||
+      authContext.authRevision !== getApiAuthRevision()
+    ) {
+      const error = new Error(
+        'Your account changed while the request was starting. Please try again.',
+      )
+      error.code = 'AUTH_SESSION_CHANGED'
+      throw error
+    }
+  }
+
+  useLayoutEffect(() => {
+    scopeActiveRef.current = true
+    return () => {
+      scopeActiveRef.current = false
+    }
+  }, [])
+
+  const { isDark } = useOutletContext()
   const queryClient = useQueryClient()
 
   // --------------------------------------------------
@@ -64,11 +117,7 @@ export default function MemoryCenter() {
 
   const memoriesKey = ['memories', userId, 'all']
 
-  const reviewsKey = [
-    'memory-reviews',
-    userId,
-    'pending',
-  ]
+  const reviewsKey = memoryReviewQueryKey(userId, 50)
 
   const settingsKey = [
     'user-settings',
@@ -93,7 +142,6 @@ export default function MemoryCenter() {
     importance: 5,
     confidence: 0.9,
   })
-
   // --------------------------------------------------
   // 1. Memories query
   // --------------------------------------------------
@@ -177,18 +225,24 @@ export default function MemoryCenter() {
   // --------------------------------------------------
 
   const saveMutation = useMutation({
-    mutationFn: async ({ memoryId, payload }) => {
+    mutationFn: async ({ memoryId, payload, authContext }) => {
+      assertCurrentMutationAuthContext(authContext)
       if (memoryId) {
         return memoryService.updateMemory(
           memoryId,
-          payload
+          payload,
+          authContext,
         )
       }
 
-      return memoryService.createMemory(payload)
+      return memoryService.createMemory(payload, authContext)
     },
 
-    onSuccess: () => {
+    onSuccess: (_, variables) => {
+      if (!isCurrentUserScope(
+        variables.requestUserId,
+      )) return
+
       setShowForm(false)
       setEditingMemory(null)
 
@@ -202,71 +256,98 @@ export default function MemoryCenter() {
       // Dashboard's long-term memory query shares this prefix.
     },
 
-    onError: (err) => {
+    onError: (err, variables) => {
+      if (!isCurrentUserScope(
+        variables.requestUserId,
+      )) return
       setError(
         err.message || 'Unable to save memory.'
       )
     },
   })
 
-  const saving = saveMutation.isPending
+  const saving = saveMutation.isPending &&
+    saveMutation.variables?.requestUserId === userId
 
   // --------------------------------------------------
   // 6. Delete memory mutation
   // --------------------------------------------------
 
   const deleteMutation = useMutation({
-    mutationFn: (memoryId) =>
-      memoryService.deleteMemory(memoryId),
+    mutationFn: ({ memoryId, authContext }) => {
+      assertCurrentMutationAuthContext(authContext)
+      return memoryService.deleteMemory(memoryId, authContext)
+    },
 
-    onSuccess: () => {
+    onSuccess: (_, variables) => {
+      if (!isCurrentUserScope(
+        variables.requestUserId,
+      )) return
       setError('')
 
       queryClient.invalidateQueries({
-        queryKey: ['memories', userId],
+        queryKey: ['memories', variables.requestUserId],
       })
     },
 
-    onError: (err) => {
+    onError: (err, variables) => {
+      if (!isCurrentUserScope(
+        variables.requestUserId,
+      )) return
       setError(
         err.message || 'Unable to delete memory.'
       )
     },
   })
+  const deleteIsPending = deleteMutation.isPending &&
+    deleteMutation.variables?.requestUserId === userId
 
   // --------------------------------------------------
   // 7. Automatic memory setting mutation
   // --------------------------------------------------
 
   const settingsMutation = useMutation({
-    mutationFn: (nextValue) =>
-      api.patch('/api/v1/me/settings', {
+    mutationFn: ({ nextValue, authContext }) => {
+      assertCurrentMutationAuthContext(authContext)
+      return api.patch('/api/v1/me/settings', {
         memory_enabled: nextValue,
-      }),
+      }, authContext)
+    },
 
-    onMutate: async (nextValue) => {
+    onMutate: async (variables) => {
+      const mutationSettingsKey = [
+        'user-settings',
+        variables.requestUserId,
+      ]
       await queryClient.cancelQueries({
-        queryKey: settingsKey,
+        queryKey: mutationSettingsKey,
       })
 
       const previousSettings =
-        queryClient.getQueryData(settingsKey)
+        queryClient.getQueryData(mutationSettingsKey)
 
-      queryClient.setQueryData(
-        settingsKey,
-        (current) => ({
-          ...(current || {}),
-          memory_enabled: nextValue,
-        })
-      )
+      if (isCurrentUserScope(
+        variables.requestUserId,
+      )) {
+        queryClient.setQueryData(
+          mutationSettingsKey,
+          (current) => ({
+            ...(current || {}),
+            memory_enabled: variables.nextValue,
+          })
+        )
+      }
 
-      return { previousSettings }
+      return { previousSettings, mutationSettingsKey }
     },
 
-    onError: (err, nextValue, context) => {
+    onError: (err, variables, context) => {
+      if (!isCurrentUserScope(
+        variables.requestUserId,
+      )) return
       if (context?.previousSettings) {
         queryClient.setQueryData(
-          settingsKey,
+          context.mutationSettingsKey,
           context.previousSettings
         )
       }
@@ -276,50 +357,68 @@ export default function MemoryCenter() {
       )
     },
 
-    onSuccess: (updatedSettings) => {
+    onSuccess: (updatedSettings, variables, context) => {
+      if (!isCurrentUserScope(
+        variables.requestUserId,
+      )) return
       queryClient.setQueryData(
-        settingsKey,
+        context.mutationSettingsKey,
         updatedSettings
       )
 
       setError('')
     },
 
-    onSettled: () => {
+    onSettled: (_data, _error, variables, context) => {
+      if (!isCurrentUserScope(
+        variables.requestUserId,
+      )) return
       queryClient.invalidateQueries({
-        queryKey: settingsKey,
+        queryKey: context.mutationSettingsKey,
       })
     },
   })
+  const settingsUpdating = settingsMutation.isPending &&
+    settingsMutation.variables?.requestUserId === userId
 
   // --------------------------------------------------
   // 8. Accept / Reject review mutation
   // --------------------------------------------------
 
   const reviewMutation = useMutation({
-    mutationFn: ({ reviewId, action }) =>
-      api.post(
+    mutationFn: ({ reviewId, action, authContext }) => {
+      assertCurrentMutationAuthContext(authContext)
+      return api.post(
         `/api/v1/memory-reviews/${reviewId}/${action}`,
-        {}
-      ),
+        {},
+        {},
+        authContext,
+      )
+    },
 
     onSuccess: (_, variables) => {
+      if (!isCurrentUserScope(
+        variables.requestUserId,
+      )) return
       setError('')
 
       // Refresh pending reviews.
       queryClient.invalidateQueries({
-        queryKey: reviewsKey,
+        queryKey: memoryReviewQueryPrefix(variables.requestUserId),
       })
 
       // Accepting a review may update an existing memory.
       if (variables.action === 'accept') {
         queryClient.invalidateQueries({
-          queryKey: ['memories', userId],
+          queryKey: ['memories', variables.requestUserId],
         })
       }
     },
 
     onError: (err, variables) => {
+      if (!isCurrentUserScope(
+        variables.requestUserId,
+      )) return
       const actionLabel =
         variables.action === 'accept'
           ? 'accept'
@@ -332,7 +431,9 @@ export default function MemoryCenter() {
     },
   })
 
-  const reviewActionId = reviewMutation.isPending
+  const reviewIsPending = reviewMutation.isPending &&
+    reviewMutation.variables?.requestUserId === userId
+  const reviewActionId = reviewIsPending
     ? reviewMutation.variables?.reviewId
     : null
 
@@ -398,12 +499,18 @@ export default function MemoryCenter() {
   async function handleSave(event) {
     event.preventDefault()
 
-    if (!form.content.trim() || saving) return
+    if (
+      !isCurrentUserScope(userId) ||
+      !form.content.trim() ||
+      saving
+    ) return
 
     setError('')
 
     await saveMutation.mutateAsync({
       memoryId: editingMemory?.id || null,
+      requestUserId: userId,
+      authContext: createMutationAuthContext(),
 
       payload: {
         ...form,
@@ -421,13 +528,19 @@ export default function MemoryCenter() {
       'Are you sure you want to delete this memory?'
     )
 
-    if (!confirmed || deleteMutation.isPending) return
+    if (
+      !confirmed ||
+      deleteIsPending ||
+      !isCurrentUserScope(userId)
+    ) return
 
     setError('')
 
-    await deleteMutation.mutateAsync(
-      memory.id
-    ).catch(() => {})
+    await deleteMutation.mutateAsync({
+      memoryId: memory.id,
+      requestUserId: userId,
+      authContext: createMutationAuthContext(),
+    }).catch(() => {})
   }
 
   // --------------------------------------------------
@@ -435,11 +548,18 @@ export default function MemoryCenter() {
   // --------------------------------------------------
 
   function handleMemoryToggle(nextValue) {
-    if (settingsMutation.isPending) return
+    if (
+      settingsUpdating ||
+      !isCurrentUserScope(userId)
+    ) return
 
     setError('')
 
-    settingsMutation.mutate(nextValue)
+    settingsMutation.mutate({
+      nextValue,
+      requestUserId: userId,
+      authContext: createMutationAuthContext(),
+    })
   }
 
   // --------------------------------------------------
@@ -454,13 +574,19 @@ export default function MemoryCenter() {
       `Are you sure you want to ${actionLabel} this memory suggestion?`
     )
 
-    if (!confirmed || reviewMutation.isPending) return
+    if (
+      !confirmed ||
+      reviewIsPending ||
+      !isCurrentUserScope(userId)
+    ) return
 
     setError('')
 
     await reviewMutation.mutateAsync({
       reviewId: review.id,
       action,
+      requestUserId: userId,
+      authContext: createMutationAuthContext(),
     }).catch(() => {})
   }
 
@@ -488,7 +614,7 @@ export default function MemoryCenter() {
 
   function refreshReviews() {
     return queryClient.invalidateQueries({
-      queryKey: reviewsKey,
+      queryKey: memoryReviewQueryPrefix(userId),
     })
   }
 
@@ -555,7 +681,7 @@ export default function MemoryCenter() {
             checked={memoryEnabled}
             disabled={
               settingsQuery.isPending ||
-              settingsMutation.isPending
+              settingsUpdating
             }
             isDark={isDark}
             onChange={handleMemoryToggle}
@@ -716,7 +842,7 @@ export default function MemoryCenter() {
                 <div className="mt-4 flex flex-wrap justify-end gap-3">
                   <button
                     onClick={() => handleReviewAction(review, 'reject')}
-                    disabled={reviewMutation.isPending}
+                    disabled={reviewIsPending}
                     className="rounded-xl border border-red-500/30 px-4 py-2 text-sm font-medium text-red-500 transition hover:bg-red-500/10 disabled:opacity-50"
                   >
                     {reviewActionId === review.id
@@ -726,7 +852,7 @@ export default function MemoryCenter() {
 
                   <button
                     onClick={() => handleReviewAction(review, 'accept')}
-                    disabled={reviewMutation.isPending}
+                    disabled={reviewIsPending}
                     className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-500 disabled:opacity-50"
                   >
                     {reviewActionId === review.id
@@ -839,11 +965,11 @@ export default function MemoryCenter() {
 
                     <button
                       onClick={() => handleDelete(memory)}
-                      disabled={deleteMutation.isPending}
+                      disabled={deleteIsPending}
                       className="text-sm text-red-500 hover:text-red-400 disabled:opacity-50"
                     >
-                      {deleteMutation.isPending &&
-                      deleteMutation.variables === memory.id
+                      {deleteIsPending &&
+                      deleteMutation.variables?.memoryId === memory.id
                         ? 'Deleting...'
                         : 'Delete'}
                     </button>

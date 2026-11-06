@@ -244,14 +244,21 @@ class CalendarService:
 
     @classmethod
     def _normalize_event(cls, raw: Any) -> dict[str, Any]:
-        if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
+        if (
+            not isinstance(raw, dict)
+            or not isinstance(raw.get("id"), str)
+            or not raw["id"].strip()
+        ):
             raise GoogleAPIError(
                 status_code=502,
                 message="Google Calendar returned an invalid event.",
             )
 
-        attendees = raw.get("attendees") or []
-        if not isinstance(attendees, list):
+        attendees = raw.get("attendees", [])
+        if (
+            not isinstance(attendees, list)
+            or any(not isinstance(attendee, dict) for attendee in attendees)
+        ):
             raise GoogleAPIError(
                 status_code=502,
                 message="Google Calendar returned invalid event attendees.",
@@ -265,10 +272,17 @@ class CalendarService:
                 "organizer": attendee.get("organizer"),
             }
             for attendee in attendees
-            if isinstance(attendee, dict)
         ]
 
         recurrence = raw.get("recurrence")
+        if recurrence is not None and (
+            not isinstance(recurrence, list)
+            or any(not isinstance(rule, str) for rule in recurrence)
+        ):
+            raise GoogleAPIError(
+                status_code=502,
+                message="Google Calendar returned invalid event recurrence.",
+            )
         return {
             "id": raw["id"],
             "summary": raw.get("summary"),
@@ -356,7 +370,13 @@ class CalendarService:
             endpoint=endpoint,
             params=params,
         )
-        raw_events = result.get("items") or []
+        if not isinstance(result, dict):
+            raise GoogleAPIError(
+                status_code=502,
+                message="Google Calendar returned an invalid event list.",
+            )
+
+        raw_events = result.get("items", [])
         if not isinstance(raw_events, list):
             raise GoogleAPIError(
                 status_code=502,
@@ -367,6 +387,29 @@ class CalendarService:
                 status_code=502,
                 message="Google Calendar returned an invalid event list.",
             )
+
+        next_page_token = result.get("nextPageToken")
+        if "nextPageToken" in result and (
+            not isinstance(next_page_token, str)
+            or not next_page_token
+            or len(next_page_token) > self.MAX_PAGE_TOKEN_LENGTH
+            or any(ord(char) < 32 for char in next_page_token)
+        ):
+            raise GoogleAPIError(
+                status_code=502,
+                message="Google Calendar returned invalid pagination metadata.",
+            )
+
+        response_time_zone = result.get("timeZone")
+        if "timeZone" in result:
+            try:
+                self._validate_time_zone(response_time_zone)
+            except ValueError as exc:
+                raise GoogleAPIError(
+                    status_code=502,
+                    message="Google Calendar returned invalid event timezone.",
+                ) from exc
+
         events = [self._normalize_event(event) for event in raw_events]
         if attendee:
             normalized_attendee = attendee.strip().casefold()
@@ -382,8 +425,8 @@ class CalendarService:
         return {
             "calendar_id": calendar_id,
             "events": events,
-            "next_page_token": result.get("nextPageToken"),
-            "time_zone": result.get("timeZone") or time_zone,
+            "next_page_token": next_page_token,
+            "time_zone": response_time_zone or time_zone,
         }
 
     async def get_event(

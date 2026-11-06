@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import { Outlet, Route, Routes, MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -97,6 +103,41 @@ describe('Connected Apps', () => {
       expect(screen.getByRole('img', { name: new RegExp(`${service} logo`, 'i') }))
         .toBeInTheDocument()
     }
+  })
+
+  it('shows disconnected states for a fresh user with no Google account', async () => {
+    renderConnectors()
+
+    const connectButton = await screen.findByRole('button', {
+      name: 'Connect Gmail',
+    })
+    await waitFor(() => expect(connectButton).toBeEnabled())
+    await waitFor(() => {
+      expect(screen.queryAllByText('Checking connection...'))
+        .toHaveLength(0)
+    })
+    const services = screen
+      .getByRole('heading', { name: 'Google Services' })
+      .closest('section')
+    const [gmailCard, calendarCard] = within(services).getAllByRole('article')
+    expect(within(gmailCard).getByText('Not connected'))
+      .toBeInTheDocument()
+    expect(within(calendarCard).getByText('Not connected'))
+      .toBeInTheDocument()
+  })
+
+  it('allows retry after the connections request fails', async () => {
+    api.get
+      .mockRejectedValueOnce(new Error('API temporarily unavailable'))
+      .mockResolvedValueOnce(connectedResponse([]))
+    renderConnectors()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+
+    await screen.findByRole('button', { name: 'Connect Gmail' })
+    expect(api.get).toHaveBeenCalledTimes(2)
+    expect(screen.queryByText('Checking connection...'))
+      .not.toBeInTheDocument()
   })
 
   it('requests Gmail scopes independently', async () => {

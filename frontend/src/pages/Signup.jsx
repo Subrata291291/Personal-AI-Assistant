@@ -5,6 +5,7 @@ import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { getOAuthRedirectTo } from '../lib/authRedirect'
 import { supabase } from '../lib/supabase'
+import { withAuthTimeout } from '../lib/requestTimeout'
 
 function Signup() {
   const { signUp } = useAuth()
@@ -66,12 +67,15 @@ function Signup() {
     setGoogleLoading(true)
 
     try {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: getOAuthRedirectTo(),
-        },
-      })
+      const { error } = await withAuthTimeout(
+        supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: getOAuthRedirectTo(),
+          },
+        }),
+        'Google sign-up',
+      )
 
       if (error) throw error
     } catch (error) {
@@ -79,6 +83,7 @@ function Signup() {
         type: 'error',
         text: error.message || 'Google sign-up failed.',
       })
+    } finally {
       setGoogleLoading(false)
     }
   }

@@ -13,6 +13,7 @@ import {
 import { api } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import GoogleServiceIcon from '../components/GoogleServiceIcon'
+import { requireConnectionsResponse } from '../lib/responseValidation'
 
 const GC_TIME = 30 * 60 * 1000
 
@@ -106,8 +107,10 @@ function Connectors() {
   const connectionsQuery = useQuery({
     queryKey: CONNECTIONS_KEY(userId),
 
-    queryFn: () =>
-      api.get('/api/v1/oauth/connections'),
+    queryFn: async () =>
+      requireConnectionsResponse(
+        await api.get('/api/v1/oauth/connections'),
+      ),
 
     enabled: Boolean(userId),
 

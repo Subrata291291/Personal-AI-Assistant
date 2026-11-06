@@ -28,17 +28,17 @@ export const memoryService = {
   },
 
   // Create a new memory
-  async createMemory(memoryData) {
-    return api.post(BASE_PATH, memoryData)
+  async createMemory(memoryData, authContext) {
+    return api.post(BASE_PATH, memoryData, {}, authContext)
   },
 
   // Update an existing memory
-  async updateMemory(memoryId, updates) {
-    return api.patch(`${BASE_PATH}/${memoryId}`, updates)
+  async updateMemory(memoryId, updates, authContext) {
+    return api.patch(`${BASE_PATH}/${memoryId}`, updates, authContext)
   },
 
   // Delete a memory
-  async deleteMemory(memoryId) {
-    return api.delete(`${BASE_PATH}/${memoryId}`)
+  async deleteMemory(memoryId, authContext) {
+    return api.delete(`${BASE_PATH}/${memoryId}`, authContext)
   },
 }

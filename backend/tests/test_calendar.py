@@ -214,6 +214,131 @@ def test_event_list_uses_primary_calendar_range_search_and_pagination():
     assert result["time_zone"] == "America/Los_Angeles"
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"items": []},
+        {},
+    ],
+)
+def test_event_list_accepts_valid_empty_responses(response):
+    service, _ = make_service()
+
+    async def fake_google_get(**_kwargs):
+        return response
+
+    service._google_get = fake_google_get
+    result = asyncio.run(service.list_events(USER_ID, CONNECTION_ID))
+
+    assert result["events"] == []
+    assert result["next_page_token"] is None
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        None,
+        False,
+        0,
+        {},
+        "not-an-event-list",
+    ],
+)
+def test_event_list_rejects_malformed_items_types(items):
+    service, _ = make_service()
+
+    async def fake_google_get(**_kwargs):
+        return {"items": items}
+
+    service._google_get = fake_google_get
+    with pytest.raises(
+        GoogleAPIError,
+        match="invalid event list",
+    ) as error:
+        asyncio.run(service.list_events(USER_ID, CONNECTION_ID))
+
+    assert error.value.status_code == 502
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        None,
+        "not-an-event",
+        {},
+        {"id": ""},
+        {"id": "event-1", "attendees": [None]},
+        {"id": "event-1", "recurrence": [1]},
+    ],
+)
+def test_event_list_rejects_malformed_event_entries(event):
+    service, _ = make_service()
+
+    async def fake_google_get(**_kwargs):
+        return {"items": [event]}
+
+    service._google_get = fake_google_get
+    with pytest.raises(GoogleAPIError) as error:
+        asyncio.run(service.list_events(USER_ID, CONNECTION_ID))
+
+    assert error.value.status_code == 502
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        None,
+        "",
+        123,
+        "bad\ntoken",
+        "x" * (CalendarService.MAX_PAGE_TOKEN_LENGTH + 1),
+    ],
+)
+def test_event_list_rejects_malformed_pagination_metadata(token):
+    service, _ = make_service()
+
+    async def fake_google_get(**_kwargs):
+        return {"items": [], "nextPageToken": token}
+
+    service._google_get = fake_google_get
+    with pytest.raises(
+        GoogleAPIError,
+        match="invalid pagination metadata",
+    ) as error:
+        asyncio.run(service.list_events(USER_ID, CONNECTION_ID))
+
+    assert error.value.status_code == 502
+
+
+def test_event_list_rejects_non_object_response_envelopes():
+    service, _ = make_service()
+
+    async def fake_google_get(**_kwargs):
+        return []
+
+    service._google_get = fake_google_get
+    with pytest.raises(GoogleAPIError, match="invalid event list") as error:
+        asyncio.run(service.list_events(USER_ID, CONNECTION_ID))
+
+    assert error.value.status_code == 502
+
+
+def test_event_list_rejects_invalid_response_timezone():
+    service, _ = make_service()
+
+    async def fake_google_get(**_kwargs):
+        return {"items": [], "timeZone": "not/a-time-zone"}
+
+    service._google_get = fake_google_get
+    with pytest.raises(
+        GoogleAPIError,
+        match="invalid event timezone",
+    ) as error:
+        asyncio.run(service.list_events(USER_ID, CONNECTION_ID))
+
+    assert error.value.status_code == 502
+
+
 def test_event_detail_encodes_ids_and_normalizes_recurring_event():
     service, _ = make_service()
     request = {}

@@ -3,6 +3,45 @@ import { api } from '../lib/api.js'
 
 const BASE_PATH = '/api/v1/gmail'
 
+function requireMessageListResponse(response) {
+  const isOptionalString = (value) =>
+    value === null || typeof value === 'string'
+  const validMessage = (message) =>
+    message !== null &&
+    typeof message === 'object' &&
+    typeof message.id === 'string' &&
+    message.id.trim().length > 0 &&
+    typeof message.snippet === 'string' &&
+    isOptionalString(message.thread_id) &&
+    isOptionalString(message.sender) &&
+    isOptionalString(message.recipient) &&
+    isOptionalString(message.subject) &&
+    isOptionalString(message.internal_date) &&
+    isOptionalString(message.date) &&
+    Array.isArray(message.labels) &&
+    message.labels.every((label) => typeof label === 'string')
+
+  if (
+    response === null ||
+    typeof response !== 'object' ||
+    !Array.isArray(response.messages) ||
+    !response.messages.every(validMessage) ||
+    !Number.isInteger(response.result_size_estimate) ||
+    response.result_size_estimate < 0 ||
+    !(
+      response.next_page_token === null ||
+      (
+        typeof response.next_page_token === 'string' &&
+        response.next_page_token.trim().length > 0
+      )
+    )
+  ) {
+    throw new Error('Gmail returned an invalid message list response.')
+  }
+
+  return response
+}
+
 export const gmailService = {
   async getMessages({
     connectionId,
@@ -24,7 +63,10 @@ export const gmailService = {
     if (pageToken) params.set('page_token', pageToken)
     if (query?.trim()) params.set('query', query.trim())
 
-    return api.get(`${BASE_PATH}/messages?${params.toString()}`)
+    const response = await api.get(
+      `${BASE_PATH}/messages?${params.toString()}`,
+    )
+    return requireMessageListResponse(response)
   },
 
   async getMessage({ connectionId, messageId }) {

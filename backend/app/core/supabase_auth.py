@@ -1,4 +1,5 @@
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -6,6 +7,24 @@ import httpx
 from fastapi import HTTPException, status
 
 from app.core.config import settings
+
+
+def _has_verified_email(user: dict[str, Any]) -> bool:
+    email = user.get("email")
+    confirmed_at = user.get("email_confirmed_at")
+    if not isinstance(email, str) or not email.strip():
+        return False
+    if not isinstance(confirmed_at, str) or not confirmed_at.strip():
+        return False
+
+    try:
+        timestamp = datetime.fromisoformat(
+            confirmed_at.strip().replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+
+    return timestamp.tzinfo is not None and timestamp.utcoffset() is not None
 
 
 async def verify_supabase_token(token: str) -> dict[str, Any]:
@@ -77,6 +96,12 @@ async def verify_supabase_token(token: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid user information returned by authentication service.",
+        )
+
+    if not _has_verified_email(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account email verification is required.",
         )
 
     return {

@@ -55,6 +55,65 @@ const message = {
   labels: ['INBOX', 'UNREAD'],
 }
 
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+function configureDraftApproval(executeOperation) {
+  const proposal = {
+    proposal_id: 'proposal-escape-test',
+    status: 'pending',
+    parameters: {
+      to: ['recipient@example.com'],
+      cc: [],
+      bcc: [],
+      subject: 'Draft subject',
+      body: 'Draft body',
+    },
+  }
+  api.get.mockResolvedValue({
+    connections: [{
+      id: 'connection-1',
+      provider: 'google',
+      status: 'connected',
+      email: 'user@example.com',
+    }],
+  })
+  api.post.mockImplementation((url) => {
+    if (url.endsWith('/approve')) {
+      return Promise.resolve({
+        proposal: { ...proposal, status: 'approved' },
+      })
+    }
+    if (url.endsWith('/execute')) return executeOperation()
+    if (url.includes('/gmail-drafts/')) {
+      return Promise.resolve({ proposal })
+    }
+    return Promise.resolve({
+      authorization_url: 'https://accounts.google.com/',
+    })
+  })
+  gmailService.getMessages.mockResolvedValue({
+    messages: [{ ...message, labels: ['DRAFT'] }],
+    next_page_token: null,
+  })
+  gmailService.getMessage.mockResolvedValue({
+    message: {
+      ...message,
+      labels: ['DRAFT'],
+      headers: { to: 'recipient@example.com', subject: 'Draft subject' },
+      body: { plain_text: 'Draft body' },
+      attachments: [],
+    },
+  })
+}
+
 function GmailLayout() {
   return <Outlet context={{ isDark: false }} />
 }
@@ -149,6 +208,104 @@ describe('Gmail archive flow', () => {
       minute: '2-digit',
       second: '2-digit',
     }))).toBeInTheDocument()
+  })
+
+  it('loads ten messages initially and uses the next page token', async () => {
+    gmailService.getMessages.mockImplementation(async ({ pageToken }) => ({
+      messages: [message],
+      next_page_token: pageToken ? null : 'next-page',
+    }))
+    renderGmail()
+
+    await waitFor(() => {
+      expect(gmailService.getMessages).toHaveBeenCalledWith({
+        connectionId: 'connection-1',
+        maxResults: 10,
+        pageToken: undefined,
+        query: '',
+        folder: 'inbox',
+      })
+    })
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Load more emails',
+    }))
+
+    await waitFor(() => {
+      expect(gmailService.getMessages).toHaveBeenLastCalledWith({
+        connectionId: 'connection-1',
+        maxResults: 10,
+        pageToken: 'next-page',
+        query: '',
+        folder: 'inbox',
+      })
+    })
+  })
+
+  it('shows malformed message-list responses as errors, not empty inboxes', async () => {
+    gmailService.getMessages.mockRejectedValue(
+      new Error('Gmail returned an invalid message list response.'),
+    )
+    renderGmail()
+
+    expect(await screen.findByText(
+      'Gmail returned an invalid message list response.',
+    )).toBeInTheDocument()
+    expect(screen.queryByText('No messages found')).not.toBeInTheDocument()
+  })
+
+  it('preserves selected folder and search query when loading a page', async () => {
+    gmailService.getMessages.mockImplementation(async ({ pageToken }) => ({
+      messages: [message],
+      next_page_token: pageToken ? null : 'search-page',
+    }))
+    renderGmail()
+
+    fireEvent.click(
+      within(await screen.findByRole('navigation', { name: 'Gmail folders' }))
+        .getByRole('button', { name: /Sent/ }),
+    )
+    await waitFor(() => {
+      expect(gmailService.getMessages).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          maxResults: 10,
+          pageToken: undefined,
+          query: '',
+          folder: 'sent',
+        }),
+      )
+    })
+
+    fireEvent.change(screen.getByPlaceholderText('Search in Sent...'), {
+      target: { value: 'from:sender@example.com' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+
+    await waitFor(() => {
+      expect(gmailService.getMessages).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          maxResults: 10,
+          pageToken: undefined,
+          query: 'from:sender@example.com',
+          folder: 'sent',
+        }),
+      )
+    })
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Load more emails',
+    }))
+
+    await waitFor(() => {
+      expect(gmailService.getMessages).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          maxResults: 10,
+          pageToken: 'search-page',
+          query: 'from:sender@example.com',
+          folder: 'sent',
+        }),
+      )
+    })
   })
 
   it('renders the shared sender avatar in every Gmail folder and search results', async () => {
@@ -814,6 +971,119 @@ describe('Gmail archive flow', () => {
       .not.toBeInTheDocument()
   })
 
+  it('keeps message details open when Escape is pressed during execution', async () => {
+    configureDraftApproval(() => new Promise(() => {}))
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Send approved draft',
+    }))
+
+    expect(await screen.findByText(
+      'Gmail is processing the approved draft. Do not retry.',
+    )).toBeInTheDocument()
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    expect(screen.getByRole('dialog', { name: 'Email Details' }))
+      .toBeInTheDocument()
+  })
+
+  it('keeps message details open when Escape is pressed after an uncertain send outcome', async () => {
+    configureDraftApproval(async () => {
+      throw new Error('Connection lost.')
+    })
+    renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Send approved draft',
+    }))
+
+    expect(await screen.findByText(
+      'The send outcome is uncertain. Check status to reconcile; do not retry.',
+    )).toBeInTheDocument()
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    expect(screen.getByRole('dialog', { name: 'Email Details' }))
+      .toBeInTheDocument()
+  })
+
+  it('closes message details on Escape when no approval blocks closing', async () => {
+    renderGmail()
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+
+    expect(screen.getByRole('dialog', { name: 'Email Details' }))
+      .toBeInTheDocument()
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('keeps one Escape listener across selection and approval changes and removes it on unmount', async () => {
+    const execution = deferred()
+    configureDraftApproval(() => execution.promise)
+    const activeKeydownListeners = new Set()
+    const originalAddListener = window.addEventListener
+    const originalRemoveListener = window.removeEventListener
+    const addListener = vi.spyOn(window, 'addEventListener')
+      .mockImplementation((type, listener, options) => {
+        if (type === 'keydown') activeKeydownListeners.add(listener)
+        return originalAddListener.call(window, type, listener, options)
+      })
+    const removeListener = vi.spyOn(window, 'removeEventListener')
+      .mockImplementation((type, listener, options) => {
+        if (type === 'keydown') activeKeydownListeners.delete(listener)
+        return originalRemoveListener.call(window, type, listener, options)
+      })
+    const view = renderGmail()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    await waitFor(() => expect(activeKeydownListeners.size).toBe(1))
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(activeKeydownListeners.size).toBe(0)
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open email: Quarterly update',
+    }))
+    await waitFor(() => expect(activeKeydownListeners.size).toBe(1))
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
+    await screen.findByRole('button', { name: 'Approve' })
+    expect(activeKeydownListeners.size).toBe(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Send approved draft',
+    }))
+    expect(await screen.findByText(
+      'Gmail is processing the approved draft. Do not retry.',
+    )).toBeInTheDocument()
+    await waitFor(() => expect(activeKeydownListeners.size).toBe(1))
+
+    view.unmount()
+    expect(activeKeydownListeners.size).toBe(0)
+    expect(addListener.mock.calls.filter(([type]) => type === 'keydown'))
+      .toHaveLength(removeListener.mock.calls.filter(
+        ([type]) => type === 'keydown',
+      ).length)
+  })
+
   it('clears cached emails and the selected account after disconnect', async () => {
     let disconnected = false
     api.get.mockImplementation(async () => ({
@@ -850,6 +1120,38 @@ describe('Gmail archive flow', () => {
     expect(screen.queryByText('Quarterly update')).not.toBeInTheDocument()
     expect(screen.queryByText('Connected: user@example.com'))
       .not.toBeInTheDocument()
+  })
+
+  it('resolves to the disconnected state for a fresh user', async () => {
+    api.get.mockResolvedValue({
+      connections: [],
+      calendar_capabilities: {},
+    })
+    renderGmail()
+
+    expect(await screen.findByText('Gmail is disconnected'))
+      .toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Connect Gmail' }))
+      .toHaveAttribute('href', '/dashboard/connectors')
+    expect(screen.queryByText('Checking connected accounts...'))
+      .not.toBeInTheDocument()
+    expect(gmailService.getMessages).not.toHaveBeenCalled()
+  })
+
+  it('shows connection lookup errors and retries without loading Gmail messages', async () => {
+    api.get
+      .mockRejectedValueOnce(new Error('API temporarily unavailable'))
+      .mockResolvedValueOnce({ connections: [] })
+    renderGmail()
+
+    expect(await screen.findAllByText('API temporarily unavailable'))
+      .not.toHaveLength(0)
+    fireEvent.click(screen.getAllByRole('button', { name: 'Retry' })[0])
+
+    expect(await screen.findByText('Gmail is disconnected'))
+      .toBeInTheDocument()
+    expect(gmailService.getMessages).not.toHaveBeenCalled()
+    expect(api.get).toHaveBeenCalledTimes(2)
   })
 
   it('keeps the Google account connected while Gmail is switched off', async () => {

@@ -2,6 +2,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -26,10 +27,49 @@ import { resolveAssistantGmailConnection } from '../services/gmailAccountSelecti
 import { conversationService } from '../services/conversationService.js'
 import { api } from '../lib/api.js'
 import AssistantMarkdown from '../components/AssistantMarkdown.jsx'
+import {
+  requireArrayResponse,
+  requireConnectionsResponse,
+} from '../lib/responseValidation'
 
 function Assistant() {
   const { user } = useAuth()
   const userId = user?.id
+  const [, setSearchParams] = useSearchParams()
+  const previousUserIdRef = useRef(userId)
+
+  useLayoutEffect(() => {
+    const previousUserId = previousUserIdRef.current
+    if (previousUserId && previousUserId !== userId) {
+      setSearchParams({}, { replace: true })
+    }
+    previousUserIdRef.current = userId
+  }, [setSearchParams, userId])
+
+  return (
+    <AssistantContent
+      key={userId || 'signed-out'}
+      user={user}
+    />
+  )
+}
+
+function AssistantContent({ user }) {
+  const userId = user?.id
+  const scopeActiveRef = useRef(true)
+
+  useLayoutEffect(() => {
+    scopeActiveRef.current = true
+    return () => {
+      scopeActiveRef.current = false
+    }
+  }, [])
+
+  const isCurrentUserScope = useCallback(
+    (scopeUserId) =>
+      scopeActiveRef.current && scopeUserId === userId,
+    [userId],
+  )
 
   const { isDark, muted, surface } = useOutletContext()
 
@@ -57,7 +97,10 @@ function Assistant() {
 
   const gmailConnectionsQuery = useQuery({
     queryKey: ['oauth-connections', userId],
-    queryFn: () => api.get('/api/v1/oauth/connections'),
+    queryFn: async () =>
+      requireConnectionsResponse(
+        await api.get('/api/v1/oauth/connections'),
+      ),
     enabled: Boolean(userId),
     staleTime: 5 * 60 * 1000,
     gcTime: 30 * 60 * 1000,
@@ -82,7 +125,11 @@ function Assistant() {
   const conversationsQuery = useQuery({
     queryKey: ['conversations', userId],
 
-    queryFn: () => conversationService.getConversations(),
+    queryFn: async () =>
+      requireArrayResponse(
+        await conversationService.getConversations(),
+        'conversations',
+      ),
 
     enabled: Boolean(userId),
   })
@@ -92,6 +139,7 @@ function Assistant() {
   // --------------------------------------------------
 
   useEffect(() => {
+    if (!isCurrentUserScope(userId)) return
     if (!userId || conversationsQuery.isPending) return
 
     if (conversationsQuery.isError) {
@@ -166,6 +214,7 @@ function Assistant() {
     conversationsQuery.isPending,
     conversationsQuery.isError,
     conversationsQuery.error,
+    isCurrentUserScope,
   ])
 
   // --------------------------------------------------
@@ -179,15 +228,22 @@ function Assistant() {
       conversationId,
     ],
 
-    queryFn: () =>
-      conversationService.getMessages(conversationId),
+    queryFn: () => {
+      if (!isCurrentUserScope(userId)) {
+        throw new Error('The active account changed before loading messages.')
+      }
+      return conversationService.getMessages(conversationId)
+    },
 
     enabled: Boolean(userId && conversationId),
   })
 
   // Handle message loading errors.
   useEffect(() => {
-    if (messagesQuery.isError) {
+    if (
+      isCurrentUserScope(userId) &&
+      messagesQuery.isError
+    ) {
       setError(
         messagesQuery.error?.message ||
         'Unable to load conversation messages.'
@@ -196,6 +252,8 @@ function Assistant() {
   }, [
     messagesQuery.isError,
     messagesQuery.error,
+    isCurrentUserScope,
+    userId,
   ])
 
   const messages = [
@@ -217,14 +275,16 @@ function Assistant() {
 
   const scrollToBottom = useCallback(() => {
     requestAnimationFrame(() => {
+      if (!isCurrentUserScope(userId)) return
       messagesEndRef.current?.scrollIntoView({
         behavior: 'smooth',
         block: 'end',
       })
     })
-  }, [])
+  }, [isCurrentUserScope, userId])
 
   function updateApprovalMessage(item, updatedMessage) {
+    if (!isCurrentUserScope(userId)) return
     queryClient.setQueryData(
       [
         'conversation-messages',
@@ -276,7 +336,14 @@ function Assistant() {
       existingConversationId,
       selectedConnectionId,
       userTimezone,
+      requestUserId,
     }) => {
+      const requestIsCurrent = () =>
+        isCurrentUserScope(requestUserId)
+      if (!requestIsCurrent()) {
+        throw new Error('The active account changed during this request.')
+      }
+
       let activeConversationId = existingConversationId
 
       // Create a conversation only for the first message.
@@ -293,6 +360,9 @@ function Assistant() {
       }
 
       try {
+        if (!requestIsCurrent()) {
+          throw new Error('The active account changed during this request.')
+        }
         const response =
           await conversationService.sendChatMessage(
             activeConversationId,
@@ -325,6 +395,7 @@ function Assistant() {
   })
 
   const sending = sendMutation.isPending
+    && sendMutation.variables?.requestUserId === userId
 
   // --------------------------------------------------
   // 6. Start a new chat
@@ -354,6 +425,7 @@ function Assistant() {
   async function handleSubmit(event) {
     event.preventDefault()
 
+    if (!isCurrentUserScope(userId)) return
     const content = message.trim()
 
     if (!content || sendingRef.current || initializing) return
@@ -402,7 +474,10 @@ function Assistant() {
         existingConversationId: conversationId,
         selectedConnectionId: selectedGmailConnectionId,
         userTimezone,
+        requestUserId: userId,
       })
+
+      if (!isCurrentUserScope(userId)) return
 
       const {
         response,
@@ -438,6 +513,8 @@ function Assistant() {
 
       scrollToBottom()
     } catch (err) {
+      if (!isCurrentUserScope(userId)) return
+
       if (err.activeConversationId) {
         setConversationId(err.activeConversationId)
 
@@ -462,7 +539,9 @@ function Assistant() {
         'Unable to process your message. Please try again.'
       )
     } finally {
-      sendingRef.current = false
+      if (isCurrentUserScope(userId)) {
+        sendingRef.current = false
+      }
     }
   }
 
@@ -664,6 +743,9 @@ function Assistant() {
                           selectedGmailConnectionId
                         }
                         onUpdated={(updatedMessage) => {
+                          if (!isCurrentUserScope(userId)) {
+                            return
+                          }
                           queryClient.setQueryData(
                             [
                               'conversation-messages',

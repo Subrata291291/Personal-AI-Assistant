@@ -18,7 +18,13 @@ def test_message_summary_preserves_internal_date_separately_from_date_header(
     async def fake_google_get(**kwargs):
         requests.append(kwargs)
         if kwargs["endpoint"] == "messages":
-            return {"messages": [{"id": "message-1"}]}
+            return {
+                "messages": [{
+                    "id": "message-1",
+                    "threadId": "thread-1",
+                }],
+                "resultSizeEstimate": 1,
+            }
         return {
             "id": "message-1",
             "threadId": "thread-1",

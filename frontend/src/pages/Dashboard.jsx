@@ -5,6 +5,11 @@ import { useAuth } from '../context/AuthContext'
 import { api } from '../lib/api.js'
 import { conversationService } from '../services/conversationService.js'
 import AppIcon from '../components/AppIcon'
+import { memoryReviewQueryKey } from '../lib/queryKeys'
+import {
+  requireArrayResponse,
+  requireConnectionsResponse,
+} from '../lib/responseValidation'
 
 const connectors = [
   {
@@ -118,7 +123,10 @@ function Dashboard() {
 
   const { data: connectionsData, isLoading: connectionsLoading, isError: connectionsError } = useQuery({
     queryKey: ['oauth-connections', userId],
-    queryFn: () => api.get('/api/v1/oauth/connections'),
+    queryFn: async () =>
+      requireConnectionsResponse(
+        await api.get('/api/v1/oauth/connections'),
+      ),
     enabled: Boolean(userId),
     staleTime: 5 * 60 * 1000,
     gcTime: 30 * 60 * 1000,
@@ -149,17 +157,17 @@ function Dashboard() {
     isLoading: reviewCountLoading,
     isError: reviewCountError,
   } = useQuery({
-    queryKey: ['memory-reviews', userId, 'pending'],
+    queryKey: memoryReviewQueryKey(userId, 100),
 
-    queryFn: () =>
-      api.get(
-        '/api/v1/memory-reviews?status_filter=pending&limit=100&offset=0'
+    queryFn: async () =>
+      requireArrayResponse(
+        await api.get(
+          '/api/v1/memory-reviews?status_filter=pending&limit=100&offset=0'
+        ),
+        'memory reviews',
       ),
 
     enabled: Boolean(userId),
-
-    select: (data) =>
-      Array.isArray(data) ? data : [],
   })
 
   // Long-term memories
@@ -170,15 +178,15 @@ function Dashboard() {
   } = useQuery({
     queryKey: ['memories', userId, 'long_term'],
 
-    queryFn: () =>
-      api.get(
-        '/api/v1/memories?memory_type=long_term&limit=100&offset=0'
+    queryFn: async () =>
+      requireArrayResponse(
+        await api.get(
+          '/api/v1/memories?memory_type=long_term&limit=100&offset=0'
+        ),
+        'memories',
       ),
 
     enabled: Boolean(userId),
-
-    select: (data) =>
-      Array.isArray(data) ? data : [],
   })
 
   // Recent conversations
@@ -189,14 +197,15 @@ function Dashboard() {
   } = useQuery({
     queryKey: ['conversations', userId],
 
-    queryFn: () =>
-      conversationService.getConversations(),
+    queryFn: async () =>
+      requireArrayResponse(
+        await conversationService.getConversations(),
+        'conversations',
+      ),
 
     enabled: Boolean(userId),
 
     select: (data) => {
-      if (!Array.isArray(data)) return []
-
       return data
         .filter((item) => !item.is_archived)
         .sort((a, b) => {

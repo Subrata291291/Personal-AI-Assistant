@@ -64,7 +64,13 @@ def test_archived_message_remains_in_all_mail(monkeypatch):
     async def fake_google_get(**kwargs):
         requests.append(kwargs)
         if kwargs["endpoint"] == "messages":
-            return {"messages": [{"id": "message-123"}]}
+            return {
+                "messages": [{
+                    "id": "message-123",
+                    "threadId": "thread-123",
+                }],
+                "resultSizeEstimate": 1,
+            }
         return {
             "id": "message-123",
             "labelIds": ["UNREAD", "CATEGORY_PERSONAL"],

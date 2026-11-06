@@ -11,6 +11,7 @@ import { Link, useOutletContext } from 'react-router-dom'
 
 import { api } from '../lib/api.js'
 import { formatRequestError } from '../lib/errorMessage.js'
+import { requireConnectionsResponse } from '../lib/responseValidation'
 import { gmailService } from '../services/gmailService.js'
 import { actionApprovalService } from '../services/actionApprovalService.js'
 import { useAuth } from '../context/AuthContext'
@@ -230,7 +231,10 @@ export default function Gmail() {
   const connectionsQuery = useQuery({
     queryKey: ['oauth-connections', userId],
 
-    queryFn: () => api.get('/api/v1/oauth/connections'),
+    queryFn: async () =>
+      requireConnectionsResponse(
+        await api.get('/api/v1/oauth/connections'),
+      ),
 
     enabled: Boolean(userId),
 
@@ -918,7 +922,7 @@ export default function Gmail() {
     queryFn: ({ pageParam }) =>
       gmailService.getMessages({
         connectionId,
-        maxResults: 20,
+        maxResults: 10,
         pageToken: pageParam,
         query: searchQuery,
         folder: activeFolder,
@@ -1125,7 +1129,7 @@ export default function Gmail() {
     draftApprovalIdempotency.current = null
   }
 
-  function closeMessageDetails(force = false) {
+  const closeMessageDetails = useCallback((force = false) => {
     if (
       !force &&
       draftSendApproval &&
@@ -1137,7 +1141,7 @@ export default function Gmail() {
     setShowHtmlBody(true)
     setAttachmentDownloadError('')
     setDownloadingAttachmentId(null)
-  }
+  }, [draftSendApproval])
 
   function openDraftSendReview(message) {
     if (!isGmailDraft(message)) return
@@ -1493,7 +1497,7 @@ export default function Gmail() {
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
     }
-  }, [selectedMessageId])
+  }, [selectedMessageId, closeMessageDetails])
 
   useEffect(() => {
     if (!messageActionConfirmation) return

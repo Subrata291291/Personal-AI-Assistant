@@ -36,6 +36,7 @@ vi.mock('../lib/api.js', () => ({
     patch: vi.fn(),
     post: vi.fn(),
   },
+  getApiAuthRevision: () => 0,
 }))
 
 import MemoryCenter from './MemoryCenter.jsx'
@@ -158,6 +159,7 @@ describe('memory preference controls', () => {
       expect(api.patch).toHaveBeenCalledWith(
         '/api/v1/me/settings',
         { memory_enabled: false },
+        { userId: 'user-1', authRevision: 0 },
       )
     })
     await waitFor(() => {

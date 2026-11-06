@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { getOAuthRedirectTo } from '../lib/authRedirect'
 import { supabase } from '../lib/supabase'
+import { withAuthTimeout } from '../lib/requestTimeout'
 
 function Login() {
   const navigate = useNavigate()
@@ -48,12 +49,15 @@ function Login() {
     setGoogleLoading(true)
 
     try {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: getOAuthRedirectTo(),
-        },
-      })
+      const { error } = await withAuthTimeout(
+        supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: getOAuthRedirectTo(),
+          },
+        }),
+        'Google sign-in',
+      )
 
       if (error) throw error
     } catch (error) {
@@ -61,6 +65,7 @@ function Login() {
         type: 'error',
         text: error.message || 'Google sign-in failed.',
       })
+    } finally {
       setGoogleLoading(false)
     }
   }
@@ -78,11 +83,14 @@ function Login() {
     setLoading(true)
 
     try {
-      const { error } = await supabase.auth.resetPasswordForEmail(
-        email.trim(),
-        {
-          redirectTo: `${window.location.origin}/login`,
-        }
+      const { error } = await withAuthTimeout(
+        supabase.auth.resetPasswordForEmail(
+          email.trim(),
+          {
+            redirectTo: `${window.location.origin}/login`,
+          },
+        ),
+        'Password reset',
       )
 
       if (error) throw error

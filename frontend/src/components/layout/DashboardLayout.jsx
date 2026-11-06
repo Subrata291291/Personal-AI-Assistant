@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import AppIcon from '../AppIcon'
 import { api } from '../../lib/api.js'
 import {
@@ -9,6 +9,11 @@ import {
   useNavigate,
 } from 'react-router-dom'
 import { useAuth } from '../../context/AuthContext'
+import { memoryReviewQueryKey } from '../../lib/queryKeys'
+import {
+  requireArrayResponse,
+  requireConnectionsResponse,
+} from '../../lib/responseValidation'
 
 const navigation = [
   {
@@ -36,11 +41,8 @@ const navigation = [
 ]
 
 function DashboardLayout() {
-  const [pendingReviewCount, setPendingReviewCount] = useState(0)
   const [notificationOpen, setNotificationOpen] = useState(false)
-  const [notificationLoading, setNotificationLoading] = useState(true)
   const { user, signOut } = useAuth()
-  const queryClient = useQueryClient()
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -56,7 +58,10 @@ function DashboardLayout() {
   const isDark = theme === 'dark'
   const connectionsQuery = useQuery({
     queryKey: ['oauth-connections', user?.id],
-    queryFn: () => api.get('/api/v1/oauth/connections'),
+    queryFn: async () =>
+      requireConnectionsResponse(
+        await api.get('/api/v1/oauth/connections'),
+      ),
     enabled: Boolean(user?.id),
     staleTime: 5 * 60 * 1000,
     gcTime: 30 * 60 * 1000,
@@ -68,39 +73,23 @@ function DashboardLayout() {
     connectionsQuery.data?.connections || []
   ).filter((connection) => connection.status === 'connected').length
 
+  const reviewsQuery = useQuery({
+    queryKey: memoryReviewQueryKey(user?.id, 100),
+    queryFn: async () =>
+      requireArrayResponse(
+        await api.get(
+          '/api/v1/memory-reviews?status_filter=pending&limit=100&offset=0'
+        ),
+        'memory reviews',
+      ),
+    enabled: Boolean(user?.id),
+  })
+  const pendingReviewCount = reviewsQuery.data?.length || 0
+  const notificationLoading = reviewsQuery.isPending
+
   useEffect(() => {
     localStorage.setItem('dashboard-theme', theme)
   }, [theme])
-
-  useEffect(() => {
-    let active = true
-
-    async function loadNotifications() {
-      try {
-        const reviews = await api.get(
-          '/api/v1/memory-reviews?status_filter=pending&limit=100&offset=0'
-        )
-
-        if (active) {
-          setPendingReviewCount(
-            Array.isArray(reviews) ? reviews.length : 0
-          )
-        }
-      } catch (error) {
-        console.error('Unable to load notifications:', error)
-      } finally {
-        if (active) {
-          setNotificationLoading(false)
-        }
-      }
-    }
-
-    loadNotifications()
-
-    return () => {
-      active = false
-    }
-  }, [])
 
   const metadata = user?.user_metadata || {}
 
@@ -155,9 +144,6 @@ function DashboardLayout() {
 
     try {
       await signOut()
-
-      // Clear all cached user data after successful logout.
-      queryClient.clear()
 
       // Clear user-specific Gmail account selection.
       if (user?.id) {
@@ -417,6 +403,19 @@ function DashboardLayout() {
                         <p className={`text-sm ${muted}`}>
                           Loading notifications...
                         </p>
+                      ) : reviewsQuery.isError ? (
+                        <div>
+                          <p className="text-sm text-red-400">
+                            Unable to load notifications.
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => reviewsQuery.refetch()}
+                            className="mt-2 text-sm font-semibold text-violet-400"
+                          >
+                            Retry
+                          </button>
+                        </div>
                       ) : pendingReviewCount > 0 ? (
                         <button
                           type="button"
@@ -560,6 +559,7 @@ function DashboardLayout() {
         {/* Nested page content */}
         <div className="mx-auto w-full max-w-[1500px] p-4 sm:p-6 lg:p-8">
           <Outlet
+            key={user?.id || 'signed-out'}
             context={{
               theme,
               isDark,

@@ -45,6 +45,48 @@ def _gmail_payload_has_attachments(payload: Any) -> bool:
     return False
 
 
+def _validate_gmail_message_list_response(
+    result: Any,
+) -> tuple[list[dict[str, Any]], str | None, int]:
+    error = GoogleAPIError(
+        status_code=502,
+        message="Gmail returned an invalid message list response.",
+    )
+    if not isinstance(result, dict):
+        raise error
+
+    estimate = result.get("resultSizeEstimate")
+    if type(estimate) is not int or estimate < 0:
+        raise error
+
+    page_token = result.get("nextPageToken")
+    if "nextPageToken" in result and (
+        not isinstance(page_token, str) or not page_token.strip()
+    ):
+        raise error
+
+    if "messages" not in result:
+        if estimate != 0 or page_token is not None:
+            raise error
+        messages: list[dict[str, Any]] = []
+    else:
+        messages = result["messages"]
+        if not isinstance(messages, list):
+            raise error
+
+    for message in messages:
+        if not isinstance(message, dict):
+            raise error
+        message_id = message.get("id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise error
+        thread_id = message.get("threadId")
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise error
+
+    return messages, page_token, estimate
+
+
 class GmailService:
     """
     Gmail operations for an authenticated user.
@@ -68,7 +110,7 @@ class GmailService:
     REQUIRED_PERMANENT_DELETE_SCOPE = "https://mail.google.com/"
 
     MAX_LIST_RESULTS = 50
-    MAX_CONCURRENT_READS = 5
+    MAX_CONCURRENT_READS = 1
     MAX_THREAD_MESSAGES = 10
     MAX_THREAD_RESPONSE_BYTES = 2_000_000
     MAX_THREAD_BODY_CHARS = 3_000
@@ -270,17 +312,16 @@ class GmailService:
             params=params,
         )
 
-        messages = result.get("messages", [])
+        messages, next_page_token, result_size_estimate = (
+            _validate_gmail_message_list_response(result)
+        )
         semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_READS)
 
         async def fetch_metadata(
             item: dict[str, Any],
             http_client: Any,
-        ) -> dict[str, Any] | None:
-            message_id = item.get("id")
-            if not message_id:
-                return None
-
+        ) -> dict[str, Any]:
+            message_id = item["id"]
             async with semaphore:
                 metadata = await self._google_get(
                     user_id=user_id,
@@ -318,17 +359,13 @@ class GmailService:
                 *(
                     fetch_metadata(item, http_client)
                     for item in messages
-                    if isinstance(item, dict)
                 )
             )
-        summaries = [item for item in fetched if item is not None]
 
         return {
-            "messages": summaries,
-            "next_page_token": result.get("nextPageToken"),
-            "result_size_estimate": result.get(
-                "resultSizeEstimate", 0
-            ),
+            "messages": fetched,
+            "next_page_token": next_page_token,
+            "result_size_estimate": result_size_estimate,
         }
 
 
