@@ -163,7 +163,7 @@ describe('Dashboard fresh-user states', () => {
         status: 'connected',
         capabilities: { gmail: true, calendar_events_read: true },
       },
-    ], '2 / 4', ['Connected', 'Connected']],
+    ], '2 / 4', ['Connected · Enabled', 'Connected · Enabled']],
     ['Gmail only', [
       {
         id: 'gmail',
@@ -171,7 +171,7 @@ describe('Dashboard fresh-user states', () => {
         status: 'connected',
         capabilities: { gmail: true },
       },
-    ], '1 / 4', ['Connected', 'Not connected']],
+    ], '1 / 4', ['Connected · Enabled', 'Disconnected']],
     ['Calendar only', [
       {
         id: 'calendar',
@@ -179,7 +179,7 @@ describe('Dashboard fresh-user states', () => {
         status: 'connected',
         capabilities: { calendar_events_read: true },
       },
-    ], '1 / 4', ['Not connected', 'Connected']],
+    ], '1 / 4', ['Disconnected', 'Connected · Enabled']],
     ['multiple Gmail accounts', [
       {
         id: 'gmail-one',
@@ -193,7 +193,7 @@ describe('Dashboard fresh-user states', () => {
         status: 'connected',
         capabilities: { gmail: true },
       },
-    ], '1 / 4', ['Connected', 'Not connected']],
+    ], '1 / 4', ['Connected · Enabled', 'Disconnected']],
     ['disconnected Calendar', [
       {
         id: 'calendar',
@@ -201,7 +201,7 @@ describe('Dashboard fresh-user states', () => {
         status: 'disconnected',
         capabilities: { calendar_events_read: true },
       },
-    ], '0 / 4', ['Not connected', 'Not connected']],
+    ], '0 / 4', ['Disconnected', 'Disconnected']],
   ])('reflects backend capabilities for %s', async (_label, connections, count, statuses) => {
     connectionsContext = {
       connections,
@@ -232,5 +232,29 @@ describe('Dashboard fresh-user states', () => {
 
     expect(await screen.findAllByText('Unavailable')).not.toHaveLength(0)
     expect(screen.queryByText('0 / 4')).not.toBeInTheDocument()
+  })
+
+  it('keeps connected count while showing an OAuth-connected disabled service', async () => {
+    currentUser.value = {
+      ...currentUser.value,
+      user_metadata: { gmail_enabled: false },
+    }
+    connectionsContext = {
+      connections: [{
+        id: 'gmail',
+        provider: 'google',
+        status: 'connected',
+        capabilities: { gmail: true },
+      }],
+      connectionsLoading: false,
+      connectionsError: false,
+    }
+
+    renderDashboard()
+
+    expect(await screen.findByText('1 / 4')).toBeInTheDocument()
+    const gmailRow = screen.getByText('Gmail').parentElement.parentElement
+    expect(within(gmailRow).getByText('Connected · Disabled'))
+      .toBeInTheDocument()
   })
 })

@@ -17,8 +17,8 @@ import {
 } from '../../lib/responseValidation'
 import {
   getConnectedGoogleServiceCount,
+  getGoogleServiceStatus,
   GOOGLE_WORKSPACE_SERVICES,
-  isGoogleServiceConnected,
 } from '../../lib/googleServiceCapabilities.js'
 import { SEMANTIC_STATUS_STYLES } from '../../lib/semanticStatusStyles.js'
 
@@ -288,32 +288,29 @@ function DashboardLayout() {
                             ? SEMANTIC_STATUS_STYLES.neutral.text
                             : connectionsQuery.isError
                               ? SEMANTIC_STATUS_STYLES.error.text
-                              : isGoogleServiceConnected(
+                              : getGoogleServiceStatus(
                                   connections,
                                   item.serviceId,
-                                )
-                                ? item.serviceId === 'drive' ||
-                                  item.serviceId === 'contacts'
+                                  metadata,
+                                ) === 'Connected · Enabled'
+                                ? SEMANTIC_STATUS_STYLES.positive.text
+                                : getGoogleServiceStatus(
+                                    connections,
+                                    item.serviceId,
+                                    metadata,
+                                  ) === 'Connected · Disabled'
                                   ? SEMANTIC_STATUS_STYLES.neutral.text
-                                  : SEMANTIC_STATUS_STYLES.positive.text
-                                : SEMANTIC_STATUS_STYLES.neutral.text
+                                  : SEMANTIC_STATUS_STYLES.neutral.text
                         }`}>
                           {connectionsQuery.isLoading
                             ? 'Checking connection'
                             : connectionsQuery.isError
                               ? 'Status unavailable'
-                              : isGoogleServiceConnected(
+                              : getGoogleServiceStatus(
                                   connections,
                                   item.serviceId,
-                                )
-                                ? item.serviceId === 'drive' ||
-                                  item.serviceId === 'contacts'
-                                  ? 'Connected · coming soon'
-                                  : 'Connected'
-                                : item.serviceId === 'drive' ||
-                                  item.serviceId === 'contacts'
-                                  ? 'Coming soon'
-                                  : 'Not connected'}
+                                  metadata,
+                                )}
                         </span>
                       )}
                     </span>
@@ -627,6 +624,7 @@ function DashboardLayout() {
               connections,
               connectionsLoading: connectionsQuery.isLoading,
               connectionsError: connectionsQuery.isError,
+              servicePreferences: metadata,
             }}
           />
         </div>

@@ -226,6 +226,10 @@ describe('Assistant user-switch isolation', () => {
   })
 
   it('preserves normal same-user message sending', async () => {
+    authMock.user = {
+      id: 'user-a',
+      user_metadata: { timezone: 'America/New_York' },
+    }
     conversationMocks.sendChatMessage.mockResolvedValue({
       conversation_id: 'conversation-a',
       user_message: {
@@ -259,7 +263,46 @@ describe('Assistant user-switch isolation', () => {
       'Hello assistant',
       expect.any(String),
       null,
-      expect.any(String),
+      'America/New_York',
     )
+  })
+
+  it('uses Asia/Kolkata when the user has no configured timezone', async () => {
+    authMock.user = { id: 'user-a' }
+    conversationMocks.sendChatMessage.mockResolvedValue({
+      conversation_id: 'conversation-a',
+      user_message: {
+        id: 'sent-user',
+        conversation_id: 'conversation-a',
+        role: 'user',
+        content: 'Show my calendar today',
+      },
+      assistant_message: {
+        id: 'sent-assistant',
+        conversation_id: 'conversation-a',
+        role: 'assistant',
+        content: 'No events.',
+      },
+      provider: 'test-provider',
+      model: 'test-model',
+    })
+    renderAssistant()
+
+    await screen.findByText('conversation-a-private-message')
+    fireEvent.change(
+      screen.getByPlaceholderText('Message your personal AI...'),
+      { target: { value: 'Show my calendar today' } },
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+    await waitFor(() => {
+      expect(conversationMocks.sendChatMessage).toHaveBeenCalledWith(
+        'conversation-a',
+        'Show my calendar today',
+        expect.any(String),
+        null,
+        'Asia/Kolkata',
+      )
+    })
   })
 })

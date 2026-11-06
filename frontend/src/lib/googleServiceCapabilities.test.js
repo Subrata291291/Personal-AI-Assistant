@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import {
   getConnectedGoogleServiceCount,
   getConnectedGoogleServices,
+  getGoogleServiceStatus,
   isGoogleServiceConnected,
+  isGoogleServiceEnabled,
 } from './googleServiceCapabilities.js'
 
 function connection(id, capabilities, status = 'connected') {
@@ -59,6 +61,20 @@ describe('Google Workspace capability counting', () => {
 
     expect(isGoogleServiceConnected(connections, 'gmail')).toBe(true)
     expect(isGoogleServiceConnected(connections, 'calendar')).toBe(false)
+  })
+
+  it('keeps application preferences separate from OAuth connection status', () => {
+    const connections = [connection('gmail', { gmail: true })]
+
+    expect(isGoogleServiceConnected(connections, 'gmail')).toBe(true)
+    expect(isGoogleServiceEnabled('gmail', { gmail_enabled: false })).toBe(false)
+    expect(isGoogleServiceEnabled('calendar', {})).toBe(true)
+    expect(getGoogleServiceStatus(
+      connections,
+      'gmail',
+      { gmail_enabled: false },
+    )).toBe('Connected · Disabled')
+    expect(getGoogleServiceStatus([], 'gmail')).toBe('Disconnected')
   })
 
   it('excludes coming-soon services from counts but reports granted capabilities', () => {

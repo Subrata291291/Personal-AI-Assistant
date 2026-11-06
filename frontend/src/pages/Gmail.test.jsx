@@ -1167,7 +1167,7 @@ describe('Gmail archive flow', () => {
     }
     renderGmail()
 
-    expect(await screen.findByText('Gmail is turned off'))
+    expect(await screen.findByText('Connected · Disabled'))
       .toBeInTheDocument()
     expect(await screen.findByText('Connected: user@example.com'))
       .toBeInTheDocument()

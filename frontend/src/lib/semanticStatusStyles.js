@@ -2,6 +2,7 @@ export const SEMANTIC_STATUS_STYLES = {
   positive: {
     text: 'text-emerald-700 dark:text-emerald-300',
     badge: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+    dot: 'bg-emerald-600 dark:bg-emerald-400',
     solid: 'border-emerald-600 bg-emerald-600 text-white shadow-sm shadow-emerald-500/25',
     toggle: 'bg-emerald-600 shadow-sm shadow-emerald-500/25',
   },

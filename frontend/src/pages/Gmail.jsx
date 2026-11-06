@@ -1679,16 +1679,28 @@ export default function Gmail() {
           </button>
 
           <div className={`flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold ${
-            isGmailEnabled
-              ? SEMANTIC_STATUS_STYLES.positive.badge
-              : SEMANTIC_STATUS_STYLES.neutral.badge
+            !connectionsVerified
+              ? SEMANTIC_STATUS_STYLES.neutral.badge
+              : selectedConnection && isGmailEnabled
+                ? SEMANTIC_STATUS_STYLES.positive.badge
+                : SEMANTIC_STATUS_STYLES.neutral.badge
           }`}>
             <span className={`h-2 w-2 rounded-full ${
-              isGmailEnabled
-                ? 'bg-emerald-500'
-                : SEMANTIC_STATUS_STYLES.neutral.dot
+              !connectionsVerified
+                ? SEMANTIC_STATUS_STYLES.neutral.dot
+                : selectedConnection && isGmailEnabled
+                  ? SEMANTIC_STATUS_STYLES.positive.dot
+                  : SEMANTIC_STATUS_STYLES.neutral.dot
             }`} />
-            {isGmailEnabled ? 'Read, Send & Manage access' : 'Gmail is turned off'}
+            {connectionsQuery.isError
+              ? 'Connection status unavailable'
+              : !connectionsVerified
+                ? 'Checking connection'
+                : !selectedConnection
+                  ? 'Disconnected'
+                  : isGmailEnabled
+                    ? 'Connected · Enabled'
+                    : 'Connected · Disabled'}
           </div>
         </div>
 

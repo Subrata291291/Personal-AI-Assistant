@@ -10,8 +10,8 @@ import { memoryReviewQueryKey } from '../lib/queryKeys'
 import { requireArrayResponse } from '../lib/responseValidation'
 import {
   getConnectedGoogleServiceCount,
+  getGoogleServiceStatus,
   GOOGLE_WORKSPACE_SERVICES,
-  isGoogleServiceConnected,
 } from '../lib/googleServiceCapabilities.js'
 import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
 
@@ -412,9 +412,10 @@ function Dashboard() {
           <div className="mt-5 space-y-2 sm:mt-6">
 
             {connectors.map((connector) => {
-              const isConnected = isGoogleServiceConnected(
+              const status = getGoogleServiceStatus(
                 connections,
                 connector.id,
+                metadata,
               )
               const isComingSoon = connector.comingSoon
 
@@ -448,8 +449,10 @@ function Dashboard() {
                         ? SEMANTIC_STATUS_STYLES.neutral.badge
                         : connectionsError
                           ? SEMANTIC_STATUS_STYLES.error.badge
-                          : isConnected && !isComingSoon
+                          : status === 'Connected · Enabled'
                             ? SEMANTIC_STATUS_STYLES.positive.badge
+                            : status === 'Connected · Disabled'
+                              ? SEMANTIC_STATUS_STYLES.neutral.badge
                             : SEMANTIC_STATUS_STYLES.neutral.badge
                     }`}
                   >
@@ -459,9 +462,7 @@ function Dashboard() {
                         ? 'Unavailable'
                         : isComingSoon
                           ? 'Coming soon'
-                          : isConnected
-                            ? 'Connected'
-                            : 'Not connected'}
+                          : status}
                   </span>
 
                 </div>

@@ -127,4 +127,28 @@ describe('Dashboard integration navigation', () => {
       expect(connectorsLink).toHaveTextContent('2')
     })
   })
+
+  it('shows OAuth connection and disabled preference separately in the sidebar', async () => {
+    currentUser.value = {
+      ...currentUser.value,
+      user_metadata: { gmail_enabled: false },
+    }
+    api.get.mockResolvedValue({
+      connections: [{
+        id: 'gmail-1',
+        provider: 'google',
+        status: 'connected',
+        capabilities: { gmail: true },
+      }],
+    })
+
+    renderLayout()
+
+    const gmailLink = screen.getByRole('link', { name: /Gmail/ })
+    await waitFor(() => {
+      expect(gmailLink).toHaveTextContent('Connected · Disabled')
+    })
+    expect(screen.getByRole('link', { name: /Connectors/ }))
+      .toHaveTextContent('1')
+  })
 })

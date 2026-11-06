@@ -52,6 +52,26 @@ export function isGoogleServiceConnected(connections, serviceId) {
   return getConnectedGoogleServices(connections).has(serviceId)
 }
 
+export function isGoogleServiceEnabled(serviceId, userMetadata = {}) {
+  return userMetadata?.[`${serviceId}_enabled`] !== false
+}
+
+export function getGoogleServiceStatus(
+  connections,
+  serviceId,
+  userMetadata = {},
+) {
+  const service = GOOGLE_WORKSPACE_SERVICES.find(
+    (item) => item.id === serviceId,
+  )
+  if (!service) return 'Unavailable'
+  if (service.comingSoon) return 'Coming soon'
+  if (!isGoogleServiceConnected(connections, serviceId)) return 'Disconnected'
+  return isGoogleServiceEnabled(serviceId, userMetadata)
+    ? 'Connected · Enabled'
+    : 'Connected · Disabled'
+}
+
 export function getConnectedGoogleServiceCount(connections) {
   const connectedServices = getConnectedGoogleServices(connections)
   return GOOGLE_WORKSPACE_SERVICES.filter(

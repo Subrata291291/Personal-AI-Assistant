@@ -434,8 +434,16 @@ function AssistantContent({ user }) {
     setError('')
 
     const temporaryId = `pending-${crypto.randomUUID()}`
-    const userTimezone =
-      Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+    const configuredTimezone = user?.user_metadata?.timezone
+    let userTimezone = 'Asia/Kolkata'
+    if (typeof configuredTimezone === 'string' && configuredTimezone) {
+      try {
+        new Intl.DateTimeFormat('en', { timeZone: configuredTimezone })
+        userTimezone = configuredTimezone
+      } catch {
+        userTimezone = 'Asia/Kolkata'
+      }
+    }
 
     // Reuse the same idempotency key for the same retry.
     if (
@@ -483,6 +491,14 @@ function AssistantContent({ user }) {
         response,
         conversationId: activeId,
       } = result
+      if (
+        /authorization is no longer valid|reconnect the selected account/i
+          .test(response.assistant_message.content)
+      ) {
+        queryClient.invalidateQueries({
+          queryKey: ['oauth-connections', userId],
+        })
+      }
 
       setConversationId(activeId)
       newChatModeRef.current = false
