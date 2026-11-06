@@ -6,6 +6,7 @@ import { api } from '../lib/api.js'
 import {
   requireConnectionsResponse,
 } from '../lib/responseValidation.js'
+import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
 import { calendarService } from '../services/calendarService.js'
 
 const EMPTY_CONNECTIONS = []
@@ -567,7 +568,6 @@ export default function Calendar() {
                       <FreeBusyResult
                         result={freeBusyResult}
                         timeZone={timeZone}
-                        isDark={isDark}
                       />
                     )}
                   </form>
@@ -656,7 +656,7 @@ export default function Calendar() {
   )
 }
 
-function FreeBusyResult({ result, timeZone, isDark }) {
+function FreeBusyResult({ result, timeZone }) {
   const primary = result.calendars.primary
   if (!primary || primary.errors.length > 0) {
     return (
@@ -667,7 +667,7 @@ function FreeBusyResult({ result, timeZone, isDark }) {
   }
   if (primary.busy.length === 0) {
     return (
-      <p role="status" className={`text-sm ${isDark ? 'text-emerald-300' : 'text-emerald-700'}`}>
+      <p role="status" className={`text-sm ${SEMANTIC_STATUS_STYLES.positive.text}`}>
         Google Calendar reports no busy intervals for this period.
       </p>
     )

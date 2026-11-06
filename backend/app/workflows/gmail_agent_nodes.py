@@ -366,13 +366,42 @@ def _calendar_local_datetime(
     return first
 
 
+def _calendar_clock_matches(text: str) -> list[datetime_time] | None:
+    matches = list(re.finditer(
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b",
+        text,
+    ))
+    if len(matches) > 2:
+        return None
+
+    parsed_times: list[datetime_time] = []
+    for match in matches:
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        meridiem = (match.group(3) or "").replace(".", "")
+        if minute > 59:
+            return None
+        if meridiem:
+            if hour < 1 or hour > 12:
+                return None
+            hour = hour % 12 + (12 if meridiem == "pm" else 0)
+        elif hour > 23:
+            return None
+        parsed_times.append(datetime_time(hour, minute))
+    return parsed_times
+
+
 def _calendar_create_request(text: str) -> bool:
     lowered = text.casefold()
     return bool(re.search(
         r"\b(?:create|add|book|schedule)\b.{0,60}"
-        r"\b(?:meetings?|events?|calendar)\b|"
-        r"\b(?:meetings?|events?)\b.{0,60}"
-        r"\b(?:create|add|book|schedule)\b",
+        r"\b(?:meetings?|events?|appointments?|calendar)\b|"
+        r"\b(?:meetings?|events?|appointments?)\b.{0,60}"
+        r"\b(?:create|add|book|schedule)\b|"
+        r"\b(?:move|reschedule)\b.{0,60}"
+        r"\b(?:meetings?|events?|appointments?)\b|"
+        r"\b(?:meetings?|events?|appointments?)\b.{0,60}"
+        r"\b(?:move|reschedule)\b",
         lowered,
     ))
 
@@ -418,12 +447,42 @@ def _deterministic_calendar_plan(
 
     creation_request = bool(re.search(
         r"\b(?:create|add|book|schedule|cancel|delete|remove|update|edit|"
-        r"change|modify|invite|rsvp)\b.{0,60}\b(?:meetings?|events?|calendar)\b|"
-        r"\b(?:meetings?|events?)\b.{0,60}\b(?:cancel|delete|remove|update|"
-        r"edit|change|modify)\b",
+        r"change|modify|move|reschedule|invite|rsvp)\b.{0,60}"
+        r"\b(?:meetings?|events?|appointments?|calendar)\b|"
+        r"\b(?:meetings?|events?|appointments?)\b.{0,60}\b(?:cancel|delete|remove|update|"
+        r"edit|change|modify|move|reschedule)\b",
         lowered,
     ))
     if creation_request:
+        if re.search(
+            r"\b(?:utc|gmt|pst|pdt|mst|mdt|cst|cdt|est|edt|bst)\b",
+            lowered,
+        ):
+            return _calendar_plan("clarify")
+        clock_text = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", " ", lowered)
+        clock_matches = _calendar_clock_matches(clock_text)
+        if clock_matches is None:
+            return _calendar_plan("clarify")
+        if clock_matches:
+            meeting_start = _calendar_local_datetime(
+                target_date,
+                clock_matches[0],
+                timezone,
+            )
+            if meeting_start is None:
+                return _calendar_plan("clarify")
+            if len(clock_matches) == 2:
+                meeting_end_date = (
+                    target_date + timedelta(days=1)
+                    if clock_matches[1] <= clock_matches[0]
+                    else target_date
+                )
+                if _calendar_local_datetime(
+                    meeting_end_date,
+                    clock_matches[1],
+                    timezone,
+                ) is None:
+                    return _calendar_plan("clarify")
         calendar_capabilities = (
             (state.get("assistant_capabilities") or {}).get(
                 "google_calendar",
@@ -482,35 +541,20 @@ def _deterministic_calendar_plan(
         ):
             return _calendar_plan("clarify")
         clock_text = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", " ", lowered)
-        clock_matches = list(re.finditer(
-            r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b",
-            clock_text,
-        ))
-        if not clock_matches or len(clock_matches) > 2:
+        parsed_times = _calendar_clock_matches(clock_text)
+        if not parsed_times:
             return _calendar_plan("clarify")
-
-        parsed_times: list[datetime_time] = []
-        for match in clock_matches:
-            hour = int(match.group(1))
-            minute = int(match.group(2) or 0)
-            meridiem = (match.group(3) or "").replace(".", "")
-            if minute > 59:
-                return _calendar_plan("clarify")
-            if meridiem:
-                if hour < 1 or hour > 12:
-                    return _calendar_plan("clarify")
-                hour = hour % 12 + (12 if meridiem == "pm" else 0)
-            elif hour > 23:
-                return _calendar_plan("clarify")
-            parsed_times.append(datetime_time(hour, minute))
         start = _calendar_local_datetime(target_date, parsed_times[0], timezone)
         if start is None:
             return _calendar_plan("clarify")
         if len(parsed_times) == 2:
-            end_date = target_date
             if parsed_times[1] <= parsed_times[0]:
                 return _calendar_plan("clarify")
-            end = _calendar_local_datetime(end_date, parsed_times[1], timezone)
+            end = _calendar_local_datetime(
+                target_date,
+                parsed_times[1],
+                timezone,
+            )
         else:
             end_naive = start.replace(tzinfo=None) + timedelta(hours=1)
             end = _calendar_local_datetime(
@@ -527,6 +571,44 @@ def _deterministic_calendar_plan(
                 "time_max": end.isoformat(),
                 "time_zone": timezone,
                 "calendar_ids": ["primary"],
+            },
+        )
+
+    month_match = re.search(r"\b(this|next)\s+month\b", lowered)
+    if month_match and re.search(
+        r"\b(?:show|list|find|get|open|check|what|when|tell me)\b",
+        lowered,
+    ):
+        month_offset = 1 if month_match.group(1) == "next" else 0
+        month_start = date(
+            today.year + (today.month - 1 + month_offset) // 12,
+            (today.month - 1 + month_offset) % 12 + 1,
+            1,
+        )
+        next_month_start = date(
+            month_start.year + (month_start.month == 12),
+            month_start.month % 12 + 1,
+            1,
+        )
+        range_start = _calendar_local_datetime(
+            month_start,
+            datetime_time.min,
+            timezone,
+        )
+        range_end = _calendar_local_datetime(
+            next_month_start,
+            datetime_time.min,
+            timezone,
+        )
+        if range_start is None or range_end is None:
+            return _calendar_plan("clarify")
+        return _calendar_plan(
+            "list_calendar_events",
+            {
+                "time_min": range_start.isoformat(),
+                "time_max": range_end.isoformat(),
+                "time_zone": timezone,
+                "max_results": 100,
             },
         )
 
@@ -1017,6 +1099,16 @@ def _deterministic_read_plan(user_message: str) -> dict[str, Any] | None:
             max_results=10,
         ).model_dump(mode="json")
 
+    if re.search(
+        r"\b(?:find|search|show|list)\b",
+        lowered,
+    ) and re.search(r"\b(?:email|emails|mail|messages|inbox)\b", lowered):
+        return SearchEmailsPlan(
+            intent="search_emails",
+            query="in:anywhere",
+            max_results=10,
+        ).model_dump(mode="json")
+
     return None
 
 
@@ -1040,7 +1132,9 @@ def _is_calendar_request(user_message: str) -> bool:
     ))
     has_action = bool(re.search(
         r"\b(?:show|list|find|get|open|check|what|when|do i have|"
-        r"am i|are we|is there|tell me|schedule)\b",
+        r"am i|are we|is there|tell me|schedule|add|create|book|"
+        r"cancel|delete|remove|update|edit|change|modify|move|"
+        r"reschedule|invite|rsvp)\b",
         lowered,
     ))
     return (

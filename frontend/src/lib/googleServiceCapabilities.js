@@ -53,5 +53,8 @@ export function isGoogleServiceConnected(connections, serviceId) {
 }
 
 export function getConnectedGoogleServiceCount(connections) {
-  return getConnectedGoogleServices(connections).size
+  const connectedServices = getConnectedGoogleServices(connections)
+  return GOOGLE_WORKSPACE_SERVICES.filter(
+    (service) => !service.comingSoon && connectedServices.has(service.id),
+  ).length
 }

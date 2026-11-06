@@ -1,5 +1,7 @@
 import json
+from datetime import datetime
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from app.llm.schemas import LLMResponse
 from app.schemas.gmail_agent import (
@@ -17,6 +19,7 @@ from app.workflows.chat_nodes import (
 )
 from app.workflows import chat_nodes
 from app.workflows import gmail_agent_nodes
+from app.workflows.calendar_agent_node import calendar_agent_node
 
 
 SUBSCRIPTION_REQUEST = (
@@ -115,6 +118,92 @@ def test_explicit_draft_send_search_read_reply_archive_and_delete_intents():
         })),
         GmailUnavailableActionPlan,
     )
+
+
+def test_calendar_and_gmail_requests_route_to_their_service():
+    cases = (
+        (
+            "I want to add a meeting in my calendar today at 11 PM with my friend.",
+            "google_calendar",
+            "clarify",
+        ),
+        (
+            "Add an event to my Google Calendar tomorrow.",
+            "google_calendar",
+            "clarify",
+        ),
+        (
+            "Schedule a meeting today at 11 PM.",
+            "google_calendar",
+            "clarify",
+        ),
+        (
+            "Book an appointment in my calendar tomorrow at 9 AM.",
+            "google_calendar",
+            "clarify",
+        ),
+        (
+            "Show my calendar this month.",
+            "google_calendar",
+            "list_calendar_events",
+        ),
+        ("Search my emails.", "gmail", "search_emails"),
+        ("Find emails from Google.", "gmail", "search_emails"),
+    )
+    for text, expected_route, expected_tool in cases:
+        routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+            text,
+            user_timezone="America/Los_Angeles",
+            request_time=datetime(
+                2026, 11, 4, 17, 0, tzinfo=ZoneInfo("UTC")
+            ),
+        ))
+        assert routed["assistant_route"] == expected_route
+        if expected_route == "google_calendar":
+            assert routed["gmail_plan"]["calendar_tool"] == expected_tool
+            assert routed["gmail_plan"]["intent"] == "google_calendar"
+        else:
+            assert routed["gmail_plan"]["intent"] == expected_tool
+
+
+def test_calendar_create_request_is_never_sent_to_gmail_or_claimed_successful():
+    text = (
+        "I want to add a meeting in my calendar today at 11 PM with my friend."
+    )
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        text,
+        user_timezone="America/Los_Angeles",
+        request_time=datetime(2026, 11, 4, 17, 0, tzinfo=ZoneInfo("UTC")),
+    ))
+    response = calendar_agent_node(
+        {
+            **_state(text),
+            "gmail_plan": routed["gmail_plan"],
+        },
+        SimpleNamespace(context={}),
+    )["assistant_response"]
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "clarify"
+    assert "Calendar changes are not available" in response
+    assert "I have not created or modified anything" in response
+    assert "created successfully" not in response.casefold()
+    assert "gmail_search" not in str(routed["gmail_plan"])
+
+
+def test_calendar_month_plan_uses_request_time_and_selected_timezone():
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Show my calendar this month.",
+        user_timezone="America/Los_Angeles",
+        request_time=datetime(2026, 11, 4, 17, 0, tzinfo=ZoneInfo("UTC")),
+    ))
+    arguments = routed["gmail_plan"]["calendar_arguments"]
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "list_calendar_events"
+    assert arguments["time_min"] == "2026-11-01T00:00:00-07:00"
+    assert arguments["time_max"] == "2026-12-01T00:00:00-08:00"
+    assert arguments["time_zone"] == "America/Los_Angeles"
 
 
 def test_capability_questions_use_a_deterministic_capability_route():

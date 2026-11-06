@@ -103,7 +103,7 @@ describe('memory preference controls', () => {
     expect(checkbox).toBeChecked()
     expect(screen.getByText('Personal details may be saved to help future conversations.'))
       .toBeInTheDocument()
-    expect(checkbox.nextElementSibling).toHaveClass('bg-gradient-to-br')
+    expect(checkbox.nextElementSibling).toHaveClass('bg-emerald-600')
 
     fireEvent.click(checkbox)
     await waitFor(() => {

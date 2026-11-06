@@ -40,7 +40,8 @@ def _clarification(state: ChatState) -> str:
             "Calendar events?"
         )
     if re.search(r"\b(?:create|add|book|schedule|cancel|delete|remove|"
-                 r"update|edit|change|modify|invite|rsvp)\b", lowered):
+                 r"update|edit|change|modify|move|reschedule|invite|rsvp)\b",
+                 lowered):
         return (
             "I can read your Google Calendar, but Calendar changes are not "
             "available. I have not created or modified anything."

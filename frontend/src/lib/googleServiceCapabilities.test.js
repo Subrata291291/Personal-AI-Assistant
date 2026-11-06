@@ -18,13 +18,13 @@ describe('Google Workspace capability counting', () => {
   it.each([
     [{ gmail: true }, 1],
     [{ gmail: true, calendar_events_read: true }, 2],
-    [{ gmail: true, calendar_events_read: true, drive_files_read: true }, 3],
+    [{ gmail: true, calendar_events_read: true, drive_files_read: true }, 2],
     [{
       gmail: true,
       calendar_events_read: true,
       drive_files_read: true,
       contacts_read: true,
-    }, 4],
+    }, 2],
   ])('counts each granted service once: %j', (capabilities, expected) => {
     expect(getConnectedGoogleServiceCount([
       connection('google-account', capabilities),
@@ -59,5 +59,18 @@ describe('Google Workspace capability counting', () => {
 
     expect(isGoogleServiceConnected(connections, 'gmail')).toBe(true)
     expect(isGoogleServiceConnected(connections, 'calendar')).toBe(false)
+  })
+
+  it('excludes coming-soon services from counts but reports granted capabilities', () => {
+    const connections = [
+      connection('google-account', {
+        drive_files_read: true,
+        contacts_read: true,
+      }),
+    ]
+
+    expect(getConnectedGoogleServiceCount(connections)).toBe(0)
+    expect(isGoogleServiceConnected(connections, 'drive')).toBe(true)
+    expect(isGoogleServiceConnected(connections, 'contacts')).toBe(true)
   })
 })

@@ -1,3 +1,5 @@
+import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
+
 function MemorySettingControl({
   checked,
   disabled = false,
@@ -23,7 +25,7 @@ function MemorySettingControl({
             isDark ? 'peer-focus-visible:ring-offset-slate-900' : 'peer-focus-visible:ring-offset-white'
           } ${
             checked
-              ? 'border-violet-500 bg-gradient-to-br from-violet-500 to-indigo-600 text-white shadow-sm shadow-violet-500/25'
+              ? SEMANTIC_STATUS_STYLES.positive.solid
               : isDark
                 ? 'border-slate-600 bg-slate-800 text-transparent hover:border-violet-400'
                 : 'border-slate-300 bg-white text-transparent hover:border-violet-400'
@@ -57,7 +59,7 @@ function MemorySettingControl({
         aria-live="polite"
         className={`min-w-8 text-right text-xs font-bold tracking-wide ${
           checked
-            ? 'text-violet-500'
+            ? SEMANTIC_STATUS_STYLES.positive.text
             : isDark ? 'text-slate-400' : 'text-slate-500'
         }`}
       >
@@ -76,7 +78,7 @@ function MemorySettingControl({
           isDark ? 'focus-visible:ring-offset-slate-900' : 'focus-visible:ring-offset-white'
         } ${
           checked
-            ? 'bg-gradient-to-r from-violet-600 to-indigo-600 shadow-sm shadow-violet-500/25'
+            ? SEMANTIC_STATUS_STYLES.positive.toggle
             : isDark
               ? 'bg-slate-700 hover:bg-slate-600'
               : 'bg-slate-300 hover:bg-slate-400'

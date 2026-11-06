@@ -12,6 +12,7 @@ import { Link, useOutletContext } from 'react-router-dom'
 import { api } from '../lib/api.js'
 import { formatRequestError } from '../lib/errorMessage.js'
 import { requireConnectionsResponse } from '../lib/responseValidation'
+import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
 import { gmailService } from '../services/gmailService.js'
 import { actionApprovalService } from '../services/actionApprovalService.js'
 import { useAuth } from '../context/AuthContext'
@@ -1677,9 +1678,15 @@ export default function Gmail() {
             ✉ Compose
           </button>
 
-          <div className="flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs font-semibold text-emerald-500">
+          <div className={`flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold ${
+            isGmailEnabled
+              ? SEMANTIC_STATUS_STYLES.positive.badge
+              : SEMANTIC_STATUS_STYLES.neutral.badge
+          }`}>
             <span className={`h-2 w-2 rounded-full ${
-              isGmailEnabled ? 'bg-emerald-400' : 'bg-amber-400'
+              isGmailEnabled
+                ? 'bg-emerald-500'
+                : SEMANTIC_STATUS_STYLES.neutral.dot
             }`} />
             {isGmailEnabled ? 'Read, Send & Manage access' : 'Gmail is turned off'}
           </div>
@@ -1733,7 +1740,7 @@ export default function Gmail() {
         )}
 
         {connectionsVerified && selectedConnection && (
-          <p className="mt-3 text-xs text-emerald-500">
+          <p className={`mt-3 text-xs ${SEMANTIC_STATUS_STYLES.positive.text}`}>
             Connected: {selectedConnection.email}
           </p>
         )}

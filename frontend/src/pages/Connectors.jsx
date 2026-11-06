@@ -14,6 +14,7 @@ import { api } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import GoogleServiceIcon from '../components/GoogleServiceIcon'
 import { requireConnectionsResponse } from '../lib/responseValidation'
+import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
 
 const GC_TIME = 30 * 60 * 1000
 
@@ -395,8 +396,8 @@ function Connectors() {
           role={notice.type === 'error' ? 'alert' : 'status'}
           className={`rounded-xl border p-4 text-sm ${
             notice.type === 'success'
-              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-500'
-              : 'border-red-500/30 bg-red-500/10 text-red-500'
+              ? SEMANTIC_STATUS_STYLES.positive.badge
+              : SEMANTIC_STATUS_STYLES.error.badge
           }`}
         >
           {notice.message}
@@ -495,7 +496,11 @@ function Connectors() {
                   {service.available ? (
                     <>
                       <p className={`text-xs font-medium ${
-                        isConnected ? 'text-emerald-500' : colors.muted
+                        service.partial
+                          ? SEMANTIC_STATUS_STYLES.warning.text
+                          : isConnected
+                            ? SEMANTIC_STATUS_STYLES.positive.text
+                            : SEMANTIC_STATUS_STYLES.neutral.text
                       }`}>
                         {connectionsQuery.isLoading
                           ? 'Checking connection...'
@@ -550,7 +555,7 @@ function Connectors() {
                             aria-live="polite"
                             className={`min-w-8 text-right text-xs font-bold tracking-wide ${
                               service.enabled
-                                ? 'text-violet-500'
+                                ? SEMANTIC_STATUS_STYLES.positive.text
                                 : isDark
                                   ? 'text-slate-400'
                                   : 'text-slate-500'
@@ -576,7 +581,7 @@ function Connectors() {
                                 : 'focus-visible:ring-offset-white'
                             } ${
                               service.enabled
-                                ? 'bg-gradient-to-r from-violet-600 to-indigo-600 shadow-sm shadow-violet-500/25'
+                                ? SEMANTIC_STATUS_STYLES.positive.toggle
                                 : isDark
                                   ? 'bg-slate-700 hover:bg-slate-600'
                                   : 'bg-slate-300 hover:bg-slate-400'

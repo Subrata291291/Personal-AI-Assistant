@@ -5,38 +5,27 @@ import { useAuth } from '../context/AuthContext'
 import { api } from '../lib/api.js'
 import { conversationService } from '../services/conversationService.js'
 import AppIcon from '../components/AppIcon'
+import GoogleServiceIcon from '../components/GoogleServiceIcon.jsx'
 import { memoryReviewQueryKey } from '../lib/queryKeys'
+import { requireArrayResponse } from '../lib/responseValidation'
 import {
-  requireArrayResponse,
-  requireConnectionsResponse,
-} from '../lib/responseValidation'
+  getConnectedGoogleServiceCount,
+  GOOGLE_WORKSPACE_SERVICES,
+  isGoogleServiceConnected,
+} from '../lib/googleServiceCapabilities.js'
+import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
 
-const connectors = [
-  {
-    name: 'Gmail',
-    detail: 'Email integration',
-    icon: 'gmail',
-    color: 'red',
-  },
-  {
-    name: 'Google Calendar',
-    detail: 'Events and schedule',
-    icon: 'calendar',
-    color: 'blue',
-  },
-  {
-    name: 'Google Drive',
-    detail: 'Files and documents',
-    icon: 'drive',
-    color: 'green',
-  },
-  {
-    name: 'Google Contacts',
-    detail: 'People and contacts',
-    icon: 'contacts',
-    color: 'yellow',
-  },
-]
+const CONNECTOR_DETAILS = {
+  gmail: 'Email integration',
+  calendar: 'Events and schedule',
+  drive: 'File integration is coming soon',
+  contacts: 'Contacts integration is coming soon',
+}
+
+const connectors = GOOGLE_WORKSPACE_SERVICES.map((service) => ({
+  ...service,
+  detail: CONNECTOR_DETAILS[service.id],
+}))
 
 const overviewCards = [
   {
@@ -116,30 +105,20 @@ function Dashboard() {
   const { user } = useAuth()
   const navigate = useNavigate()
 
-  const { isDark, muted, surface, hoverSurface } =
-    useOutletContext()
+  const {
+    isDark,
+    muted,
+    surface,
+    hoverSurface,
+    connections = [],
+    connectionsLoading,
+    connectionsError,
+  } =
+  useOutletContext()
 
   const userId = user?.id
 
-  const { data: connectionsData, isLoading: connectionsLoading, isError: connectionsError } = useQuery({
-    queryKey: ['oauth-connections', userId],
-    queryFn: async () =>
-      requireConnectionsResponse(
-        await api.get('/api/v1/oauth/connections'),
-      ),
-    enabled: Boolean(userId),
-    staleTime: 5 * 60 * 1000,
-    gcTime: 30 * 60 * 1000,
-    refetchOnWindowFocus: true,
-  })
-
-  const googleConnections = (connectionsData?.connections || []).filter(
-    (connection) =>
-      connection.provider === 'google' &&
-      connection.status === 'connected',
-  )
-
-  const isGmailConnected = googleConnections.length > 0
+  const connectedServiceCount = getConnectedGoogleServiceCount(connections)
 
   const metadata = user?.user_metadata || {}
 
@@ -298,7 +277,7 @@ function Dashboard() {
               ? '...'
               : connectionsError
                 ? '—'
-                : `${isGmailConnected ? 1 : 0} / ${connectors.length}`
+                : `${connectedServiceCount} / ${connectors.length}`
           }
 
           return (
@@ -432,64 +411,62 @@ function Dashboard() {
 
           <div className="mt-5 space-y-2 sm:mt-6">
 
-            {connectors.map((connector) => (
+            {connectors.map((connector) => {
+              const isConnected = isGoogleServiceConnected(
+                connections,
+                connector.id,
+              )
+              const isComingSoon = connector.comingSoon
 
-              <div
-                key={connector.name}
-                className={`flex min-w-0 items-center gap-3 rounded-xl p-3 transition sm:p-3.5 ${hoverSurface}`}
-              >
-
+              return (
                 <div
-                  className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl sm:h-11 sm:w-11 ${
-                    connector.color === 'red'
-                      ? 'bg-red-500/10 text-red-400'
-                      : connector.color === 'blue'
-                        ? 'bg-blue-500/10 text-blue-400'
-                        : connector.color === 'green'
-                          ? 'bg-emerald-500/10 text-emerald-400'
-                          : 'bg-yellow-500/10 text-yellow-400'
-                  }`}
+                  key={connector.id}
+                  className={`flex min-w-0 items-center gap-3 rounded-xl p-3 transition sm:p-3.5 ${hoverSurface}`}
                 >
-                  <AppIcon name={connector.icon} className="h-5 w-5" />
-                </div>
 
-                <div className="min-w-0 flex-1">
-
-                  <div className="truncate text-sm font-semibold">
-                    {connector.name}
+                  <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl sm:h-11 sm:w-11 ${
+                    isDark ? 'bg-[#1b1e2b]' : 'bg-slate-50'
+                  }`}>
+                    <GoogleServiceIcon service={connector.id} />
                   </div>
 
-                  <div className={`mt-1 truncate text-xs ${muted}`}>
-                    {connector.name === 'Gmail' && isGmailConnected
-                      ? `${googleConnections.length} Google account${googleConnections.length === 1 ? '' : 's'} connected`
-                      : connector.detail}
+                  <div className="min-w-0 flex-1">
+
+                    <div className="truncate text-sm font-semibold">
+                      {connector.label}
+                    </div>
+
+                    <div className={`mt-1 truncate text-xs ${muted}`}>
+                      {connector.detail}
+                    </div>
+
                   </div>
 
-                </div>
-
-                <span
-                  className={`shrink-0 rounded-full px-2 py-1 text-[10px] sm:px-3 sm:text-xs ${
-                    connector.name === 'Gmail' && isGmailConnected
-                      ? 'bg-emerald-500/10 text-emerald-500'
-                      : isDark
-                        ? 'bg-[#292d3c] text-slate-400'
-                        : 'bg-slate-100 text-slate-500'
-                  }`}
-                >
-                  {connector.name === 'Gmail'
-                    ? connectionsLoading
-                      ? 'Checking...'
+                  <span
+                    className={`shrink-0 rounded-full border px-2 py-1 text-[10px] sm:px-3 sm:text-xs ${
+                      connectionsLoading
+                        ? SEMANTIC_STATUS_STYLES.neutral.badge
+                        : connectionsError
+                          ? SEMANTIC_STATUS_STYLES.error.badge
+                          : isConnected && !isComingSoon
+                            ? SEMANTIC_STATUS_STYLES.positive.badge
+                            : SEMANTIC_STATUS_STYLES.neutral.badge
+                    }`}
+                  >
+                    {connectionsLoading
+                      ? 'Checking…'
                       : connectionsError
                         ? 'Unavailable'
-                        : isGmailConnected
-                          ? 'Connected'
-                          : 'Not connected'
-                    : 'Coming soon'}
-                </span>
+                        : isComingSoon
+                          ? 'Coming soon'
+                          : isConnected
+                            ? 'Connected'
+                            : 'Not connected'}
+                  </span>
 
-              </div>
-
-            ))}
+                </div>
+              )
+            })}
 
           </div>
 

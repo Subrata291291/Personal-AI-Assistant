@@ -20,6 +20,7 @@ import {
   GOOGLE_WORKSPACE_SERVICES,
   isGoogleServiceConnected,
 } from '../../lib/googleServiceCapabilities.js'
+import { SEMANTIC_STATUS_STYLES } from '../../lib/semanticStatusStyles.js'
 
 const integrationItems = [
   { name: 'Connectors', path: '/dashboard/connectors', icon: 'connectors' },
@@ -283,7 +284,19 @@ function DashboardLayout() {
                       <span className="block truncate">{item.name}</span>
                       {item.serviceId && (
                         <span className={`mt-0.5 block truncate text-[10px] ${
-                          isDark ? 'text-slate-500' : 'text-slate-400'
+                          connectionsQuery.isLoading
+                            ? SEMANTIC_STATUS_STYLES.neutral.text
+                            : connectionsQuery.isError
+                              ? SEMANTIC_STATUS_STYLES.error.text
+                              : isGoogleServiceConnected(
+                                  connections,
+                                  item.serviceId,
+                                )
+                                ? item.serviceId === 'drive' ||
+                                  item.serviceId === 'contacts'
+                                  ? SEMANTIC_STATUS_STYLES.neutral.text
+                                  : SEMANTIC_STATUS_STYLES.positive.text
+                                : SEMANTIC_STATUS_STYLES.neutral.text
                         }`}>
                           {connectionsQuery.isLoading
                             ? 'Checking connection'
