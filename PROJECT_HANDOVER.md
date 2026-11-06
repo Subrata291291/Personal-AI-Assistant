@@ -1,37 +1,43 @@
 # Personal AI Assistant — Technical Project Handover
 
 This document is a source-checked handover for continuing development in a
-new coding assistant session. It describes the repository as inspected on
-**2026-11-05**; it is not proof of live production configuration or status.
-Read this alongside [README.md](./README.md).
+new coding assistant session. Its historical source-inspection baseline is
+commit `703242d` (`main`), not the current working-tree or staged snapshot;
+subsequent changes are not included in that commit. The worktree was clean
+before the documentation-only update made at that inspection. This is not
+proof of live production configuration or status. Read this alongside
+[README.md](./README.md).
 
 ## A. Project Identity and Current Status
 
 - **Project:** Personal AI Assistant.
-- **Purpose:** multi-user conversational assistant with persistent memory and
-  Gmail integration.
+- **Purpose:** multi-user conversational assistant with persistent memory,
+  Gmail integration, and Google Calendar access.
 - **Repository:** `Subrata291291/Personal-AI-Assistant`.
 - **Workspace inspected:** `C:\Users\ASUS\Desktop\personal_ai_assistant`.
 - **Branch:** `main`.
-- **Latest commit at inspection:** `63b0fa0` — `Type approval query parameters explicitly`.
-- **Git state before Phase 1:** a pre-existing deletion of the root-level
-  `verify_email_parser.py`. It remains untouched; do not restore or stage it
-  without the user's direction.
+- **Latest commit at inspection:** `703242d` — `Add approved Calendar event creation and integration toggles`.
+- **Git state at inspection:** clean; `main` and `origin/main` both point at
+  `703242d`.
 - **Application status:** source implements the frontend, API, memory pipeline,
-  Gmail integration, approval-backed Gmail sends, and Calendar-specific OAuth
-  connection/capability reporting plus authenticated read-only Calendar event
-  and FreeBusy endpoints. Calendar Assistant tools, event UI, and write
-  operations remain unimplemented.
+  Gmail integration and approval-backed Gmail sends, authenticated Calendar
+  reads/tools, approval-backed Calendar Create/Update/Delete workflows, and
+  Connected Apps integration preferences. Each Calendar write operation has
+  its own feature flag, and all three flags default to `false`. Connected Apps
+  includes a per-account “Grant Calendar write access” control.
 - **Production status:** deployment and Google/Supabase dashboards were not
-  inspected. Do not infer that the latest commit is deployed. The production
-  frontend origin `https://www.myorbitai.in` appears in backend defaults/CORS,
-  but actual live frontend/backend URLs and release state must be confirmed.
+  inspected. Production migration status was reported as complete through
+  `c9f42a71e6b3`; this report was not independently verified here. Do not infer
+  that the latest commit is deployed. The production frontend origin
+  `https://www.myorbitai.in` appears in backend defaults/CORS, but actual live
+  frontend/backend URLs and release state must be confirmed.
 - **Repository map:** `backend/app/` contains the API, services, repositories,
   database models, LLM providers, memory, Google integration, and LangGraph
   workflows; `backend/db_migrations/versions/` contains Alembic revisions;
   `backend/tests/` contains pytest coverage. `frontend/src/` contains routes,
   components, contexts, API/service clients, and tests. Root configuration
-  includes `alembic.ini`, `.env.example`, and frontend package configuration.
+  includes `alembic.ini`, `.env.example`, root `requirements.txt`, and frontend
+  package configuration.
 - **Current production diagnostic limitation:** a reported Gmail approval
   “Failed to fetch” could not be tied to a specific production network,
   preflight, API, validation, or database failure because Render logs and
@@ -53,7 +59,9 @@ Read this alongside [README.md](./README.md).
 | Frontend tests/lint | Vitest `^5.1.0`, jsdom `^30.1.3`, Testing Library, oxlint `^1.89.0`. |
 | Hosting intent | Render for backend, Netlify for frontend, Supabase for Auth/PostgreSQL. No Render or Netlify deployment manifest is tracked. |
 
-Python versions are pinned in [backend/requirements.txt](./backend/requirements.txt).
+Python versions and core backend packages are pinned in the root
+[requirements.txt](./requirements.txt); `backend/requirements.txt` currently
+contains only `email-validator==2.3.0`.
 There is no `pyproject.toml` or `.python-version` defining a different Python
 range. `frontend/package.json` has no `engines` declaration; Vite 8's installed
 package declares Node.js `^20.19.0 || >=22.12.0`. The local environment at
@@ -78,7 +86,7 @@ flowchart LR
   Graph --> LLM[LLM fallback router]
   Graph --> GmailAgent[Gmail planner/agent]
   GmailAgent --> GoogleAPI[Google Gmail API]
-  API --> CalendarAPI[Google Calendar API - read only]
+  API --> CalendarAPI[Google Calendar API - read + gated create]
   API --> OAuth[Google OAuth callback]
   OAuth --> DB
   GoogleAPI --> DB
@@ -118,17 +126,20 @@ flowchart LR
   paths over PostgreSQL.
 - Google integrations are implemented in `backend/app/integrations/google/`
   and Gmail-specific operations in `backend/app/services/gmail_service.py`.
-  Read-only Calendar operations use
-  `backend/app/services/calendar_service.py`.
+  Calendar reads and create-event authorization use
+  `backend/app/services/calendar_service.py`; the separate
+  `CalendarActionExecutor` owns the gated create mutation.
 
 ### Database
 
 PostgreSQL is the system of record for conversations, messages, chat request
 leases/idempotency, memories/reviews, settings, Google connections, OAuth
-credentials, and OAuth states. The app has SQLAlchemy models and Alembic
-migrations; `ChatRequestRepository` and some approval/draft metadata use SQL
-against existing tables. The current action-approval record is JSON metadata
-on `pa_conversation_messages`; there is no action-approval table or migration.
+credentials/states, and Calendar action operations. The app has SQLAlchemy
+models and Alembic migrations; `ChatRequestRepository` and approval/draft
+metadata use SQL against existing tables. Approval proposals remain JSON
+metadata on `pa_conversation_messages`; Calendar writes additionally have a
+durable `pa_calendar_action_operations` journal. There is no separate generic
+action-approval table.
 
 ### Authentication distinction
 
@@ -158,11 +169,11 @@ sequenceDiagram
   participant UI as Frontend draft/review UI
   participant API as FastAPI approvals
   participant DB as PostgreSQL
-  participant X as GmailActionExecutor
-  participant G as Gmail API
+  participant X as GmailActionExecutor or CalendarActionExecutor
+  participant G as Gmail or Calendar API
   U->>UI: Edit preview and choose Send Email
   UI->>API: Create approval proposal (no send)
-  API->>DB: Persist pending proposal
+  API->>DB: Persist pending proposal and Calendar journal row if applicable
   API-->>UI: Pending proposal
   U->>UI: Explicitly approve
   UI->>API: POST approve
@@ -170,9 +181,10 @@ sequenceDiagram
   U->>UI: Explicitly choose Send approved draft
   UI->>API: POST execute
   API->>DB: Claim execution once
-  API->>X: Execute approved send
-  X->>G: Gmail send
-  X->>DB: Persist completed/failed/uncertain result
+  API->>X: Dispatch supported approved action
+  X->>G: Submit one integration mutation attempt
+  X->>G: Read back/reconcile when required
+  X->>DB: Persist result and synchronize Calendar journal if applicable
   API-->>UI: Updated proposal state
 ```
 
@@ -189,15 +201,17 @@ verification. API routes are relative to `/api/v1`.
 | Idempotent chat | Implemented | `Assistant.jsx`, `conversationService.js` | `POST /chat`, `ChatService`, `ChatRequestRepository` | `pa_chat_requests`, request/message IDs and leases; `backend/tests/test_gmail_intent_routing.py` exercises workflow behavior | Requires a valid database target and backend environment. |
 | General assistant and LLM fallback | Implemented | `Assistant.jsx`, `AssistantMarkdown.jsx` | `ChatService`, LangGraph, `llm/` | Persisted provider/model/completion metadata | Responses can stop at provider output limits; automatic continuation is not implemented. |
 | Persistent memory | Implemented, with operational caveats | `MemoryCenter.jsx`, `Settings.jsx`, `MemorySettingControl.jsx` | `/memories`, `/memory-reviews`, `/users/me/settings`; `MemoryService`, `MemoryPipeline` | `pa_memories`, `pa_memory_reviews`, `pa_user_settings`, pgvector | Dedicated backend pytest coverage is limited; see §F/J. Disabling automatic storage does not necessarily disable retrieval. |
-| Google account connection | Implemented | `Connectors.jsx`, `gmailAccountSelection.js` | `/oauth/google/connect?service=gmail|calendar`, `/oauth/google/callback`, `/oauth/connections` | `pa_user_connections`, `pa_oauth_states`, `pa_oauth_credentials`; actual returned scopes are merged per user-owned Google account | Gmail and Calendar request independent scopes; credentials may be shared. Disconnect is account-wide and removes credentials locally without revoking Google authorization. |
-| Calendar OAuth capability | Phase 1 implemented | `Connectors.jsx` | Calendar-specific OAuth consent and scope-based capability reporting | Existing Google credential scope array; no Calendar migration | Requests event-read and FreeBusy scopes independently of Gmail; Google Cloud API enablement and consent-screen configuration are unverified. |
-| Google Calendar read API | Implemented; backend only | None | `/calendar/events`, `/calendar/events/{event_id}`, `/calendar/schedule/today`, `/calendar/schedule`, `/calendar/freebusy` | Existing user-owned encrypted Google credentials; `backend/tests/test_calendar.py`; no schema changes | Read-only event and FreeBusy operations. No Calendar event UI or write operations. |
+| Google account connection | Implemented | `Connectors.jsx`, `gmailAccountSelection.js` | `/oauth/google/connect?service=gmail|calendar|calendar_write`, `/oauth/google/callback`, `/oauth/connections` | `pa_user_connections`, `pa_oauth_states`, `pa_oauth_credentials`; actual returned scopes are merged per user-owned Google account | Gmail, Calendar read, and Calendar write use service-specific grants. Calendar write consent requires selecting an existing connected Google account and is bound to the initiating user and selected connection. Disconnect is account-wide and removes credentials locally without revoking Google authorization. |
+| Integration ON/OFF preferences | Implemented | `Connectors.jsx` | Authenticated Supabase user metadata; enforced in chat, direct integration routers, and approval creation/execution | `gmail_enabled` and `calendar_enabled` in user metadata; missing values default to enabled | OFF preserves OAuth connection and credentials. Default Calendar account selector is absent; backend resolution still reads its existing preference. |
+| Calendar OAuth capability | Implemented | `Connectors.jsx` | Calendar-specific OAuth consent and scope-based capability reporting | Existing Google credential scope array; no separate permission table | Read and FreeBusy scopes are requested by `service=calendar`; incremental Calendar write consent requests `calendar.events`. Connected Apps exposes “Grant Calendar write access” for a selected connected account. Google Cloud API enablement and consent-screen configuration are unverified. |
+| Google Calendar read API | Implemented; backend and chat tools | No event-management page | `/calendar/events`, `/calendar/events/{event_id}`, `/calendar/schedule/today`, `/calendar/schedule`, `/calendar/freebusy`; read-only chat tools | Existing user-owned encrypted Google credentials; `backend/tests/test_calendar.py`, Calendar tool tests | Event reads and FreeBusy remain read-only. No event-management UI. |
+| Calendar Create, Update, and Delete | Implemented in code; independently gated | Chat approval card; no Calendar event-management page | Shared `/action-approvals` API; `CalendarActionExecutor` | Proposal in conversation-message metadata plus `pa_calendar_action_operations`; operation identity and fingerprint | All three operations execute only through the approval workflow and each has an independent flag: `CALENDAR_CREATE_EVENT_ENABLED`, `CALENDAR_UPDATE_EVENT_ENABLED`, and `CALENDAR_DELETE_EVENT_ENABLED`. All default to `false`. The selected connected account must have the `calendar.events` grant; see the migration chain in §I. |
 | Gmail browse/read/search | Implemented | `Gmail.jsx`, `gmailService.js`, `SenderAvatar.jsx`, `gmailTimestamp.js` | `/gmail/messages`, `/gmail/messages/{message_id}` | Google Gmail API; `backend/tests/test_gmail_received_timestamp.py`, `test_connection_capabilities.py`; frontend `Gmail.test.jsx`, `gmailService.test.js` | Requires a connected account with required grant. |
 | Gmail direct mailbox write actions | Implemented as direct authenticated API/UI operations | `Gmail.jsx`, `gmailService.js` | `/gmail/messages/send`, `/{id}/trash`, `/{id}/untrash`, `/{id}/archive`, `/{id}/delete-permanently`, `/{id}/reply`, `/{id}/reply-all`, `/{id}/forward` | Gmail API; `backend/tests/test_gmail_archive.py` and frontend Gmail tests | These endpoints are not all routed through `GmailActionExecutor`; do not claim approval is a universal backend gate. Assistant planning explicitly reports archive/delete unavailable. |
 | Chat email preview and Gmail draft save | Implemented | `EmailDraftCard.jsx`, `conversationService.js` | `PATCH /conversations/{conversation_id}/messages/{message_id}/draft`, `POST .../{message_id}/draft/save`, `GET .../{message_id}/draft/save-status` | Draft state/operation metadata stored with conversation messages; `backend/tests/test_gmail_draft_save.py`, frontend `EmailDraftCard.test.jsx`, `conversationService.test.js` | A preview is not a Gmail draft until Save Draft completes. Gmail write operation must be reconciled before retry. |
-| Approval-backed Gmail sending | Implemented in code and mocked tests | `EmailDraftCard.jsx`, `ActionApprovalCard.jsx`, `Gmail.jsx`, `actionApprovalService.js` | `/action-approvals` routes; `ActionApprovalService`, `GmailActionExecutor` | Proposal is JSON in message metadata; idempotency uses an existing proposal record. `backend/tests/test_gmail_draft_send_approval.py`, `test_action_approval_idempotency.py`, frontend approval/Gmail tests | Live production failure cause and deployment status are unverified. Executor supports only `gmail.send` and `gmail.send_draft`. |
+| Approval-backed Gmail sending | Implemented in code and mocked tests | `EmailDraftCard.jsx`, `ActionApprovalCard.jsx`, `Gmail.jsx`, `actionApprovalService.js` | `/action-approvals` routes; `ActionApprovalService`, `GmailActionExecutor` | Proposal is JSON in message metadata; draft-send idempotency uses a deterministic proposal record. `backend/tests/test_gmail_draft_send_approval.py`, `test_action_approval_idempotency.py`, frontend approval/Gmail tests | Live production failure cause and deployment status are unverified. `GmailActionExecutor` remains Gmail-specific and executes only `gmail.send` and `gmail.send_draft`. |
 | Gmail attachment access | Implemented for read/download | `Gmail.jsx`, `gmailService.js` | `GET /gmail/messages/{message_id}/attachments/{attachment_id}` | Gmail API; backend attachment tests; frontend Gmail tests | Draft send review blocks drafts with attachments rather than risking loss of attachment data. |
-| Google Calendar Assistant access; Drive, Contacts, tasks | Calendar read-only chat tools implemented; Drive, Contacts, and tasks remain unsupported | Calendar event UI is absent; other connector cards remain placeholders | `calendar_agent` invokes only the existing read-only Calendar tools; other integration routes remain unavailable | Per-user stored grants select separate event-read and FreeBusy connections; `CalendarService` revalidates ownership and scopes | No Calendar write service or event UI. |
+| Google Calendar Assistant access; Drive, Contacts, tasks | Calendar read-only tools and approval-gated Create/Update/Delete workflows implemented; Drive, Contacts, and tasks remain unsupported | Shared approval card in chat; no Calendar event-management page; other connector cards remain placeholders | `calendar_agent` invokes read tools or prepares a write proposal; `CalendarActionExecutor` performs the independently gated operation | Per-user stored grants select owned event-read, FreeBusy, and write connections; the service revalidates ownership and scopes | All Calendar write flags default off; Connected Apps exposes the write-consent control. Live deployment and Google Cloud status are unverified. |
 
 ### API route index
 
@@ -219,7 +233,7 @@ bearer token.
 | `POST /conversations/{conversation_id}/messages/{message_id}/draft/save` | Save preview to Gmail using UUID `connection_id` and `operation_id` body fields. |
 | `GET /conversations/{conversation_id}/messages/{message_id}/draft/save-status` | Reconcile save using connection/operation query fields. |
 | `POST /chat` | Idempotent assistant request; requires the `Idempotency-Key` header. |
-| `POST /oauth/google/connect?service=gmail|calendar`, `GET /oauth/google/callback` | Start service-scoped Google OAuth (Gmail is the default for older callers) and handle callback. |
+| `POST /oauth/google/connect?service=gmail|calendar|calendar_write`, `GET /oauth/google/callback` | Start service-scoped Google OAuth (Gmail is the default for older callers); `calendar_write` requests the Calendar events write scope incrementally. |
 | `GET /oauth/connections`, `DELETE /oauth/connections/{connection_id}` | List service-specific granted capabilities and disconnect the shared Google account locally; deletion affects both services and does not revoke authorization at Google. |
 | `POST`, `GET /memories`; `GET`, `PATCH`, `DELETE /memories/{memory_id}` | User-scoped memory CRUD. |
 | `GET /memory-reviews`, `POST /memory-reviews/{review_id}/accept`, `POST /memory-reviews/{review_id}/reject` | Review ambiguous memory updates. |
@@ -233,7 +247,7 @@ bearer token.
 | `POST /gmail/messages/{message_id}/trash`, `/untrash`, `/archive`, `/delete-permanently` | Direct mailbox state changes. |
 | `POST /gmail/messages/{message_id}/reply`, `/reply-all`, `/forward` | Direct Gmail reply/forward APIs. |
 | `POST /action-approvals/gmail-drafts/{message_id}`, `GET /action-approvals/gmail-drafts/approval/{idempotency_key}` | Create/reconcile proposal for sending an existing Gmail draft. |
-| `POST /action-approvals`, `GET /action-approvals`, `GET /action-approvals/{proposal_id}` | Create generic proposal, list pending proposals, get/reconcile proposal. |
+| `POST /action-approvals`, `GET /action-approvals`, `GET /action-approvals/{proposal_id}` | Create a supported generic proposal, list pending proposals, get/reconcile proposal. Calendar create reconciliation reads the deterministic event ID back from Google. |
 | `POST /action-approvals/{proposal_id}/approve`, `/reject`, `/execute` | Explicit proposal decision and execution. |
 
 ### Calendar AI tools and LangGraph route (Phases 3A–3B)
@@ -258,9 +272,122 @@ arguments do not include user or connection IDs. Scope-gated registration
 enables event tools and FreeBusy independently. Intent routing supports common
 upcoming, daily, weekly, event lookup, and availability requests; ambiguous
 intervals are clarified. Responses are rendered from tool results, and
-incomplete FreeBusy data never produces an availability claim. There are no
-event mutation tools; Calendar writes and a Calendar frontend remain out of
-scope.
+incomplete FreeBusy data never produces an availability claim. The chat
+workflow can also prepare `calendar.create_event` as an approval proposal;
+the read-only tools themselves never mutate Calendar. There is no Calendar
+event-management page.
+
+### Calendar Create, Update, and Delete approval workflow
+
+Calendar `create_event`, `update_event`, and `delete_event` are supported
+through the shared approval workflow. The user must approve the exact proposal
+before separately selecting execution. `CalendarActionExecutor` dispatches
+these Calendar operations; `GmailActionExecutor` remains Gmail-specific.
+Each operation is protected by its own server-side feature flag, all defaulting
+to `false`: `CALENDAR_CREATE_EVENT_ENABLED`,
+`CALENDAR_UPDATE_EVENT_ENABLED`, and `CALENDAR_DELETE_EVENT_ENABLED`.
+Operation-specific validation and provider reconciliation are described in
+the implementation and tests; the detailed examples below primarily describe
+the create path.
+
+The chat planner prepares a proposal; it cannot call the Google mutation API.
+The user must first approve the exact proposal, then separately select the
+execute action. The shared API routes are:
+
+- `POST /api/v1/action-approvals` — create a validated generic action proposal,
+  including Calendar create.
+- `GET /api/v1/action-approvals` — list pending/approved proposals.
+- `GET /api/v1/action-approvals/{proposal_id}` — get status and reconcile a
+  Calendar operation in `executing` or `execution_uncertain`.
+- `POST /api/v1/action-approvals/{proposal_id}/approve`
+- `POST /api/v1/action-approvals/{proposal_id}/execute`
+- `POST /api/v1/action-approvals/{proposal_id}/reject`
+
+Proposal parameters are strict and reject unknown fields. Create Event
+requires `calendar_id`, `summary`, `start`, `end`, and `all_day`; optional
+fields are `description`, `time_zone`, `location`, and `attendees`. Limits
+include a 1,024-character calendar ID and summary, 8,000-character
+description, 1,024-character location, and at most 50 attendees. Attendee
+addresses are validated and deduplicated. Timed events require RFC3339
+timestamps with explicit offsets and a valid IANA timezone. Each offset must
+match that timezone at the specified time; nonexistent wall times are
+rejected, and the explicit offset distinguishes an ambiguous DST occurrence.
+All-day events require date-only `YYYY-MM-DD` values, omit `time_zone`, and
+use an exclusive end date later than the start date.
+
+The executor uses the authenticated user ID and proposal-stored connection
+ID; it does not accept an LLM-supplied owner or connection. It rechecks active
+connection ownership, the stored `calendar.events` OAuth grant, and target
+calendar access immediately before execution. The user's Connected Apps
+preference and the applicable operation-specific feature flag must also be
+enabled.
+
+The proposal TTL is 15 minutes. Its supported lifecycle is `pending` to
+`approved` or `rejected` (or `expired`); `approved` can transition to
+`executing` or `expired`; `executing` resolves to `completed`, `failed`, or
+`execution_uncertain`. An uncertain operation may become `completed` only
+after a matching provider read-back, or `failed` only when reconciliation
+establishes it was not executed. There is no user-facing cancellation route.
+Conditional state updates prevent competing approvals/executions from
+claiming the same proposal; the Calendar journal and proposal metadata are
+updated together in a database transaction. Bulk expiration also updates
+pending/approved Calendar journal rows. No live PostgreSQL concurrency or
+transaction behavior has been exercised in this documentation review.
+
+Calendar operation integrity uses canonical JSON (sorted keys, compact
+encoding, finite numeric values only), SHA-256 payload fingerprints, and
+stable operation UUIDs tied to the proposal and fingerprint. Create uses a
+deterministic Google event ID and private extended properties containing the
+operation ID and fingerprint. The proposal ID created from chat is stable for
+the same user and chat request UUID; operation identity is proposal-scoped,
+not global deduplication for semantically identical proposals created by
+different chat requests. Reusing an operation identity with a different
+fingerprint is rejected. The Google mutation transport sends one attempt; it
+does not apply the retry loop used for ordinary Google GETs.
+After a possible transmission, timeout, accepted response, or duplicate event
+ID, the executor reads the deterministic event ID back and checks the
+operation markers and requested fields. A confirmed match completes the
+proposal; missing or conflicting read-back leaves it uncertain for
+reconciliation/manual review. Do not retry by creating a new proposal or
+blindly resending the mutation.
+
+Connection failures known to occur before transmission are classified as
+not-transmitted; later transport timeouts/network failures are uncertain.
+Successful provider responses still require read-back confirmation before the
+proposal completes. An event ID conflict is reconciled against the existing
+event's private operation marker; a mismatch is not treated as this operation's
+success. API errors are sanitized: 401/403 map to a permission response, 404
+to an unavailable-calendar response, 429/5xx to temporary unavailability with
+no automatic mutation retry, and other provider rejections to a gateway error.
+
+Approval proposals remain JSON in `pa_conversation_messages` metadata. The
+Calendar-specific `pa_calendar_action_operations` row durably journals
+identity, fingerprint, execution state, attempt count, provider classification,
+and reconciliation status. Proposal and operation state are synchronized by
+transactional, conditional updates. The migration chain is
+`b1c4d2e8a730` (create the operation journal), followed by
+`c9f42a71e6b3` (bind Calendar write OAuth state to the selected connection).
+Production is reported as migrated through `c9f42a71e6b3`; this handover did
+not independently query the live database. Confirm the deployed revision,
+database role, actual Google grants, and OAuth consent configuration before
+enabling any write flag.
+
+**Release/readiness caveats:** all three Calendar write operations remain
+disabled by default. Connected Apps exposes a per-account `calendar_write`
+grant control, which requires selecting an existing connected account. The
+OAuth state is bound to the initiating user and selected connection.
+Production is reported at migration revision `c9f42a71e6b3`; verify the live
+revision and database role before relying on that state. Confirm actual Google
+grants and OAuth consent configuration before enabling any write flag.
+
+The ON/OFF preferences are `gmail_enabled` and `calendar_enabled` in the
+authenticated Supabase user's `user_metadata`, not `pa_user_settings`.
+Absent metadata means enabled for existing users. The backend checks the
+preference for chat routing, direct Gmail/Calendar API access, approval
+creation, and execution; switching OFF does not disconnect the Google
+connection. The default Calendar connection ID used by existing Calendar
+read flows remains a backend-resolved preference in that same user metadata;
+the read-account selector was removed.
 
 ## E. Gmail Integration — Detailed Technical Handover
 
@@ -306,11 +433,17 @@ scopes from the Gmail configuration.
 | `https://mail.google.com/` | Permanent Gmail deletion | Permanent-delete method; this is broader than an ordinary read or send grant. |
 | `https://www.googleapis.com/auth/calendar.events.readonly` | Read Calendar events on calendars the user can access | Requested by Calendar OAuth for `events.list` and `events.get`. |
 | `https://www.googleapis.com/auth/calendar.events.freebusy` | Read FreeBusy availability | Requested by Calendar OAuth for `freeBusy.query`; it does not grant event details. |
+| `https://www.googleapis.com/auth/calendar.events` | Create, update, and delete Calendar events | Requested incrementally by `service=calendar_write` after the user selects an existing connected Google account in Connected Apps. |
 
-`POST /oauth/google/connect?service=calendar` requests both Calendar scopes
-above plus the identity scopes. It uses incremental authorization and callback
-processing preserves previously stored grants and refresh tokens. Capabilities
-are derived from stored scopes returned by Google, not merely the request.
+`POST /oauth/google/connect?service=calendar` requests both Calendar read
+scopes above plus the identity scopes. For write consent, the user selects an
+existing connected Google account and the Connected Apps “Grant Calendar
+write access” control starts `service=calendar_write`, which requests
+`calendar.events` incrementally with the identity scopes. OAuth state binds
+the consent to the initiating user and selected connection; callback
+processing verifies the returned Google identity matches that connection and
+preserves previously stored grants and refresh tokens. Capabilities are
+derived from stored scopes returned by Google, not merely the request.
 Calendar event reads accept the requested `calendar.events.readonly` scope,
 `calendar.readonly`, `calendar`, and the previous `calendar.events` grant for
 backwards compatibility. FreeBusy accepts only Google's documented compatible
@@ -320,27 +453,30 @@ and `calendar`. In particular, `calendar.events` and
 
 Connected Apps reports event-read access, FreeBusy access, partial versus
 complete read-only Calendar API availability, and Calendar chat-tool
-availability separately. Existing `calendar.events` connections remain usable
-for event reads and can select
-“Grant missing Calendar permissions” to request the new scopes; incremental
-authorization preserves Gmail grants and existing refresh tokens. A declined
-or partial grant is not reported as full Calendar API availability. No
-Calendar chat tools or event mutation endpoints are implemented. Reauthorization
-does not revoke a previously granted `calendar.events` scope; it remains stored
-for backwards-compatible reads and is not used to perform Calendar mutations.
+availability separately. Existing connections can select
+“Grant missing Calendar permissions” for missing Calendar read scopes;
+incremental authorization preserves Gmail grants and existing refresh tokens.
+A declined or partial grant is not reported as full Calendar API availability.
+Read-only Calendar chat tools are implemented. Calendar Create, Update, and
+Delete are approval-gated and feature-flagged; each has an
+independent feature flag, and all three default to `false`. Reauthorization
+does not revoke a previously granted `calendar.events` scope; the grant
+remains stored.
 
 The stored OAuth scope list can become stale if a user revokes app access
 directly in Google Account settings; this application does not have reliable
 per-scope revocation detection. It does not silently delete grants or
 credentials. Google API authorization failures are returned as safe
 permission errors without exposing provider response details or tokens.
-`ActionType` and `GoogleAPIClient.ALLOWED_HOSTS` include future integration
-names/hosts; that does not mean Calendar writes or assistant tools are wired.
+Generic approval schema names and Google API allowlisted hosts do not imply
+that a corresponding integration action is executable. Check the
+integration-specific executor and its feature gates before documenting a
+mutation as available.
 
 The OAuth consent-screen configuration and verification status were not
-inspected. Enable the Google Calendar API and configure the OAuth consent screen
-for the requested read-only Calendar scopes before deploying Calendar API
-access. Confirm scope classification, verification requirements, test-user
+inspected. Enable the Google Calendar API and configure the OAuth consent
+screen for the read scopes and, before Calendar creation, the additional write
+scope. Confirm scope classification, verification requirements, test-user
 restrictions, and production approval with the Google Cloud project owner.
 Google's method authorization lists are documented at
 [events.list](https://developers.google.com/workspace/calendar/api/v3/reference/events/list),
@@ -577,10 +713,12 @@ automatically continued; UI can mark the response as incomplete.
 `backend/app/workflows/chat_graph.py` builds a LangGraph:
 
 1. `intent_router` (implemented by `gmail_intent_router_node`) selects general,
-   daily-planning, Gmail, or unavailable integration routes.
+   daily-planning, Gmail, Calendar, or unavailable integration routes.
 2. General/daily-planning goes through `memory_retrieval` then `llm`.
 3. Gmail requests go through `gmail_agent`.
-4. Drive, Calendar, Contacts, and tasks go to an explicit unavailable node.
+4. Calendar read requests use read-only Calendar tools; eligible create
+   requests prepare a proposal for the approval API.
+5. Drive, Contacts, and tasks go to an explicit unavailable node.
 
 Gmail planning supports separate intent labels including `gmail_search`,
 `gmail_read`, `gmail_compose`, `gmail_save_draft`, `gmail_send`,
@@ -608,6 +746,14 @@ conversion without tracing runtime/worker behavior and tests.
 - Backend `get_current_user` calls Supabase Auth's `/auth/v1/user` endpoint to
   validate the bearer token; authenticated user ID is used for ownership
   filters.
+- The Gmail and Calendar ON/OFF preferences are Supabase Auth
+  `user_metadata` values named `gmail_enabled` and `calendar_enabled`.
+  Missing values default to `true`; OFF prevents the guarded integration use
+  without disconnecting the Google account. These are distinct from the
+  `pa_user_settings.memory_enabled` preference.
+- `default_calendar_connection_id` remains an existing backend account
+  selection preference in user metadata. Its selector is no longer present in
+  Connected Apps; do not remove or assume that preference is unused.
 - Authenticated Supabase clients use the user's bearer token for message and
   conversation operations. SQLAlchemy/database code also performs explicit
   ownership checks.
@@ -629,8 +775,8 @@ conversion without tracing runtime/worker behavior and tests.
   migrations.
 - App tables include `pa_conversations`, `pa_conversation_messages`,
   `pa_chat_requests`, `pa_user_settings`, `pa_user_connections`,
-  `pa_oauth_credentials`, `pa_oauth_states`, `pa_memories`, and
-  `pa_memory_reviews`.
+  `pa_oauth_credentials`, `pa_oauth_states`, `pa_memories`,
+  `pa_memory_reviews`, and `pa_calendar_action_operations`.
 - Schema relationships include Supabase `auth.users` ownership for conversations,
   settings, connections, OAuth states, memories, reviews, and chat requests;
   messages belong to conversations; memories optionally reference a source
@@ -644,22 +790,42 @@ conversion without tracing runtime/worker behavior and tests.
   message-reference fields.
 - Approval proposals and Gmail draft save operation/result metadata are
   stored with conversation-message JSON metadata; no separate approval table
-  or Gmail operation table is present in the migration history.
+  or Gmail operation table is present in the migration history. Calendar
+  operation records use the separate `pa_calendar_action_operations` table.
 - SQLAlchemy definitions are in `backend/app/db/models/`; migration files are
   in `backend/db_migrations/versions/`.
-- The checked-in migration inventory (revision ID and file purpose) is:
+- The repository migration inventory (revision ID and file purpose) is:
   `019b1ee3f7e0` conversation messages; `6ee5bbe8410e` conversations;
   `023364c627d0` OAuth states; `a73faa34ca23` user connections;
   `895f8d00188b` OAuth credentials; `90ed5bf7013b` persistent memories;
   `8a97f7715f18` user settings; `d8b6b04f83c1` chat requests;
   `6f37d9a42afe` chat request IDs on messages; `4a91c2e7b630` chat request
   lease fields; `25e053b2e67c` conversation UUID server default;
-  `a45c51b4a676` chat request execution-safety fields; and
-  `821cd57b946d` memory reviews. See each version file for exact operations
-  and `down_revision`; this inventory is not a statement of the live database
-  migration state.
+  `a45c51b4a676` chat request execution-safety fields;
+  `821cd57b946d` memory reviews;
+  `b1c4d2e8a730` Calendar action operation journal; and
+  `c9f42a71e6b3` Calendar write OAuth connection binding. See each version
+  file for exact operations and `down_revision`.
 - A read-only local `alembic heads` check returned one head,
-  `821cd57b946d`. This is not evidence that any live database has applied it.
+  `c9f42a71e6b3`. The required Calendar Write migration sequence is
+  `b1c4d2e8a730` followed by `c9f42a71e6b3`. Production is reported at
+  `c9f42a71e6b3`; this report is based on the provided production context,
+  not an independent database query.
+- The Calendar migration creates a new journal table with a primary key on
+  `proposal_id`, unique `operation_id`, partial unique index on
+  `(user_id, idempotency_key)` when the key is non-null, state/action
+  constraints, and an `auth.users` foreign key on `user_id`. The operation's
+  `connection_id` is not a database foreign key; service/repository code
+  checks active connection ownership. It enables and
+  forces RLS without creating a row policy, and revokes table grants from
+  `PUBLIC`, `anon`, `authenticated`, and `service_role`. Database access
+  therefore depends on the actual application connection principal and its
+  privileges; verify it explicitly before deployment. No existing approval
+  records are migrated; proposals remain in conversation metadata. The
+  downgrade refuses to drop the journal while operation rows exist. Validate
+  the actual production DB role and migration level before deploying code that
+  needs this table; this audit did not run the migration or inspect a live
+  database.
 
 ### Google connection credentials
 
@@ -721,7 +887,9 @@ into documentation):
 
 Backend settings also provide `GOOGLE_OAUTH_SCOPES` (default documented in
 §E), `GOOGLE_OAUTH_ACCESS_TYPE`, and `GOOGLE_OAUTH_PROMPT`; those are not
-listed in `.env.example`. The frontend additionally requires
+listed in `.env.example`. `CALENDAR_CREATE_EVENT_ENABLED` is also a backend
+setting, defaults to `false`, and is not listed in `.env.example`. The
+frontend additionally requires
 `VITE_API_BASE_URL`, `VITE_SUPABASE_URL`, and `VITE_SUPABASE_ANON_KEY`, also
 not listed in the root sample. The browser bundle must never receive the
 Supabase service-role key, OAuth client secret, database password, or LLM
@@ -755,10 +923,16 @@ Backend pytest modules include:
 - `test_gmail_draft_save.py`
 - `test_gmail_draft_send_approval.py`
 - `test_action_approval_idempotency.py`
+- `test_calendar_create_event_flow.py`
+- `test_calendar_write_infrastructure.py`
+- `test_calendar_agent_node.py`
+- `test_calendar_account_selection.py`
+- `test_calendar_tools.py`
+- `test_integration_preferences.py`
+- `test_connection_capabilities.py`
 - `test_gmail_intent_routing.py`
 - `test_gmail_archive.py`
 - `test_gmail_received_timestamp.py`
-- `test_connection_capabilities.py`
 - `test_google_oauth_redirects.py`
 - `test_cors.py`
 
@@ -767,20 +941,27 @@ Frontend regression tests include `Gmail.test.jsx`, `EmailDraftCard.test.jsx`,
 formatting tests, authentication redirect tests, connector tests, memory
 setting tests, and timestamp/avatar tests.
 
-### Last recorded verification before this docs-only task
+### Verification run for this documentation update
 
-- Backend full pytest suite: **57 passed**.
-- Frontend Vitest suite: **78 passed** across 14 files.
-- Frontend production build: succeeded; Vite warned the main minified JS chunk
-  was about 894 kB, above the 500 kB advisory threshold.
-- Frontend oxlint: completed with warnings, including existing effect/hook
-  warnings in `Gmail.jsx`, `Assistant.jsx`, `Connectors.jsx`,
-  `MemoryCenter.jsx`, `Conversations.jsx`, and `AuthContext.jsx`.
-- `git diff --check`: passed for the implementation changes.
+- Backend full pytest suite: **236 passed**.
+- Frontend Vitest suite: **90 passed** across 15 files. jsdom printed
+  navigation-not-implemented notices from tests; the suite passed.
+- Frontend production build: succeeded; Vite reported the main minified JS
+  chunk at 899.84 kB, above the 500 kB advisory threshold.
+- Frontend oxlint: exited successfully with warnings in `AuthContext.jsx`,
+  `Connectors.jsx`, `MemoryCenter.jsx`, `Assistant.jsx`, `Conversations.jsx`,
+  and `Gmail.jsx`.
+- Alembic: at the time of this earlier verification, `heads` and `history`
+  completed with repository head `b1c4d2e8a730`. The child revision
+  `c9f42a71e6b3` is now the reported repository head; no migration is run by
+  the local documentation checks.
+- `git diff --check`: passed after documentation edits; only `README.md` and
+  `PROJECT_HANDOVER.md` were changed.
 
-These are local automated checks, not a live production deployment test.
-This documentation-only update should run `git diff --check` and verify paths;
-it need not rerun application suites unless documentation tooling is added.
+These are local automated checks, not a live production deployment test. The
+tests use mocks and do not establish Google mutation outcomes, deployed RLS or
+database role behavior, OAuth consent status, or production hosting
+configuration.
 
 ### Manual verification still required
 
@@ -800,9 +981,10 @@ also not established by unit tests.
 | Medium | Some Gmail writes do not go through approval executor | Confirmed direct mailbox API routes exist; Assistant archive/delete are unavailable, but several mailbox UI writes call Gmail endpoints directly. | `backend/app/api/v1/endpoints/gmail.py`, `frontend/src/pages/Gmail.jsx`, `frontend/src/services/gmailService.js` | Confirm intended product/safety policy with the user before altering write gating. |
 | Medium | Gmail draft send with attachments | Confirmed review UI blocks drafts with attachments to avoid losing them. | `frontend/src/pages/Gmail.jsx`, `backend/app/services/gmail_service.py` | Design attachment-preserving review/send semantics before claiming support. |
 | Medium | Draft-save marker behavior on real Gmail | Mock tests exercise marker lookup and multi-page reconciliation; real Gmail preservation/visibility has not been verified. | `backend/app/integrations/google/message_builder.py`, `backend/app/services/gmail_service.py`, `backend/tests/test_gmail_draft_save.py` | Verify on a dedicated staging account using non-sensitive draft content and reconcile by the same operation ID. |
+| High | Calendar writes remain disabled by default | Create, Update, and Delete are supported through approval and have independent flags, all defaulting to `false`. Production is reported migrated through `c9f42a71e6b3`, but the live role, deployed code, actual grants, and Google OAuth verification status were not independently checked. | `backend/app/services/calendar_action_executor.py`, `backend/app/core/config.py`, `backend/db_migrations/versions/b1c4d2e8a730_create_calendar_action_operations.py`, `backend/db_migrations/versions/c9f42a71e6b3_bind_calendar_write_oauth.py`, `frontend/src/pages/Connectors.jsx` | Before enabling any flag, independently verify deployed revision, database role, Google scope approval, and consent/account-binding behavior; use a dedicated staging account for provider verification. |
 | Medium | Output length limits | Provider metadata can indicate output-limited completion; automatic continuation is not implemented. | `backend/app/llm/`, `backend/app/workflows/chat_nodes.py`, `frontend/src/components/AssistantMarkdown.jsx` | Reproduce using mock provider responses and add continuation only with idempotent/persistence design. |
 | Low | Bundle size and lint warnings | Confirmed local build warning for >500 kB main chunk and oxlint warnings. | `frontend/src/pages/Gmail.jsx`, other files named in §J, `frontend/vite.config.js` | Establish a baseline; address only when the related feature is changed or an explicit optimization task is requested. |
-| Planned | Google Drive, Calendar, Contacts, tasks/reminders | Not implemented as integrations; graph routes return an unavailable response. | `backend/app/workflows/chat_graph.py`, `chat_nodes.py`, connector UI | Treat as roadmap work, not a functioning production feature. |
+| Planned | Google Drive, Contacts, tasks/reminders | Drive, Contacts, and tasks are unavailable. Calendar Create, Update, and Delete are implemented through approval but remain disabled by their independent default-off flags. | `backend/app/workflows/chat_graph.py`, `calendar_action_executor.py`, connector UI | Do not infer deployed availability from source alone. Complete the documented rollout checks before enabling any Calendar write flag. |
 
 ## L. Pending Development Roadmap
 
@@ -815,7 +997,7 @@ Statuses reflect source/repository evidence, not user-approved priority.
 | Gmail improvements | Reassess Google OAuth scopes and approval/verification requirements; particularly the broad full-mail scope. | Requires production verification |
 | Gmail improvements | Define and implement attachment-preserving draft review/send if desired. | Pending |
 | Gmail improvements | Confirm whether all direct mailbox write actions are intended to remain outside the human-approval executor. | Requires user decision |
-| Google Calendar integration | Phases 1–3B implemented for read-only chat tools and APIs. | Calendar event UI and any future write workflow require separate design and approval |
+| Google Calendar integration | Read APIs/tools and approval-gated Create, Update, and Delete are implemented. Each write operation has an independent flag defaulting to `false`; incremental `calendar.events` consent is bound to the initiating user and selected connected account. | Independently verify the deployed migration revision, DB role, actual Google grant, and OAuth consent status; perform provider verification in staging before considering any flag enablement. |
 | Google Drive integration | Implement actual Drive service, authorization, endpoints, UI, and approvals; current intent routes are placeholders. | Pending |
 | Google Contacts integration | Implement actual Contacts API workflow and authorization; current route is a placeholder. | Pending |
 | Memory improvements | Add focused backend memory CRUD, isolation, retrieval, pipeline, and review tests. | Pending |
@@ -893,26 +1075,33 @@ Statuses reflect source/repository evidence, not user-approved priority.
    - **Expected result/tests:** documented local/browser observations and
      focused test results.
 
-6. **Start one future Google integration only after scope approval.**
-   - **Do:** choose Drive, Calendar, or Contacts; specify required read/write
-     behavior, consent scopes, UI, API, and approval rules before
-     implementation.
-   - **Why:** graph route/action schema placeholders are not implementations.
-   - **Inspect:** `backend/app/integrations/connectors/`,
-     `backend/app/workflows/chat_graph.py`,
-     `backend/app/schemas/action_approval.py`.
-   - **Dependencies:** user-approved scope and provider verification.
-   - **Expected result/tests:** complete feature slice, not a connector card or
-     schema-only declaration.
+6. **Complete Calendar Write release readiness before enabling any operation.**
+   - **Do:** verify the production migration revision and database role,
+     confirm the existing per-account `calendar_write` consent path and
+     Google OAuth review status, and test Create/Update/Delete approval and
+     reconciliation only in a dedicated staging account.
+   - **Why:** each operation's feature flag defaults off, and deployed
+     migration, role, grant, and OAuth verification status must be confirmed
+     before enabling production mutations.
+   - **Inspect:** `backend/app/services/calendar_action_executor.py`,
+     `backend/app/services/calendar_action_identity.py`,
+     `backend/app/db_migrations/versions/b1c4d2e8a730_create_calendar_action_operations.py`,
+     `backend/db_migrations/versions/c9f42a71e6b3_bind_calendar_write_oauth.py`,
+     `backend/app/services/user_connection_service.py`,
+     `frontend/src/pages/Connectors.jsx`.
+   - **Dependencies:** user/owner approval, production dashboard access, DB
+     owner confirmation, Google Cloud project owner, and staging account.
+   - **Expected result/tests:** no Calendar mutation until separately
+     authorized; prove single-attempt behavior, reconciliation, ownership,
+     and permission checks with tests/mocks first.
 
 ## N. Instructions for the Next AI Coding Assistant
 
 1. Read `README.md` first.
 2. Read this entire `PROJECT_HANDOVER.md` before changing code.
-3. Inspect `git status --short` before modifications. Preserve every user
-   change, including the currently observed deletion of the root-level
-   `verify_email_parser.py`; do not reset, clean, or restore it
-   without instruction.
+3. Inspect `git status --short` before modifications. Preserve all existing
+   user changes; do not reset, clean, or restore files that are absent or
+   deleted without instruction.
 4. Verify current source and deployment evidence; documentation and prior chat
    are not proof that runtime behavior is unchanged.
 5. Preserve existing architecture unless evidence justifies a change.

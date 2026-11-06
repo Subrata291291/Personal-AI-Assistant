@@ -1,9 +1,10 @@
 # Personal AI Assistant
 
 Personal AI Assistant is a multi-user web application for conversational
-assistance, persistent user-controlled memory, and Gmail workflows. Its
-backend is a FastAPI service; the React application authenticates users with
-Supabase and calls the backend with the current Supabase access token.
+assistance, persistent user-controlled memory, Gmail workflows, and Google
+Calendar access. Its backend is a FastAPI service; the React application
+authenticates users with Supabase and calls the backend with the current
+Supabase access token.
 
 For current implementation details, known limitations, and safe next steps,
 read [PROJECT_HANDOVER.md](./PROJECT_HANDOVER.md).
@@ -18,13 +19,21 @@ read [PROJECT_HANDOVER.md](./PROJECT_HANDOVER.md).
   management, and selected message actions.
 - Keep email composition, Gmail draft saving, approval proposals, and actual
   sending as separate operations.
+- Read Google Calendar events and availability; prepare Calendar Create,
+  Update, and Delete proposals that require explicit approval and a separate
+  execution.
 - Support pluggable language-model providers with transient-failure fallback.
 
-Implemented Google API operations include Gmail workflows and read-only Google
-Calendar event and FreeBusy endpoints. Calendar event creation and management
-are not implemented. Google Drive, Contacts, tasks, and reminders are not
-connected integrations; Assistant requests for those services receive an
-unavailable response.
+Calendar Create, Update, and Delete are supported through the approval
+workflow. Each operation has an independent backend feature flag:
+`CALENDAR_CREATE_EVENT_ENABLED`, `CALENDAR_UPDATE_EVENT_ENABLED`, and
+`CALENDAR_DELETE_EVENT_ENABLED`. All three default to `false`. Incremental
+write consent requests the `https://www.googleapis.com/auth/calendar.events`
+scope for an existing connected Google account selected by the user. Consent
+is bound to the initiating user and selected connection. Connected Apps
+includes a “Grant Calendar write access” control. Google Drive, Contacts,
+tasks, and reminders are not connected integrations; Assistant requests for
+those services receive an unavailable response.
 
 ## Technology stack
 
@@ -36,11 +45,12 @@ unavailable response.
 | Authentication | Supabase Auth; Supabase JavaScript client and backend bearer-token verification |
 | AI/LLM | Groq, OpenRouter, Google Gemini, OpenAI; Gemini embeddings |
 | Agent orchestration | LangGraph; the Python MCP SDK is a dependency, but no production MCP tool server is wired in the current app |
-| External integrations | Google OAuth, Gmail API, and read-only Google Calendar API |
+| External integrations | Google OAuth, Gmail API, Google Calendar read APIs, and feature-gated Calendar event creation |
 | Deployment | Render, Netlify, and Supabase are the intended hosting/services; deployment dashboards and live configuration are not verified from this repository |
 
-Backend dependencies and versions are pinned in
-[backend/requirements.txt](./backend/requirements.txt). Frontend dependency
+Backend dependencies and versions are pinned in the root
+[requirements.txt](./requirements.txt); `backend/requirements.txt` currently
+contains only `email-validator==2.3.0`. Frontend dependency
 ranges and scripts are in [frontend/package.json](./frontend/package.json);
 the resolved dependency tree is recorded in `frontend/package-lock.json`.
 Vite 8 declares Node.js `^20.19.0 || >=22.12.0`. The repository does not set a
@@ -59,7 +69,7 @@ flowchart LR
   Graph --> LLM[Groq / OpenRouter / Gemini / OpenAI]
   API --> GoogleOAuth[Google OAuth]
   API --> Gmail[Gmail API]
-  API --> Calendar[Google Calendar API - read only]
+  API --> Calendar[Google Calendar API - read + gated create]
   GoogleOAuth --> DB
   Gmail --> DB
 ```
@@ -74,7 +84,9 @@ For chat, the backend validates the user and conversation, claims the
 idempotent chat request, loads history, invokes the LangGraph router, and
 persists the resulting messages and metadata. General chat passes through
 memory retrieval and an LLM; Gmail requests go to a Gmail-specific planner and
-workflow.
+workflow. Calendar chat can use read-only tools and, when all server-side
+gates are enabled, prepare a Create Event approval. The proposal does not
+change Google Calendar until the user approves and separately executes it.
 
 ## Major implemented features
 
@@ -83,14 +95,21 @@ workflow.
 - Public `/privacy` and `/terms` pages.
 - Conversations, message history, archival, and deletion.
 - User settings for automatic memory storage.
+- Gmail and Google Calendar ON/OFF preferences in Connected Apps. Turning an
+  integration OFF retains its Google account connection; missing preference
+  metadata defaults to ON for backward compatibility.
 - Persistent memory records of type `long_term`, `episodic`, `semantic`, and
   `procedural`, with embeddings and review of ambiguous updates.
 - Gmail account connection/disconnection, mailbox folders, paginated listing,
   Gmail search, message details, attachment downloads, and message actions.
 - Chat-generated editable email previews, Gmail draft saving, and a distinct
   send-approval workflow.
-- Authenticated, user-scoped, read-only Google Calendar event, schedule,
-  conflict, and FreeBusy endpoints.
+- Authenticated, user-scoped Google Calendar event, schedule, conflict, and
+  FreeBusy reads, plus read-only Calendar chat tools.
+- Approval-gated Calendar Create, Update, and Delete workflows. Each operation
+  has an independent flag, disabled by default, and requires the Calendar
+  migration chain, an existing account with the Calendar write OAuth grant,
+  the user integration preference enabled, and its corresponding server flag.
 - Email HTML sanitization and sandboxed display; Markdown/GFM assistant
   responses.
 - Request-ID correlation and timing instrumentation.
@@ -102,7 +121,7 @@ and delete as unavailable. Some mailbox UI actions call direct authenticated
 Gmail endpoints rather than the action-approval executor; see the handover
 before changing write behavior.
 
-## Google Calendar read-only API
+## Google Calendar API and event creation
 
 Every endpoint requires the authenticated user's bearer token and a
 `connection_id` for that user's active Google connection. Calendar access is
@@ -152,8 +171,32 @@ GET /api/v1/calendar/events?connection_id=YOUR_CONNECTION_UUID&time_min=2026-11-
 }
 ```
 
-Calendar routes in this phase expose no event mutation operation. The
-FreeBusy `POST` only calls Google's read-only `freeBusy.query` method.
+The read endpoints and FreeBusy query remain read-only. Calendar creation is
+available only through a proposal attached to chat and the shared action
+approval API; there is no direct Calendar mutation endpoint or Calendar event
+management UI. The workflow validates a strict event payload, ties approval to
+its fingerprint, claims a durable operation, submits one Google mutation
+attempt, and reads the event back to confirm its outcome. An uncertain result
+must be reconciled; do not blindly retry it.
+
+The three independent backend flags
+`CALENDAR_CREATE_EVENT_ENABLED`, `CALENDAR_UPDATE_EVENT_ENABLED`, and
+`CALENDAR_DELETE_EVENT_ENABLED` are defined in
+`backend/app/core/config.py` and each defaults to `false`. The OAuth connect
+endpoint accepts `service=calendar_write` to request the
+`https://www.googleapis.com/auth/calendar.events` scope incrementally. The
+user selects an existing connected Google account in Connected Apps; the
+one-time OAuth state binds the grant to the initiating user and selected
+connection, and the callback verifies the Google identity matches that
+connection.
+
+The approval-backed write workflow uses two migrations in order:
+`b1c4d2e8a730` creates the durable Calendar operation journal, and
+`c9f42a71e6b3` binds incremental OAuth state to the selected connection. The
+production migration sequence is reported complete through
+`c9f42a71e6b3`; verify the live revision in the database before relying on
+deployment state. See [PROJECT_HANDOVER.md](./PROJECT_HANDOVER.md) for
+proposal state, validation, execution recovery, and rollout checks.
 
 ## Repository layout
 
@@ -174,7 +217,7 @@ FreeBusy `POST` only calls Google's read-only `freeBusy.query` method.
 │   ├── db_migrations/versions/  Alembic migration history
 │   ├── tests/                   Backend pytest regression tests
 │   ├── scripts/                 Project scripts
-│   └── requirements.txt         Pinned Python dependencies
+│   └── requirements.txt         Additional backend requirement
 ├── frontend/
 │   ├── src/components/          Reusable UI, email, and approval components
 │   ├── src/context/             Authentication context
@@ -185,6 +228,7 @@ FreeBusy `POST` only calls Google's read-only `freeBusy.query` method.
 │   ├── package.json             Frontend scripts and dependency ranges
 │   └── vite.config.js           Vite and Vitest configuration
 ├── .env.example                 Backend environment-variable names/placeholders
+├── requirements.txt             Pinned Python dependencies
 ├── README.md
 └── PROJECT_HANDOVER.md          Detailed active-development handover
 ```
@@ -209,7 +253,7 @@ Run from the repository root:
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r backend\requirements.txt
+python -m pip install -r requirements.txt
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
@@ -288,7 +332,10 @@ non-secret placeholders. Major groups are:
 - Origins: `FRONTEND_URL`, `CORS_ALLOWED_ORIGINS`, `BACKEND_URL`.
 
 The application settings class also defines `GOOGLE_OAUTH_SCOPES`,
-`GOOGLE_OAUTH_ACCESS_TYPE`, and `GOOGLE_OAUTH_PROMPT`. Read
+`GOOGLE_OAUTH_ACCESS_TYPE`, `GOOGLE_OAUTH_PROMPT`, and the three Calendar
+operation flags `CALENDAR_CREATE_EVENT_ENABLED`,
+`CALENDAR_UPDATE_EVENT_ENABLED`, and `CALENDAR_DELETE_EVENT_ENABLED`. All
+three Calendar flags default to `false`. Read
 [PROJECT_HANDOVER.md](./PROJECT_HANDOVER.md) for defaults, exact OAuth scope
 contents, and production values that still need confirmation. Do not disclose
 the contents of a real `.env`.
@@ -304,10 +351,12 @@ All backend endpoints are mounted under `/api/v1`. Main route groups:
 - `/oauth`
 - `/memories` and `/memory-reviews`
 - `/gmail`
+- `/calendar`
 - `/action-approvals`
 
-The detailed route list and the distinction between direct Gmail API writes
-and approval-backed sends are in [PROJECT_HANDOVER.md](./PROJECT_HANDOVER.md).
+The detailed route list, the Calendar create approval flow, and the distinction
+between direct Gmail API writes and approval-backed sends are in
+[PROJECT_HANDOVER.md](./PROJECT_HANDOVER.md).
 
 ## Testing, build, and lint
 
@@ -358,6 +407,12 @@ callback path is `/api/v1/oauth/google/callback`.
   protection depends on keeping `ENCRYPTION_KEY` stable and private.
 - Keep explicit user/connection ownership checks and the RLS policies in
   migrations. Confirm the actual database role and deployed policies.
+- Calendar event creation is disabled by default. Do not enable it until the
+  Calendar operation migration, incremental Google write grant, and
+  production database permissions have been verified.
+- Calendar writes use one mutation attempt and read-back reconciliation.
+  Treat an `execution_uncertain` result as unresolved; check the existing
+  proposal status rather than creating a new approval or retrying the mutation.
 - Google grants broad Gmail permissions in the current default scope list,
   including the full-mail scope used for permanent deletion. Review scope
   necessity and Google OAuth verification requirements before changing or
@@ -374,6 +429,6 @@ callback path is `/api/v1/oauth/google/callback`.
 ## Project handover
 
 Continue from [PROJECT_HANDOVER.md](./PROJECT_HANDOVER.md). It documents
-current Git state, architecture, route and feature status, detailed Gmail
-workflows, memory and LLM implementation, deployment unknowns, known issues,
-roadmap, and safe next steps.
+project architecture and implementation context, its historical
+source-inspection baseline, and previously documented verification, deployment
+unknowns, known issues, roadmap, and handover information.
