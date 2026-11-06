@@ -893,7 +893,10 @@ def _deterministic_integration_plan(
         return None
     if re.search(r"\b(?:drive|files?|documents?|spreadsheets?)\b", lowered):
         return IntegrationPlan(intent="google_drive")
-    if re.search(r"\b(?:contacts?|address book)\b", lowered):
+    if re.search(
+        r"\b(?:contacts?|address book|phone numbers?|mobile numbers?)\b",
+        lowered,
+    ):
         return IntegrationPlan(intent="google_contacts")
     if re.search(r"\b(?:reminders?|to-?dos?|tasks?)\b", lowered):
         return IntegrationPlan(intent="tasks")
@@ -1021,7 +1024,8 @@ def _requires_intent_planning(user_message: str) -> bool:
     return bool(re.search(
         r"\b(?:gmail|inbox|e-?mails?|messages?|mail|google|drive|files?|"
         r"documents?|spreadsheets?|calendar|meetings?|events?|schedule|"
-        r"contacts?|address book|reminders?|to-?dos?|tasks?|"
+        r"contacts?|address book|phone numbers?|mobile numbers?|"
+        r"reminders?|to-?dos?|tasks?|"
         r"availability|freebusy)\b",
         user_message,
         re.IGNORECASE,
@@ -1076,6 +1080,24 @@ def _is_mixed_gmail_calendar_request(user_message: str) -> bool:
         lowered,
     ))
     return asks_gmail and has_calendar_task and has_task_separator
+
+
+def _is_mixed_google_service_request(user_message: str) -> bool:
+    lowered = user_message.casefold()
+    service_mentions = (
+        r"\b(?:gmail|inbox|e-?mails?|mail|messages?)\b",
+        r"\b(?:calendar|meetings?|events?|appointments?|schedule)\b",
+        r"\b(?:drive|files?|pdfs?|documents?|spreadsheets?)\b",
+        r"\b(?:contacts?|address book|phone numbers?|mobile numbers?)\b",
+    )
+    mentioned_services = sum(
+        bool(re.search(pattern, lowered))
+        for pattern in service_mentions
+    )
+    return mentioned_services > 1 and bool(re.search(
+        r"\b(?:and|also|then|plus)\b",
+        lowered,
+    ))
 
 
 def _fallback_plan() -> dict[str, Any]:
@@ -1138,6 +1160,14 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             "gmail_plan": {
                 "intent": "clarify",
                 "clarification_reason": "mixed_gmail_calendar",
+            },
+            "assistant_route": "gmail",
+        }
+    if _is_mixed_google_service_request(state["user_message"]):
+        return {
+            "gmail_plan": {
+                "intent": "clarify",
+                "clarification_reason": "mixed_google_services",
             },
             "assistant_route": "gmail",
         }
@@ -1366,6 +1396,15 @@ def gmail_agent_node(
         )
 
     if intent == "clarify":
+        if plan_data.get("clarification_reason") == "mixed_google_services":
+            return gmail_response_node(
+                state,
+                direct_response=(
+                    "This request spans multiple Google services that I "
+                    "can't combine into one live lookup. Which service "
+                    "should I handle first?"
+                ),
+            )
         if plan_data.get("clarification_reason") == "mixed_gmail_calendar":
             return gmail_response_node(
                 state,

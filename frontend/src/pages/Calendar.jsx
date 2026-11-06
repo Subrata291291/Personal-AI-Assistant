@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useOutletContext } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { useAuth } from '../context/AuthContext'
-import GoogleWorkspaceNavigation from '../components/GoogleWorkspaceNavigation.jsx'
 import { api } from '../lib/api.js'
 import {
   requireConnectionsResponse,
@@ -40,6 +39,15 @@ function addDays(date, count) {
   const parsed = new Date(`${date}T00:00:00Z`)
   parsed.setUTCDate(parsed.getUTCDate() + count)
   return parsed.toISOString().slice(0, 10)
+}
+
+function getMonthDateRange(date) {
+  const [year, month] = date.split('-').map(Number)
+  const nextMonth = new Date(Date.UTC(year, month, 1))
+  return {
+    start: `${year}-${String(month).padStart(2, '0')}-01`,
+    end: nextMonth.toISOString().slice(0, 10),
+  }
 }
 
 function localDateTimeToIso(value, timeZone) {
@@ -243,10 +251,26 @@ export default function Calendar() {
           timeZone,
         })
       }
-      if (mode === 'date') {
+      if (mode === 'date' || mode === 'week') {
         return calendarService.getSchedule({
           connectionId,
           date: selectedDate,
+          period: mode === 'week' ? 'week' : 'day',
+          timeZone,
+        })
+      }
+      if (mode === 'month') {
+        const monthRange = getMonthDateRange(selectedDate)
+        return calendarService.listEvents({
+          connectionId,
+          timeMin: localDateTimeToIso(
+            `${monthRange.start}T00:00`,
+            timeZone,
+          ),
+          timeMax: localDateTimeToIso(
+            `${monthRange.end}T00:00`,
+            timeZone,
+          ),
           timeZone,
         })
       }
@@ -320,6 +344,8 @@ export default function Calendar() {
   const viewButtons = [
     ['today', 'Today'],
     ['tomorrow', 'Tomorrow'],
+    ['week', 'Week'],
+    ['month', 'Month'],
     ['date', 'Choose date'],
     ['range', 'Date range'],
     ['search', 'Search'],
@@ -330,14 +356,6 @@ export default function Calendar() {
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
-      <GoogleWorkspaceNavigation
-        connections={connections}
-        loading={connectionsQuery.isLoading}
-        failed={connectionsQuery.isError}
-        activeService="calendar"
-        isDark={isDark}
-      />
-
       <header>
         <p className="text-xs font-bold uppercase tracking-widest text-violet-400">
           Google Workspace
@@ -447,9 +465,13 @@ export default function Calendar() {
                   ))}
                 </div>
 
-                {mode === 'date' && (
+                {['date', 'week', 'month'].includes(mode) && (
                   <label className="mb-4 block text-sm">
-                    Date
+                    {mode === 'week'
+                      ? 'Date in week'
+                      : mode === 'month'
+                        ? 'Date in month'
+                        : 'Date'}
                     <input
                       aria-label="Calendar date"
                       type="date"

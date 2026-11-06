@@ -10,7 +10,6 @@ import {
 import { Link, useOutletContext } from 'react-router-dom'
 
 import { api } from '../lib/api.js'
-import GoogleWorkspaceNavigation from '../components/GoogleWorkspaceNavigation.jsx'
 import { formatRequestError } from '../lib/errorMessage.js'
 import { requireConnectionsResponse } from '../lib/responseValidation'
 import { gmailService } from '../services/gmailService.js'
@@ -1646,14 +1645,6 @@ export default function Gmail() {
           background-clip: padding-box;
         }
       `}</style>
-
-      <GoogleWorkspaceNavigation
-        connections={connections}
-        loading={!connectionsVerified && connectionsQuery.isLoading}
-        failed={connectionsQuery.isError}
-        activeService="gmail"
-        isDark={isDark}
-      />
 
       {/* Page heading */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">

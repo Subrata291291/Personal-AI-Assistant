@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import AppIcon from '../AppIcon'
+import GoogleServiceIcon from '../GoogleServiceIcon'
 import { api } from '../../lib/api.js'
 import {
   NavLink,
@@ -14,6 +15,20 @@ import {
   requireArrayResponse,
   requireConnectionsResponse,
 } from '../../lib/responseValidation'
+import {
+  getConnectedGoogleServiceCount,
+  GOOGLE_WORKSPACE_SERVICES,
+  isGoogleServiceConnected,
+} from '../../lib/googleServiceCapabilities.js'
+
+const integrationItems = [
+  { name: 'Connectors', path: '/dashboard/connectors', icon: 'connectors' },
+  ...GOOGLE_WORKSPACE_SERVICES.map((service) => ({
+    name: service.label,
+    path: service.path,
+    serviceId: service.id,
+  })),
+]
 
 const navigation = [
   {
@@ -33,10 +48,7 @@ const navigation = [
   },
   {
     section: 'INTEGRATIONS',
-    items: [
-      { name: 'Connectors', path: '/dashboard/connectors', icon: 'connectors' },
-      { name: 'Gmail', path: '/dashboard/gmail', icon: 'gmail' },
-    ],
+    items: integrationItems,
   },
 ]
 
@@ -69,9 +81,8 @@ function DashboardLayout() {
     refetchOnWindowFocus: true,
   })
 
-  const connectedAccountCount = (
-    connectionsQuery.data?.connections || []
-  ).filter((connection) => connection.status === 'connected').length
+  const connections = connectionsQuery.data?.connections || []
+  const connectedServiceCount = getConnectedGoogleServiceCount(connections)
 
   const reviewsQuery = useQuery({
     queryKey: memoryReviewQueryKey(user?.id, 100),
@@ -259,9 +270,40 @@ function DashboardLayout() {
                     }
                   >
                     <span className="flex w-5 shrink-0 justify-center">
-                      <AppIcon name={item.icon} className="h-5 w-5" />
+                      {item.serviceId
+                        ? (
+                          <GoogleServiceIcon
+                            service={item.serviceId}
+                            className="h-5 w-5"
+                          />
+                        )
+                        : <AppIcon name={item.icon} className="h-5 w-5" />}
                     </span>
-                    <span className="flex-1">{item.name}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate">{item.name}</span>
+                      {item.serviceId && (
+                        <span className={`mt-0.5 block truncate text-[10px] ${
+                          isDark ? 'text-slate-500' : 'text-slate-400'
+                        }`}>
+                          {connectionsQuery.isLoading
+                            ? 'Checking connection'
+                            : connectionsQuery.isError
+                              ? 'Status unavailable'
+                              : isGoogleServiceConnected(
+                                  connections,
+                                  item.serviceId,
+                                )
+                                ? item.serviceId === 'drive' ||
+                                  item.serviceId === 'contacts'
+                                  ? 'Connected · coming soon'
+                                  : 'Connected'
+                                : item.serviceId === 'drive' ||
+                                  item.serviceId === 'contacts'
+                                  ? 'Coming soon'
+                                  : 'Not connected'}
+                        </span>
+                      )}
+                    </span>
 
                     {item.name === 'Connectors' && !connectionsQuery.isError && (
                       <span
@@ -269,7 +311,7 @@ function DashboardLayout() {
                           isDark ? 'bg-[#292d3c]' : 'bg-slate-200'
                         }`}
                       >
-                        {connectionsQuery.isLoading ? '…' : connectedAccountCount}
+                        {connectionsQuery.isLoading ? '…' : connectedServiceCount}
                       </span>
                     )}
                   </NavLink>
@@ -569,6 +611,9 @@ function DashboardLayout() {
               surface,
               hoverSurface,
               search,
+              connections,
+              connectionsLoading: connectionsQuery.isLoading,
+              connectionsError: connectionsQuery.isError,
             }}
           />
         </div>

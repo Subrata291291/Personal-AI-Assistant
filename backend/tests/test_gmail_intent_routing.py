@@ -10,7 +10,11 @@ from app.schemas.gmail_agent import (
     SearchEmailsPlan,
     parse_assistant_intent,
 )
-from app.workflows.chat_nodes import capabilities_node, llm_node
+from app.workflows.chat_nodes import (
+    capabilities_node,
+    integration_unavailable_node,
+    llm_node,
+)
 from app.workflows import chat_nodes
 from app.workflows import gmail_agent_nodes
 
@@ -311,6 +315,43 @@ def test_mixed_gmail_and_calendar_request_asks_which_task_to_do_first():
     assert "Which task would you like me to do first?" in (
         response["assistant_response"]
     )
+
+
+def test_drive_and_contact_requests_route_to_explicit_unavailable_results():
+    cases = (
+        ("Find a PDF in my Drive.", "google_drive"),
+        ("Find Subrata's phone number.", "google_contacts"),
+    )
+    for message, expected_route in cases:
+        state = _state(message)
+        routed = gmail_agent_nodes.gmail_intent_router_node(state)
+        assert routed["assistant_route"] == expected_route
+
+        result = integration_unavailable_node({
+            **state,
+            **routed,
+        })
+        assert "not implemented in the Assistant yet" in (
+            result["assistant_response"]
+        )
+        assert "cannot retrieve or change that data" in (
+            result["assistant_response"]
+        )
+
+
+def test_mixed_drive_and_contacts_request_clarifies_without_provider_calls():
+    state = _state("Find a PDF in my Drive and Subrata's phone number.")
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+
+    assert routed["assistant_route"] == "gmail"
+    assert routed["gmail_plan"]["clarification_reason"] == (
+        "mixed_google_services"
+    )
+    result = gmail_agent_nodes.gmail_agent_node(
+        {**state, "gmail_plan": routed["gmail_plan"]},
+        SimpleNamespace(context={"user_id": "user-1"}),
+    )
+    assert "multiple Google services" in result["assistant_response"]
 
 
 def test_gmail_search_about_meetings_does_not_get_routed_to_calendar():

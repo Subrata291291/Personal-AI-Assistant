@@ -7,7 +7,7 @@ import {
   waitFor,
 } from '@testing-library/react'
 import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockUser = vi.hoisted(() => ({
   current: { id: 'user-1', user_metadata: { timezone: 'Asia/Kolkata' } },
@@ -84,6 +84,10 @@ const emptySchedule = {
 }
 
 describe('Calendar workspace', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   beforeEach(() => {
     vi.clearAllMocks()
     mockUser.current = {
@@ -129,6 +133,43 @@ describe('Calendar workspace', () => {
     await waitFor(() => {
       expect(calendarService.getToday).toHaveBeenCalledWith({
         connectionId: 'calendar-account-2',
+        timeZone: 'Asia/Kolkata',
+      })
+    })
+  })
+
+  it('uses the existing schedule and events endpoints for Week and Month views', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
+    calendarService.getSchedule.mockResolvedValue({
+      ...emptySchedule,
+      period: 'week',
+    })
+    calendarService.listEvents.mockResolvedValue({
+      calendar_id: 'primary',
+      events: [],
+      next_page_token: null,
+      time_zone: 'Asia/Kolkata',
+    })
+    renderCalendar()
+
+    await screen.findByRole('heading', { name: 'Google Calendar' })
+    fireEvent.click(await screen.findByRole('tab', { name: 'Week' }))
+    await waitFor(() => {
+      expect(calendarService.getSchedule).toHaveBeenLastCalledWith({
+        connectionId: 'calendar-account',
+        date: '2026-11-06',
+        period: 'week',
+        timeZone: 'Asia/Kolkata',
+      })
+    })
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Month' }))
+    await waitFor(() => {
+      expect(calendarService.listEvents).toHaveBeenLastCalledWith({
+        connectionId: 'calendar-account',
+        timeMin: '2026-10-31T18:30:00.000Z',
+        timeMax: '2026-11-30T18:30:00.000Z',
         timeZone: 'Asia/Kolkata',
       })
     })

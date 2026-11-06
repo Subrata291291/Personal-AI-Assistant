@@ -29,6 +29,7 @@ vi.mock('../lib/api', () => ({
 
 import Connectors from './Connectors.jsx'
 import { api } from '../lib/api'
+import { getConnectedGoogleServiceCount } from '../lib/googleServiceCapabilities.js'
 
 function ConnectorsLayout() {
   return <Outlet context={{ isDark: true }} />
@@ -42,17 +43,20 @@ function renderConnectors() {
     },
   })
 
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/dashboard/connectors']}>
-        <Routes>
-          <Route element={<ConnectorsLayout />}>
-            <Route path="/dashboard/connectors" element={<Connectors />} />
-          </Route>
-        </Routes>
-      </MemoryRouter>
-    </QueryClientProvider>,
-  )
+  return {
+    queryClient,
+    ...render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/dashboard/connectors']}>
+          <Routes>
+            <Route element={<ConnectorsLayout />}>
+              <Route path="/dashboard/connectors" element={<Connectors />} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    ),
+  }
 }
 
 const googleConnection = {
@@ -402,7 +406,7 @@ describe('Connected Apps', () => {
       connected = false
       return { message: 'disconnected' }
     })
-    renderConnectors()
+    const { queryClient } = renderConnectors()
 
     fireEvent.click(await screen.findByRole('button', {
       name: 'Disconnect Google account',
@@ -419,6 +423,9 @@ describe('Connected Apps', () => {
     expect(screen.queryByRole('button', {
       name: 'Disconnect Google account',
     })).not.toBeInTheDocument()
+    expect(getConnectedGoogleServiceCount(
+      queryClient.getQueryData(['oauth-connections', 'user-1']).connections,
+    )).toBe(0)
   })
 
   it('keeps Calendar and unrelated Google services distinct', async () => {

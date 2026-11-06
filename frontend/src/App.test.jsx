@@ -2,13 +2,31 @@ import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
+const authState = vi.hoisted(() => ({ authenticated: false }))
+
 vi.mock('./context/AuthContext', () => ({
   useAuth: () => ({
-    isAuthenticated: false,
+    isAuthenticated: authState.authenticated,
     loading: false,
     signIn: vi.fn(),
     signUp: vi.fn(),
+    user: {
+      id: 'user-1',
+      email: 'user@example.com',
+      user_metadata: {},
+    },
+    signOut: vi.fn(),
   }),
+}))
+
+vi.mock('./lib/api.js', () => ({
+  api: {
+    get: vi.fn(async (path) => (
+      path === '/api/v1/oauth/connections'
+        ? { connections: [] }
+        : []
+    )),
+  },
 }))
 
 vi.mock('./lib/supabase', () => ({
@@ -23,10 +41,13 @@ vi.mock('./lib/supabase', () => ({
 import App from './App.jsx'
 import Login from './pages/Login.jsx'
 import Signup from './pages/Signup.jsx'
+import { queryClient } from './lib/queryClient.js'
 
 describe('Public policy pages and auth links', () => {
   beforeEach(() => {
     window.history.pushState({}, '', '/')
+    authState.authenticated = false
+    queryClient.clear()
   })
 
   it('loads the privacy policy page directly without login', () => {
@@ -67,5 +88,17 @@ describe('Public policy pages and auth links', () => {
 
     expect(screen.getByRole('link', { name: /privacy policy/i })).toHaveAttribute('href', '/privacy')
     expect(screen.getByRole('link', { name: /terms of service/i })).toHaveAttribute('href', '/terms')
+  })
+
+  it.each([
+    ['/dashboard/drive', 'Google Drive'],
+    ['/dashboard/contacts', 'Google Contacts'],
+  ])('opens the independent route %s', async (path, title) => {
+    authState.authenticated = true
+    window.history.pushState({}, '', path)
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: title }))
+      .toBeInTheDocument()
   })
 })
