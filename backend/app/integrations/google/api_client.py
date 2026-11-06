@@ -20,6 +20,7 @@ from app.repositories.user_connection_repository import (
 from app.integrations.google.exceptions import (
     GoogleAPIError,
     GoogleAPIMutationError,
+    GoogleOAuthAuthorizationError,
 )
 from app.services.oauth_credential_service import OAuthCredentialService
 
@@ -78,6 +79,37 @@ class GoogleAPIClient:
             follow_redirects=False,
         ) as owned_client:
             yield owned_client
+
+    @staticmethod
+    def _clear_revoked_connection_credentials(
+        db: Session,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> None:
+        db.rollback()
+        try:
+            disconnected = UserConnectionRepository(db).mark_disconnected(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            if disconnected:
+                OAuthCredentialRepository(db).delete(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                )
+            db.commit()
+        except Exception as persistence_error:
+            db.rollback()
+            logger.exception(
+                "google_connection_revocation_persist_failed | "
+                "user_id=%s | connection_id=%s",
+                user_id,
+                connection_id,
+            )
+            raise RuntimeError(
+                "Google authorization expired, but connection status "
+                "could not be updated."
+            ) from persistence_error
 
     @asynccontextmanager
     async def _active_connection_request(
@@ -316,6 +348,13 @@ class GoogleAPIClient:
 
             db.commit()
 
+        except GoogleOAuthAuthorizationError as exc:
+            self._clear_revoked_connection_credentials(
+                db,
+                normalized_user_id,
+                normalized_connection_id,
+            )
+            raise exc
         except Exception:
             db.rollback()
             raise
@@ -355,6 +394,13 @@ class GoogleAPIClient:
                         )
                     )
                     db.commit()
+                except GoogleOAuthAuthorizationError:
+                    self._clear_revoked_connection_credentials(
+                        db,
+                        normalized_user_id,
+                        normalized_connection_id,
+                    )
+                    raise
                 except Exception:
                     db.rollback()
                     raise
@@ -421,6 +467,13 @@ class GoogleAPIClient:
                 connection_id=normalized_connection_id,
             )
             db.commit()
+        except GoogleOAuthAuthorizationError:
+            self._clear_revoked_connection_credentials(
+                db,
+                normalized_user_id,
+                normalized_connection_id,
+            )
+            raise
         except Exception:
             db.rollback()
             raise

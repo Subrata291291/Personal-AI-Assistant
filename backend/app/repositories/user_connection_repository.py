@@ -93,6 +93,21 @@ class UserConnectionRepository:
         )
         return self.db.scalar(statement)
 
+    def mark_disconnected(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> bool:
+        connection = self.get_by_id_for_update(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+        if connection is None or connection.provider != "google":
+            return False
+        connection.status = "disconnected"
+        self.db.flush()
+        return True
+
     def get_active_google_connection(
         self,
         user_id: UUID,

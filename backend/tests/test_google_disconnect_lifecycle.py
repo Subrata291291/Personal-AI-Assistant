@@ -1,12 +1,17 @@
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 from uuid import uuid4
 
 import pytest
 
 from app.integrations.google.api_client import GoogleAPIClient
+from app.integrations.google.exceptions import (
+    GoogleAPIError,
+    GoogleOAuthAuthorizationError,
+    GoogleOAuthTransientError,
+)
 from app.services.action_approval_service import (
     ActionApprovalService,
     ApprovalConflictError,
@@ -101,6 +106,359 @@ def test_disconnected_connection_rejects_google_request_before_transmission(
         )
 
     http_client.request.assert_not_awaited()
+
+
+def test_revoked_google_refresh_marks_connection_disconnected(
+    monkeypatch,
+):
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(
+        side_effect=GoogleOAuthAuthorizationError(),
+    )
+    connection_repository = Mock()
+    connection_repository.mark_disconnected.return_value = True
+    credential_repository = Mock()
+    credential_repository.delete.return_value = True
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.UserConnectionRepository",
+        lambda _db: connection_repository,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialRepository",
+        lambda _db: credential_repository,
+    )
+    db = Mock()
+    http_client = Mock()
+    http_client.request = AsyncMock()
+
+    with pytest.raises(GoogleOAuthAuthorizationError):
+        asyncio.run(
+            GoogleAPIClient().request(
+                db=db,
+                user_id=str(USER_ID),
+                connection_id=str(CONNECTION_ID),
+                method="GET",
+                url=(
+                    "https://calendar.googleapis.com/calendar/v3/users/me/"
+                    "calendarList"
+                ),
+                http_client=http_client,
+            )
+        )
+
+    connection_repository.mark_disconnected.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    credential_repository.delete.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    db.commit.assert_called_once()
+    http_client.request.assert_not_awaited()
+
+
+def test_revoked_google_refresh_during_mutation_cleans_only_selected_connection(
+    monkeypatch,
+):
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(
+        side_effect=GoogleOAuthAuthorizationError(),
+    )
+    connection_repository = Mock()
+    connection_repository.mark_disconnected.return_value = True
+    credential_repository = Mock()
+    credential_repository.delete.return_value = True
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.UserConnectionRepository",
+        lambda _db: connection_repository,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialRepository",
+        lambda _db: credential_repository,
+    )
+    db = Mock()
+    http_client = Mock()
+    http_client.request = AsyncMock()
+
+    with pytest.raises(GoogleOAuthAuthorizationError):
+        asyncio.run(
+            GoogleAPIClient().request_mutation(
+                db=db,
+                user_id=str(USER_ID),
+                connection_id=str(CONNECTION_ID),
+                method="POST",
+                url="https://calendar.googleapis.com/calendar/v3/calendars/primary/events",
+                json_data={},
+                http_client=http_client,
+            )
+        )
+
+    token_service.get_valid_access_token.assert_awaited_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    connection_repository.mark_disconnected.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    credential_repository.delete.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    db.commit.assert_called_once()
+    http_client.request.assert_not_awaited()
+
+
+def test_revoked_google_token_after_api_401_cleans_only_selected_connection(
+    monkeypatch,
+):
+    authorization_error = GoogleOAuthAuthorizationError()
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(
+        side_effect=["old-access-token", authorization_error],
+    )
+    connection_repository = Mock()
+    connection_repository.get_active_google_connection_for_update.return_value = (
+        SimpleNamespace(id=CONNECTION_ID)
+    )
+    connection_repository.mark_disconnected.return_value = True
+    credential_repository = Mock()
+    credential_repository.get_by_connection.return_value = SimpleNamespace(
+        connection_id=CONNECTION_ID,
+    )
+    credential_repository.delete.return_value = True
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.UserConnectionRepository",
+        lambda _db: connection_repository,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialRepository",
+        lambda _db: credential_repository,
+    )
+    db = Mock()
+    client = GoogleAPIClient()
+    client._send_request = AsyncMock(
+        side_effect=GoogleAPIError(401, "Google API request was rejected."),
+    )
+
+    with pytest.raises(GoogleOAuthAuthorizationError) as raised:
+        asyncio.run(
+            client.request(
+                db=db,
+                user_id=str(USER_ID),
+                connection_id=str(CONNECTION_ID),
+                method="GET",
+                url="https://www.googleapis.com/calendar/v3/users/me/calendarList",
+                http_client=Mock(),
+            )
+        )
+
+    assert raised.value is authorization_error
+    token_service.get_valid_access_token.assert_has_awaits([
+        call(user_id=USER_ID, connection_id=CONNECTION_ID),
+        call(
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            rejected_access_token="old-access-token",
+        ),
+    ])
+    connection_repository.mark_disconnected.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    credential_repository.delete.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    connection_repository.get_active_google_connection_for_update.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    credential_repository.get_by_connection.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    db.commit.assert_has_calls([call(), call()])
+    db.rollback.assert_has_calls([call(), call()])
+
+
+def test_revoked_google_token_cleanup_failure_is_surfaced(monkeypatch):
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(
+        side_effect=[
+            "old-access-token",
+            GoogleOAuthAuthorizationError(),
+        ],
+    )
+    connection_repository = Mock()
+    connection_repository.get_active_google_connection_for_update.return_value = (
+        SimpleNamespace(id=CONNECTION_ID)
+    )
+    connection_repository.mark_disconnected.side_effect = OSError(
+        "database write failed",
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.UserConnectionRepository",
+        lambda _db: connection_repository,
+    )
+    credential_repository = Mock()
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialRepository",
+        lambda _db: credential_repository,
+    )
+    db = Mock()
+    client = GoogleAPIClient()
+    client._send_request = AsyncMock(
+        side_effect=GoogleAPIError(401, "Google API request was rejected."),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Google authorization expired, but connection status could not be updated.",
+    ) as raised:
+        asyncio.run(
+            client.request(
+                db=db,
+                user_id=str(USER_ID),
+                connection_id=str(CONNECTION_ID),
+                method="GET",
+                url="https://www.googleapis.com/calendar/v3/users/me/calendarList",
+                http_client=Mock(),
+            )
+        )
+
+    assert isinstance(raised.value.__cause__, OSError)
+    connection_repository.mark_disconnected.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    credential_repository.delete.assert_not_called()
+    db.rollback.assert_has_calls([call(), call(), call()])
+    db.commit.assert_called_once()
+
+
+def test_transient_mutation_token_failure_does_not_clear_credentials(
+    monkeypatch,
+):
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(
+        side_effect=GoogleOAuthTransientError(),
+    )
+    connection_repository = Mock()
+    credential_repository = Mock()
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.UserConnectionRepository",
+        lambda _db: connection_repository,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialRepository",
+        lambda _db: credential_repository,
+    )
+    db = Mock()
+    http_client = Mock()
+    http_client.request = AsyncMock()
+
+    with pytest.raises(GoogleOAuthTransientError):
+        asyncio.run(
+            GoogleAPIClient().request_mutation(
+                db=db,
+                user_id=str(USER_ID),
+                connection_id=str(CONNECTION_ID),
+                method="POST",
+                url="https://calendar.googleapis.com/calendar/v3/calendars/primary/events",
+                json_data={},
+                http_client=http_client,
+            )
+        )
+
+    db.rollback.assert_called_once()
+    connection_repository.mark_disconnected.assert_not_called()
+    credential_repository.delete.assert_not_called()
+    http_client.request.assert_not_awaited()
+
+
+def test_successful_mutation_uses_selected_user_and_connection(monkeypatch):
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(return_value="access-token")
+    connection_repository = Mock()
+    connection_repository.get_active_google_connection_for_update.return_value = (
+        SimpleNamespace(id=CONNECTION_ID)
+    )
+    credential_repository = Mock()
+    credential_repository.get_by_connection.return_value = SimpleNamespace(
+        connection_id=CONNECTION_ID,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.UserConnectionRepository",
+        lambda _db: connection_repository,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialRepository",
+        lambda _db: credential_repository,
+    )
+    db = Mock()
+    http_client = Mock()
+    http_client.request = AsyncMock(
+        return_value=SimpleNamespace(
+            is_success=True,
+            status_code=200,
+            content=b"{}",
+            json=lambda: {},
+        )
+    )
+
+    result = asyncio.run(
+        GoogleAPIClient().request_mutation(
+            db=db,
+            user_id=str(USER_ID),
+            connection_id=str(CONNECTION_ID),
+            method="POST",
+            url="https://calendar.googleapis.com/calendar/v3/calendars/primary/events",
+            json_data={},
+            http_client=http_client,
+        )
+    )
+
+    assert result == {}
+    token_service.get_valid_access_token.assert_awaited_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    connection_repository.get_active_google_connection_for_update.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    credential_repository.get_by_connection.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    http_client.request.assert_awaited_once()
+    db.commit.assert_has_calls([call(), call()])
 
 
 @pytest.mark.parametrize("operation", ["events", "freebusy"])
