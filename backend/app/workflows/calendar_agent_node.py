@@ -1,16 +1,22 @@
 import asyncio
 import json
+import logging
 import re
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from langgraph.runtime import Runtime
 from pydantic import ValidationError
 
+from app.db.session import SessionLocal
+from app.schemas.calendar_approval import CalendarCreateEventParameters
+from app.services.calendar_service import CalendarService
 from app.workflows.calendar_tools import create_calendar_tools
 from app.workflows.chat_state import ChatContext, ChatState
 
+logger = logging.getLogger(__name__)
 
 def _clarification(state: ChatState) -> str:
     lowered = state["user_message"].casefold()
@@ -211,6 +217,23 @@ def calendar_agent_node(
     plan = state.get("gmail_plan") or {}
     tool_name = plan.get("calendar_tool")
     arguments = plan.get("calendar_arguments")
+    if (
+        tool_name not in {None, "clarify"}
+        and runtime.context.get("calendar_enabled", True) is False
+    ):
+        response = (
+            "Google Calendar is turned off in Connected Apps. Turn it on "
+            "there to use Calendar; your Google account remains connected."
+        )
+        return {
+            "assistant_response": response,
+            "provider": "",
+            "model": "",
+            "messages": [
+                {"role": "user", "content": state["user_message"]},
+                {"role": "assistant", "content": response},
+            ],
+        }
     if tool_name == "clarify" or not isinstance(arguments, dict):
         response = _clarification(state)
         return {
@@ -222,6 +245,151 @@ def calendar_agent_node(
                 {"role": "assistant", "content": response},
             ],
         }
+
+
+    def _create_event_proposal(
+        state: ChatState,
+        runtime: Runtime[ChatContext],
+        arguments: object,
+    ) -> dict[str, Any]:
+        context = runtime.context
+        capabilities = (
+            (state.get("assistant_capabilities") or {}).get("google_calendar", {})
+        )
+        if not capabilities.get("write_execution_available"):
+            if context.get("calendar_write_selection_required", False):
+                response = (
+                    "More than one connected Google account has Calendar write "
+                    "access. Choose a default Calendar account in Connected Apps "
+                    "before preparing an event approval."
+                )
+            elif context.get("calendar_selected_write_scope_missing", False):
+                response = (
+                    "Your selected Google account lacks Calendar write access. "
+                    "Grant Calendar event access in Connected Apps; I have not "
+                    "created an event."
+                )
+            else:
+                response = (
+                    "Google Calendar event creation is not enabled for this "
+                    "account. I have not created an event."
+                )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+
+        connection_id = context.get("calendar_write_connection_id")
+        user_id = context.get("user_id")
+        if not connection_id or not user_id or not isinstance(arguments, dict):
+            response = (
+                "I couldn’t safely select an authorized Google Calendar account "
+                "for this event. Nothing was created."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+
+        try:
+            parameters = CalendarCreateEventParameters.model_validate(arguments)
+            with SessionLocal() as db:
+                asyncio.run(
+                    CalendarService(db).validate_create_event_access(
+                        user_id=UUID(str(user_id)),
+                        connection_id=UUID(str(connection_id)),
+                        calendar_id=parameters.calendar_id,
+                    )
+                )
+        except ValidationError:
+            response = (
+                "I couldn’t validate the event details. Please provide a title, "
+                "calendar, start and end, and an explicit timezone for timed "
+                "events. Nothing was created."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+        except PermissionError:
+            response = (
+                "The selected Google account is missing Calendar write "
+                "permission. Reconnect or grant Calendar event access; nothing "
+                "was created."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+        except Exception as exc:
+            logger.exception(
+                "Calendar create proposal preflight failed | user_id=%s "
+                "| error_type=%s",
+                user_id,
+                type(exc).__name__,
+            )
+            response = (
+                "I couldn’t verify access to that Calendar. Check the calendar "
+                "ID and the selected account’s access, then try again. Nothing "
+                "was created."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+
+        serialized = parameters.model_dump(mode="json")
+        if parameters.all_day:
+            event_time = f"{parameters.start} (all day)"
+        else:
+            event_time = (
+                f"{parameters.start} to {parameters.end} "
+                f"({parameters.time_zone})"
+            )
+        response = (
+            f"I prepared an approval request to create **{parameters.summary}** "
+            f"on calendar `{parameters.calendar_id}` for {event_time}. "
+            "Review the approval card below. Google Calendar will not be changed "
+            "unless you approve and separately execute the request."
+        )
+        return {
+            "assistant_response": response,
+            "provider": "",
+            "model": "",
+            "calendar_create_event_proposal": serialized,
+            "messages": [
+                {"role": "user", "content": state["user_message"]},
+                {"role": "assistant", "content": response},
+            ],
+        }
+
+    if tool_name == "create_calendar_event_proposal":
+        return _create_event_proposal(state, runtime, arguments)
 
     context = runtime.context
     user_id = context.get("user_id")

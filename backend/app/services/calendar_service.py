@@ -411,6 +411,30 @@ class CalendarService:
         )
         return self._normalize_event(result)
 
+    async def validate_create_event_access(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        calendar_id: str,
+    ) -> None:
+        self._validate_connection(
+            user_id,
+            connection_id,
+            frozenset({google_scopes.CALENDAR_EVENTS_WRITE_SCOPE}),
+        )
+        calendar_id = self._validate_resource_id(
+            calendar_id,
+            "calendar_id",
+        )
+        await self._google_get(
+            user_id=user_id,
+            connection_id=connection_id,
+            endpoint=(
+                f"calendars/{quote(calendar_id, safe='')}/events"
+            ),
+            params={"maxResults": 1},
+        )
+
     async def get_schedule(
         self,
         user_id: UUID,

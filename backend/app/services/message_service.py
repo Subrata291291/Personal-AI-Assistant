@@ -124,6 +124,33 @@ class MessageService:
 
         return result.data[0]
 
+    def update_request_message_content(
+        self,
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        chat_request_id: UUID,
+        message_id: UUID,
+        content: str,
+    ) -> dict[str, Any] | None:
+        if not content or not content.strip():
+            raise ValueError("Message content cannot be empty.")
+        if not self.verify_conversation_ownership(user_id, conversation_id):
+            return None
+        result = (
+            self.supabase
+            .table("pa_conversation_messages")
+            .update({"content": content.strip()})
+            .eq("id", str(message_id))
+            .eq("conversation_id", str(conversation_id))
+            .eq("chat_request_id", str(chat_request_id))
+            .eq("role", "assistant")
+            .select("*")
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+
     def get_request_message(
         self,
         user_id: UUID,

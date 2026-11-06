@@ -41,6 +41,7 @@ class GoogleOAuthClient:
     REQUEST_TIMEOUT = 15.0
     IDENTITY_SCOPES = ("openid", "email", "profile")
     CALENDAR_EVENTS_READ_SCOPE = google_scopes.CALENDAR_EVENTS_READ_SCOPE
+    CALENDAR_EVENTS_WRITE_SCOPE = google_scopes.CALENDAR_EVENTS_WRITE_SCOPE
     CALENDAR_FREEBUSY_SCOPE = google_scopes.CALENDAR_FREEBUSY_SCOPE
 
     @staticmethod
@@ -172,6 +173,13 @@ class GoogleOAuthClient:
                 *cls.IDENTITY_SCOPES,
                 cls.CALENDAR_EVENTS_READ_SCOPE,
                 cls.CALENDAR_FREEBUSY_SCOPE,
+            ]
+        elif service == "calendar_write":
+            requested_scopes = [
+                *cls.IDENTITY_SCOPES,
+                cls.CALENDAR_EVENTS_READ_SCOPE,
+                cls.CALENDAR_FREEBUSY_SCOPE,
+                cls.CALENDAR_EVENTS_WRITE_SCOPE,
             ]
         elif service == "gmail":
             configured_scopes = settings.google_oauth_scopes_list

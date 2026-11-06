@@ -97,6 +97,16 @@ def chat(
                 if isinstance(user_metadata, dict)
                 else None
             ),
+            gmail_enabled=(
+                user_metadata.get("gmail_enabled") is not False
+                if isinstance(user_metadata, dict)
+                else True
+            ),
+            calendar_enabled=(
+                user_metadata.get("calendar_enabled") is not False
+                if isinstance(user_metadata, dict)
+                else True
+            ),
         )
 
     except LookupError:

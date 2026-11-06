@@ -10,6 +10,12 @@ from sqlalchemy import Engine, text
 from app.core.logging import get_logger
 from app.core.request_metrics import request_id
 from app.db.session import engine
+from app.schemas.action_approval import ActionApprovalProposal
+from app.services.calendar_action_identity import (
+    CalendarOperationConflictError,
+    validate_idempotency_fingerprint_reuse,
+    verify_calendar_proposal_integrity,
+)
 
 
 logger = get_logger(__name__)
@@ -148,7 +154,7 @@ _INSERT_PROPOSAL = text("""
                 'execution_started_at', NULL,
                 'completed_at', NULL,
                 'result', NULL
-            )
+            ) || COALESCE(CAST(:calendar_integrity AS jsonb), '{}'::jsonb)
         )
     FROM public.pa_conversations AS conversation
     CROSS JOIN proposal_clock
@@ -181,6 +187,31 @@ _GET_PROPOSAL = text("""
       AND approval_message.metadata->'action_approval'->>'proposal_id'
           = CAST(:proposal_id AS uuid)::text
     LIMIT 1
+""")
+
+_INSERT_CALENDAR_OPERATION = text("""
+    INSERT INTO public.pa_calendar_action_operations (
+        proposal_id,
+        operation_id,
+        user_id,
+        connection_id,
+        idempotency_key,
+        payload_fingerprint,
+        action_type,
+        calendar_id,
+        event_id
+    )
+    VALUES (
+        CAST(:proposal_id AS uuid),
+        CAST(:operation_id AS uuid),
+        CAST(:user_id AS uuid),
+        CAST(:connection_id AS uuid),
+        CAST(:idempotency_key AS uuid),
+        CAST(:payload_fingerprint AS text),
+        CAST(:action_type AS text),
+        CAST(:calendar_id AS text),
+        CAST(:event_id AS text)
+    )
 """)
 
 _LOCK_PROPOSAL_IDEMPOTENCY = text("""
@@ -310,7 +341,8 @@ _LIST_PENDING = text("""
           CAST(:conversation_id AS uuid) IS NULL
           OR conversation.id = CAST(:conversation_id AS uuid)
       )
-      AND approval_message.metadata->'action_approval'->>'status' = 'pending'
+      AND approval_message.metadata->'action_approval'->>'status'
+          IN ('pending', 'approved')
       AND (
           approval_message.metadata->'action_approval'->>'expires_at'
       )::timestamptz > clock_timestamp()
@@ -319,6 +351,7 @@ _LIST_PENDING = text("""
 """)
 
 _EXPIRE_PENDING = text("""
+    WITH expired_proposals AS (
     UPDATE public.pa_conversation_messages AS approval_message
     SET metadata = jsonb_set(
         approval_message.metadata,
@@ -341,6 +374,19 @@ _EXPIRE_PENDING = text("""
       AND (
           approval_message.metadata->'action_approval'->>'expires_at'
       )::timestamptz <= clock_timestamp()
+    RETURNING
+        approval_message.metadata->'action_approval'->>'proposal_id'
+            AS proposal_id
+    )
+    UPDATE public.pa_calendar_action_operations AS operation
+    SET execution_state = 'expired',
+        execution_completed_at = clock_timestamp(),
+        updated_at = clock_timestamp()
+    FROM expired_proposals
+    WHERE operation.proposal_id = CAST(
+        expired_proposals.proposal_id AS uuid
+    )
+      AND operation.execution_state IN ('pending', 'approved')
 """)
 
 _TRANSITION = text("""
@@ -387,6 +433,232 @@ _TRANSITION = text("""
         NULL::text AS account_email
 """)
 
+_SYNC_CALENDAR_APPROVAL_STATE = text("""
+    UPDATE public.pa_calendar_action_operations
+    SET execution_state = CAST(:new_state AS text),
+        execution_completed_at = CASE
+            WHEN :new_state IN ('rejected', 'expired')
+                THEN clock_timestamp()
+            ELSE execution_completed_at
+        END,
+        updated_at = clock_timestamp()
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND proposal_id = CAST(:proposal_id AS uuid)
+      AND execution_state = CAST(:expected_state AS text)
+""")
+
+_LOCK_CALENDAR_APPROVAL_FOR_EXECUTION = text("""
+    SELECT
+        approval_message.id AS message_id,
+        approval_message.metadata->'action_approval' AS proposal,
+        NULL::text AS account_email,
+        operation.*,
+        clock_timestamp() AS database_now
+    FROM public.pa_conversation_messages AS approval_message
+    JOIN public.pa_conversations AS conversation
+      ON conversation.id = approval_message.conversation_id
+    JOIN public.pa_calendar_action_operations AS operation
+      ON operation.proposal_id = approval_message.id
+     AND operation.user_id = conversation.user_id
+    WHERE conversation.user_id = CAST(:user_id AS uuid)
+      AND operation.proposal_id = CAST(:proposal_id AS uuid)
+    FOR UPDATE OF approval_message, operation
+""")
+
+_EXPIRE_CALENDAR_APPROVAL_CLAIM = text("""
+    UPDATE public.pa_conversation_messages AS approval_message
+    SET metadata = jsonb_set(
+        approval_message.metadata,
+        '{action_approval}',
+        (approval_message.metadata->'action_approval')
+            || jsonb_build_object(
+                'status', 'expired',
+                'completed_at', clock_timestamp()::text
+            ),
+        false
+    )
+    WHERE approval_message.id = CAST(:proposal_id AS uuid)
+      AND approval_message.metadata->'action_approval'->>'status'
+          = 'approved'
+      AND (
+          approval_message.metadata->'action_approval'->>'expires_at'
+      )::timestamptz <= clock_timestamp()
+    RETURNING approval_message.id
+""")
+
+_EXPIRE_CALENDAR_OPERATION_CLAIM = text("""
+    UPDATE public.pa_calendar_action_operations
+    SET execution_state = 'expired',
+        execution_completed_at = clock_timestamp(),
+        updated_at = clock_timestamp()
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND proposal_id = CAST(:proposal_id AS uuid)
+      AND execution_state = 'approved'
+    RETURNING proposal_id
+""")
+
+_CLAIM_CALENDAR_APPROVAL = text("""
+    UPDATE public.pa_conversation_messages AS approval_message
+    SET metadata = jsonb_set(
+        approval_message.metadata,
+        '{action_approval}',
+        (approval_message.metadata->'action_approval')
+            || jsonb_build_object(
+                'status', 'executing',
+                'execution_started_at', clock_timestamp()::text
+            ),
+        false
+    )
+    FROM public.pa_conversations AS conversation
+    WHERE conversation.id = approval_message.conversation_id
+      AND conversation.user_id = CAST(:user_id AS uuid)
+      AND approval_message.id = CAST(:proposal_id AS uuid)
+      AND approval_message.metadata->'action_approval'->>'status'
+          = 'approved'
+      AND (
+          approval_message.metadata->'action_approval'->>'expires_at'
+      )::timestamptz > clock_timestamp()
+    RETURNING
+        approval_message.id AS message_id,
+        approval_message.metadata->'action_approval' AS proposal,
+        NULL::text AS account_email
+""")
+
+_CLAIM_CALENDAR_OPERATION = text("""
+    UPDATE public.pa_calendar_action_operations
+    SET execution_state = 'executing',
+        attempt_count = attempt_count + 1,
+        execution_started_at = clock_timestamp(),
+        execution_completed_at = NULL,
+        updated_at = clock_timestamp()
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND proposal_id = CAST(:proposal_id AS uuid)
+      AND execution_state = 'approved'
+    RETURNING proposal_id
+""")
+
+_LOCK_CALENDAR_EXECUTION_STATE = text("""
+    SELECT
+        approval_message.id AS message_id,
+        approval_message.metadata->'action_approval' AS proposal,
+        operation.execution_state
+    FROM public.pa_conversation_messages AS approval_message
+    JOIN public.pa_conversations AS conversation
+      ON conversation.id = approval_message.conversation_id
+    JOIN public.pa_calendar_action_operations AS operation
+      ON operation.proposal_id = approval_message.id
+     AND operation.user_id = conversation.user_id
+    WHERE conversation.user_id = CAST(:user_id AS uuid)
+      AND operation.proposal_id = CAST(:proposal_id AS uuid)
+    FOR UPDATE OF approval_message, operation
+""")
+
+_UPDATE_CALENDAR_APPROVAL_RESULT = text("""
+    UPDATE public.pa_conversation_messages
+    SET metadata = jsonb_set(
+        metadata,
+        '{action_approval}',
+        (metadata->'action_approval')
+            || CAST(:approval_patch AS jsonb)
+            || jsonb_build_object('completed_at', clock_timestamp()::text),
+        false
+    )
+    WHERE id = CAST(:proposal_id AS uuid)
+      AND metadata->'action_approval'->>'status'
+          = CAST(:expected_state AS text)
+    RETURNING metadata->'action_approval' AS proposal
+""")
+
+_UPDATE_CALENDAR_OPERATION_RESULT = text("""
+    UPDATE public.pa_calendar_action_operations
+    SET execution_state = CAST(:new_state AS text),
+        execution_completed_at = clock_timestamp(),
+        provider_result_classification = CAST(
+            :provider_result_classification AS text
+        ),
+        reconciliation_status = CAST(:reconciliation_status AS text),
+        reconciled_at = CASE
+            WHEN :reconciliation_status = 'confirmed'
+                THEN clock_timestamp()
+            ELSE reconciled_at
+        END,
+        updated_at = clock_timestamp()
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND proposal_id = CAST(:proposal_id AS uuid)
+      AND execution_state = CAST(:expected_state AS text)
+    RETURNING proposal_id
+""")
+
+_UPDATE_UNCERTAIN_RECONCILIATION = text("""
+    UPDATE public.pa_calendar_action_operations
+    SET reconciliation_status = CAST(:reconciliation_status AS text),
+        reconciled_at = CASE
+            WHEN :reconciliation_status = 'manual_review'
+                THEN clock_timestamp()
+            ELSE reconciled_at
+        END,
+        updated_at = clock_timestamp()
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND proposal_id = CAST(:proposal_id AS uuid)
+      AND execution_state = 'execution_uncertain'
+    RETURNING proposal_id
+""")
+
+_STALE_CALENDAR_EXECUTION_CHECK = text("""
+    SELECT
+        approval_message.id AS message_id,
+        approval_message.metadata->'action_approval' AS proposal,
+        operation.execution_state,
+        operation.execution_started_at,
+        clock_timestamp() AS database_now
+    FROM public.pa_conversation_messages AS approval_message
+    JOIN public.pa_conversations AS conversation
+      ON conversation.id = approval_message.conversation_id
+    JOIN public.pa_calendar_action_operations AS operation
+      ON operation.proposal_id = approval_message.id
+     AND operation.user_id = conversation.user_id
+    WHERE conversation.user_id = CAST(:user_id AS uuid)
+      AND operation.proposal_id = CAST(:proposal_id AS uuid)
+    FOR UPDATE OF approval_message, operation
+""")
+
+_MARK_STALE_CALENDAR_APPROVAL_UNCERTAIN = text("""
+    UPDATE public.pa_conversation_messages
+    SET metadata = jsonb_set(
+        metadata,
+        '{action_approval}',
+        (metadata->'action_approval')
+            || jsonb_build_object(
+                'status', 'execution_uncertain',
+                'completed_at', clock_timestamp()::text,
+                'result', jsonb_build_object(
+                    'outcome', 'unconfirmed',
+                    'reason', 'worker_interrupted'
+                )
+            ),
+        false
+    )
+    WHERE id = CAST(:proposal_id AS uuid)
+      AND metadata->'action_approval'->>'status' = 'executing'
+    RETURNING
+        id AS message_id,
+        metadata->'action_approval' AS proposal,
+        NULL::text AS account_email
+""")
+
+_MARK_STALE_CALENDAR_OPERATION_UNCERTAIN = text("""
+    UPDATE public.pa_calendar_action_operations
+    SET execution_state = 'execution_uncertain',
+        execution_completed_at = clock_timestamp(),
+        provider_result_classification = 'outcome_unknown',
+        reconciliation_status = 'pending',
+        updated_at = clock_timestamp()
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND proposal_id = CAST(:proposal_id AS uuid)
+      AND execution_state = 'executing'
+    RETURNING proposal_id
+""")
+
 
 class ActionApprovalRepository:
     """Durable approval records stored as dedicated conversation messages."""
@@ -406,6 +678,7 @@ class ActionApprovalRepository:
         connection_id: UUID,
         account_email: str | None,
         expiration_minutes: int,
+        calendar_operation: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         params = {
             "proposal_id": str(proposal_id),
@@ -422,8 +695,61 @@ class ActionApprovalRepository:
             "account_email": account_email,
             "expiration_minutes": expiration_minutes,
             "content": f"Approval proposal: {action_type}",
+            "calendar_integrity": (
+                json.dumps(
+                    {
+                        "integrity_schema_version": (
+                            calendar_operation["integrity_schema_version"]
+                        ),
+                        "payload_fingerprint": (
+                            calendar_operation["payload_fingerprint"]
+                        ),
+                        "operation_id": calendar_operation["operation_id"],
+                        "calendar_event_id": calendar_operation["event_id"],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if calendar_operation is not None
+                else None
+            ),
         }
         with self.engine.begin() as connection:
+            if calendar_operation is not None:
+                connection.execute(
+                    _LOCK_PROPOSAL_IDEMPOTENCY,
+                    {
+                        "lock_key": (
+                            "calendar-create:"
+                            f"{calendar_operation['user_id']}:"
+                            f"{calendar_operation['proposal_id']}"
+                        ),
+                    },
+                )
+                existing = (
+                    connection.execute(
+                        _GET_PROPOSAL,
+                        {
+                            "user_id": str(user_id),
+                            "proposal_id": str(proposal_id),
+                        },
+                    )
+                    .mappings()
+                    .first()
+                )
+                if existing is not None:
+                    existing_row = self._proposal_row(existing, account_email)
+                    if (
+                        existing_row["payload_fingerprint"]
+                        != calendar_operation["payload_fingerprint"]
+                        or existing_row["operation_id"]
+                        != UUID(str(calendar_operation["operation_id"]))
+                    ):
+                        raise CalendarOperationConflictError(
+                            "This Calendar proposal ID is already bound to "
+                            "different event details."
+                        )
+                    return existing_row
             row = (
                 connection.execute(_INSERT_PROPOSAL, params)
                 .mappings()
@@ -431,6 +757,11 @@ class ActionApprovalRepository:
             )
             if row is None:
                 return None
+            if calendar_operation is not None:
+                connection.execute(
+                    _INSERT_CALENDAR_OPERATION,
+                    calendar_operation,
+                )
             return self._proposal_row(row, account_email)
 
     def create_gmail_draft_proposal(
@@ -639,6 +970,37 @@ class ActionApprovalRepository:
                 .mappings()
                 .first()
             )
+            if (
+                row is not None
+                and row["proposal"]["action_type"].startswith("calendar.")
+                and (
+                    (
+                        expected_status == "pending"
+                        and new_status in {
+                            "approved",
+                            "rejected",
+                            "expired",
+                        }
+                    )
+                    or (
+                        expected_status == "approved"
+                        and new_status == "expired"
+                    )
+                )
+            ):
+                synchronized = connection.execute(
+                    _SYNC_CALENDAR_APPROVAL_STATE,
+                    {
+                        "user_id": str(user_id),
+                        "proposal_id": str(proposal_id),
+                        "expected_state": expected_status,
+                        "new_state": new_status,
+                    },
+                )
+                if synchronized.rowcount != 1:
+                    raise RuntimeError(
+                        "Calendar approval state could not be synchronized."
+                    )
         return self._proposal_row(row) if row is not None else None
 
     @staticmethod
@@ -656,8 +1018,10 @@ class ActionApprovalRepository:
             "user_id",
             "conversation_id",
             "connection_id",
+            "operation_id",
         ):
-            proposal[field] = UUID(str(proposal[field]))
+            if proposal.get(field) is not None:
+                proposal[field] = UUID(str(proposal[field]))
         for field in (
             "created_at",
             "expires_at",
@@ -684,3 +1048,503 @@ class ActionApprovalRepository:
                 or account_email
             ),
         }
+
+
+_GET_CALENDAR_OPERATION = text("""
+    SELECT *
+    FROM public.pa_calendar_action_operations
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND proposal_id = CAST(:proposal_id AS uuid)
+    LIMIT 1
+""")
+
+_GET_CALENDAR_OPERATION_BY_KEY = text("""
+    SELECT *
+    FROM public.pa_calendar_action_operations
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND idempotency_key = CAST(:idempotency_key AS uuid)
+    LIMIT 1
+""")
+
+_BIND_CALENDAR_IDEMPOTENCY_KEY = text("""
+    UPDATE public.pa_calendar_action_operations
+    SET idempotency_key = CAST(:idempotency_key AS uuid),
+        updated_at = clock_timestamp()
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND proposal_id = CAST(:proposal_id AS uuid)
+      AND idempotency_key IS NULL
+    RETURNING *
+""")
+
+_TRANSITION_CALENDAR_OPERATION = text("""
+    UPDATE public.pa_calendar_action_operations
+    SET execution_state = CAST(:new_state AS text),
+        attempt_count = attempt_count
+            + CASE WHEN :new_state = 'executing' THEN 1 ELSE 0 END,
+        execution_started_at = CASE
+            WHEN :new_state = 'executing' THEN clock_timestamp()
+            ELSE execution_started_at
+        END,
+        execution_completed_at = CASE
+            WHEN :new_state IN (
+                'completed', 'failed', 'execution_uncertain'
+            ) THEN clock_timestamp()
+            WHEN :new_state IN ('pending', 'approved', 'executing')
+                THEN NULL
+            ELSE execution_completed_at
+        END,
+        provider_result_classification = COALESCE(
+            CAST(:provider_result_classification AS text),
+            provider_result_classification
+        ),
+        reconciliation_status = COALESCE(
+            CAST(:reconciliation_status AS text),
+            reconciliation_status
+        ),
+        reconciled_at = CASE
+            WHEN :reconciliation_status IN ('confirmed', 'not_executed')
+                THEN clock_timestamp()
+            ELSE reconciled_at
+        END,
+        updated_at = clock_timestamp()
+    WHERE user_id = CAST(:user_id AS uuid)
+      AND proposal_id = CAST(:proposal_id AS uuid)
+      AND execution_state = CAST(:expected_state AS text)
+    RETURNING *
+""")
+
+
+class CalendarActionOperationRepository:
+    """Durable, owner-scoped operation records for future Calendar writes."""
+
+    ALLOWED_TRANSITIONS = {
+        "pending": {"approved", "rejected", "cancelled", "expired"},
+        "approved": {"executing", "cancelled", "expired"},
+        "executing": {"completed", "failed", "execution_uncertain"},
+        "execution_uncertain": {"completed", "failed"},
+    }
+    PROVIDER_RESULT_CLASSIFICATIONS = frozenset({
+        "accepted",
+        "rejected",
+        "not_transmitted",
+        "outcome_unknown",
+        "confirmed",
+    })
+    RECONCILIATION_STATUSES = frozenset({
+        "not_required",
+        "pending",
+        "confirmed",
+        "not_executed",
+        "not_found",
+        "conflict",
+        "manual_review",
+    })
+
+    def __init__(self, database_engine: Engine | None = None):
+        self.engine = database_engine or engine
+
+    def get_for_user(
+        self,
+        user_id: UUID,
+        proposal_id: UUID,
+    ) -> dict[str, Any] | None:
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    _GET_CALENDAR_OPERATION,
+                    {
+                        "user_id": str(user_id),
+                        "proposal_id": str(proposal_id),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row is not None else None
+
+    def get_by_idempotency_key(
+        self,
+        user_id: UUID,
+        idempotency_key: UUID,
+    ) -> dict[str, Any] | None:
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    _GET_CALENDAR_OPERATION_BY_KEY,
+                    {
+                        "user_id": str(user_id),
+                        "idempotency_key": str(idempotency_key),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row is not None else None
+
+    def claim_execution(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+    ) -> dict[str, Any] | None:
+        """Atomically verify and claim an approved Calendar proposal."""
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    _LOCK_CALENDAR_APPROVAL_FOR_EXECUTION,
+                    {
+                        "user_id": str(user_id),
+                        "proposal_id": str(proposal_id),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                return None
+
+            proposal_data = ActionApprovalRepository._proposal_row(row)
+            proposal = ActionApprovalProposal.model_validate(proposal_data)
+            identity = verify_calendar_proposal_integrity(proposal, user_id)
+            if (
+                UUID(str(row["operation_id"])) != identity.operation_id
+                or UUID(str(row["user_id"])) != user_id
+                or UUID(str(row["connection_id"])) != identity.connection_id
+                or row["action_type"] != identity.action_type
+                or row["calendar_id"] != identity.calendar_id
+                or row["event_id"] != identity.event_id
+                or row["payload_fingerprint"] != identity.payload_fingerprint
+                or row["execution_state"] != proposal_data["status"]
+                or proposal_data["status"] != "approved"
+            ):
+                raise CalendarOperationConflictError(
+                    "Calendar approval integrity verification failed."
+                )
+
+            params = {
+                "user_id": str(user_id),
+                "proposal_id": str(proposal_id),
+            }
+            if proposal_data["expires_at"] <= row["database_now"]:
+                expired_proposal = connection.execute(
+                    _EXPIRE_CALENDAR_APPROVAL_CLAIM,
+                    params,
+                ).first()
+                expired_operation = connection.execute(
+                    _EXPIRE_CALENDAR_OPERATION_CLAIM,
+                    params,
+                ).first()
+                if expired_proposal is None or expired_operation is None:
+                    raise RuntimeError(
+                        "Calendar approval expiration could not be synchronized."
+                    )
+                return None
+
+            claimed_proposal = (
+                connection.execute(
+                    _CLAIM_CALENDAR_APPROVAL,
+                    params,
+                )
+                .mappings()
+                .first()
+            )
+            if claimed_proposal is None:
+                return None
+            claimed_operation = connection.execute(
+                _CLAIM_CALENDAR_OPERATION,
+                params,
+            ).first()
+            if claimed_operation is None:
+                raise RuntimeError(
+                    "Calendar operation claim could not be synchronized."
+                )
+            return ActionApprovalRepository._proposal_row(claimed_proposal)
+
+    def finish_execution(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+        expected_state: str,
+        new_state: str,
+        provider_result_classification: str,
+        reconciliation_status: str,
+        safe_result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if expected_state not in {"executing", "execution_uncertain"}:
+            raise ValueError("Invalid Calendar execution completion state.")
+        if new_state not in {"completed", "failed", "execution_uncertain"}:
+            raise ValueError("Invalid Calendar execution completion state.")
+        if provider_result_classification not in self.PROVIDER_RESULT_CLASSIFICATIONS:
+            raise ValueError("Invalid Calendar provider result classification.")
+        if reconciliation_status not in self.RECONCILIATION_STATUSES:
+            raise ValueError("Invalid Calendar reconciliation status.")
+        if new_state == "completed" and reconciliation_status != "confirmed":
+            raise ValueError(
+                "Calendar completion requires confirmed provider read-back."
+            )
+        if expected_state == "execution_uncertain" and (
+            (new_state == "completed" and reconciliation_status != "confirmed")
+            or (
+                new_state == "failed"
+                and reconciliation_status != "not_executed"
+            )
+        ):
+            raise ValueError(
+                "Uncertain Calendar operations require reconciliation."
+            )
+        if provider_result_classification in {
+            "outcome_unknown",
+            "accepted",
+        } and new_state == "failed":
+            raise ValueError(
+                "Uncertain Calendar results cannot be marked failed."
+            )
+
+        approval_patch = {
+            "status": new_state,
+            "result": safe_result,
+        }
+        with self.engine.begin() as connection:
+            params = {
+                "user_id": str(user_id),
+                "proposal_id": str(proposal_id),
+                "expected_state": expected_state,
+            }
+            locked = (
+                connection.execute(
+                    _LOCK_CALENDAR_EXECUTION_STATE,
+                    params,
+                )
+                .mappings()
+                .first()
+            )
+            if (
+                locked is None
+                or locked["execution_state"] != expected_state
+                or locked["proposal"].get("status") != expected_state
+            ):
+                return None
+
+            updated_approval = (
+                connection.execute(
+                    _UPDATE_CALENDAR_APPROVAL_RESULT,
+                    {
+                        "proposal_id": str(proposal_id),
+                        "expected_state": expected_state,
+                        "approval_patch": json.dumps(
+                            approval_patch,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+            updated_operation = connection.execute(
+                _UPDATE_CALENDAR_OPERATION_RESULT,
+                {
+                    "user_id": str(user_id),
+                    "proposal_id": str(proposal_id),
+                    "expected_state": expected_state,
+                    "new_state": new_state,
+                    "provider_result_classification": (
+                        provider_result_classification
+                    ),
+                    "reconciliation_status": reconciliation_status,
+                },
+            ).first()
+            if updated_approval is None or updated_operation is None:
+                raise RuntimeError(
+                    "Calendar execution result could not be synchronized."
+                )
+            row = {
+                "message_id": locked["message_id"],
+                "proposal": updated_approval["proposal"],
+                "account_email": None,
+            }
+        return ActionApprovalRepository._proposal_row(row)
+
+    def update_uncertain_reconciliation(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+        reconciliation_status: str,
+    ) -> bool:
+        if reconciliation_status not in {"pending", "manual_review"}:
+            raise ValueError("Invalid uncertain reconciliation status.")
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                _UPDATE_UNCERTAIN_RECONCILIATION,
+                {
+                    "user_id": str(user_id),
+                    "proposal_id": str(proposal_id),
+                    "reconciliation_status": reconciliation_status,
+                },
+            ).first()
+        return row is not None
+
+    def mark_stale_execution_uncertain(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+        stale_after_seconds: int,
+    ) -> dict[str, Any] | None:
+        if stale_after_seconds < 1:
+            raise ValueError("Stale execution threshold must be positive.")
+        params = {
+            "user_id": str(user_id),
+            "proposal_id": str(proposal_id),
+        }
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    _STALE_CALENDAR_EXECUTION_CHECK,
+                    params,
+                )
+                .mappings()
+                .first()
+            )
+            if (
+                row is None
+                or row["execution_state"] != "executing"
+                or row["proposal"].get("status") != "executing"
+                or row["execution_started_at"] is None
+                or (
+                    row["database_now"] - row["execution_started_at"]
+                ).total_seconds() < stale_after_seconds
+            ):
+                return None
+
+            approval = (
+                connection.execute(
+                    _MARK_STALE_CALENDAR_APPROVAL_UNCERTAIN,
+                    params,
+                )
+                .mappings()
+                .first()
+            )
+            operation = connection.execute(
+                _MARK_STALE_CALENDAR_OPERATION_UNCERTAIN,
+                params,
+            ).first()
+            if approval is None or operation is None:
+                raise RuntimeError(
+                    "Stale Calendar execution recovery could not be synchronized."
+                )
+            return ActionApprovalRepository._proposal_row(approval)
+
+    def bind_idempotency_key(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+        idempotency_key: UUID,
+        payload_fingerprint: str,
+    ) -> dict[str, Any]:
+        with self.engine.begin() as connection:
+            connection.execute(
+                _LOCK_PROPOSAL_IDEMPOTENCY,
+                {
+                    "lock_key": (
+                        f"calendar:{user_id}:{idempotency_key}"
+                    ),
+                },
+            )
+            existing = (
+                connection.execute(
+                    _GET_CALENDAR_OPERATION_BY_KEY,
+                    {
+                        "user_id": str(user_id),
+                        "idempotency_key": str(idempotency_key),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+            if existing is not None:
+                validate_idempotency_fingerprint_reuse(
+                    existing["payload_fingerprint"],
+                    payload_fingerprint,
+                )
+                return dict(existing)
+
+            row = (
+                connection.execute(
+                    _BIND_CALENDAR_IDEMPOTENCY_KEY,
+                    {
+                        "user_id": str(user_id),
+                        "proposal_id": str(proposal_id),
+                        "idempotency_key": str(idempotency_key),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                raise LookupError(
+                    "Calendar operation was not found or already has an idempotency key."
+                )
+            validate_idempotency_fingerprint_reuse(
+                row["payload_fingerprint"],
+                payload_fingerprint,
+            )
+            return dict(row)
+
+    def transition(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+        expected_state: str,
+        new_state: str,
+        provider_result_classification: str | None = None,
+        reconciliation_status: str | None = None,
+    ) -> dict[str, Any] | None:
+        allowed = self.ALLOWED_TRANSITIONS.get(expected_state, set())
+        if new_state not in allowed:
+            raise ValueError("Invalid Calendar operation state transition.")
+        if (
+            provider_result_classification is not None
+            and provider_result_classification
+            not in self.PROVIDER_RESULT_CLASSIFICATIONS
+        ):
+            raise ValueError(
+                "Invalid Calendar provider result classification."
+            )
+        if (
+            reconciliation_status is not None
+            and reconciliation_status not in self.RECONCILIATION_STATUSES
+        ):
+            raise ValueError("Invalid Calendar reconciliation status.")
+        if expected_state == "execution_uncertain":
+            required_reconciliation = {
+                "completed": "confirmed",
+                "failed": "not_executed",
+            }[new_state]
+            if reconciliation_status != required_reconciliation:
+                raise ValueError(
+                    "Uncertain Calendar operations require positive reconciliation."
+                )
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    _TRANSITION_CALENDAR_OPERATION,
+                    {
+                        "user_id": str(user_id),
+                        "proposal_id": str(proposal_id),
+                        "expected_state": expected_state,
+                        "new_state": new_state,
+                        "provider_result_classification": (
+                            provider_result_classification
+                        ),
+                        "reconciliation_status": reconciliation_status,
+                    },
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row is not None else None

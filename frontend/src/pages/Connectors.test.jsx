@@ -4,10 +4,11 @@ import { Outlet, Route, Routes, MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const updateUserMetadata = vi.hoisted(() => vi.fn())
+const userMetadata = vi.hoisted(() => ({ current: {} }))
 
 vi.mock('../context/AuthContext', () => ({
   useAuth: () => ({
-    user: { id: 'user-1', user_metadata: {} },
+    user: { id: 'user-1', user_metadata: userMetadata.current },
     updateUserMetadata,
   }),
 }))
@@ -79,6 +80,7 @@ function connectedResponse(connections, calendarCapabilities) {
 describe('Connected Apps', () => {
   beforeEach(() => {
     updateUserMetadata.mockReset()
+    userMetadata.current = {}
     api.get.mockResolvedValue(connectedResponse([]))
     api.post.mockResolvedValue({
       authorization_url: 'https://accounts.google.com/oauth',
@@ -216,14 +218,20 @@ describe('Connected Apps', () => {
       }))
     renderConnectors()
 
-    expect(await screen.findByRole('button', {
-      name: 'Gmail connected',
-    })).toBeDisabled()
-    expect(screen.getByRole('button', {
+    expect(await screen.findByRole('switch', {
+      name: 'Enable Gmail',
+    })).toHaveAttribute('aria-checked', 'true')
+    expect(screen.getByRole('switch', {
+      name: 'Enable Google Calendar',
+    })).toHaveAttribute('aria-checked', 'true')
+    expect(screen.queryByRole('button', { name: 'Gmail connected' }))
+      .not.toBeInTheDocument()
+    expect(screen.queryByRole('button', {
       name: 'Google Calendar connected',
-    })).toBeDisabled()
-    expect(screen.getByText('Gmail: Connected · Google Calendar: Connected'))
-      .toBeInTheDocument()
+    })).not.toBeInTheDocument()
+    expect(await screen.findByText(
+      'Gmail: Connected · Google Calendar: Connected',
+    )).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /disconnect calendar/i }))
       .not.toBeInTheDocument()
   })
@@ -273,18 +281,14 @@ describe('Connected Apps', () => {
     }))
     renderConnectors()
 
-    expect(await screen.findByRole('button', {
-      name: 'Google Calendar connected',
-    })).toBeDisabled()
-    expect(screen.getByText(
+    expect(await screen.findByRole('switch', {
+      name: 'Enable Google Calendar',
+    })).toHaveAttribute('aria-checked', 'true')
+    expect(await screen.findByText(
       'Calendar event-read: available · FreeBusy: available · Calendar chat: available · Calendar writes: not available.',
     )).toBeInTheDocument()
-    expect(screen.getByRole('option', {
-      name: 'events@example.com — event access',
-    })).toBeInTheDocument()
-    expect(screen.getByRole('option', {
-      name: 'availability@example.com — free/busy access',
-    })).toBeInTheDocument()
+    expect(screen.queryByLabelText('Default Calendar account'))
+      .not.toBeInTheDocument()
   })
 
   it('confirms account-wide disconnection and preserves it when declined', async () => {
@@ -407,7 +411,7 @@ describe('Connected Apps', () => {
       .toBeInTheDocument()
   })
 
-  it('updates the default Calendar account preference', async () => {
+  it('shows working service switches separately from OAuth account status', async () => {
     api.get.mockResolvedValue(connectedResponse([{
       ...googleConnection,
       capabilities: {
@@ -428,12 +432,111 @@ describe('Connected Apps', () => {
     }))
     renderConnectors()
 
-    fireEvent.change(await screen.findByLabelText('Default Calendar account'), {
-      target: { value: 'connection-1' },
+    const gmailSwitch = await screen.findByRole('switch', {
+      name: 'Enable Gmail',
     })
+    const calendarSwitch = screen.getByRole('switch', {
+      name: 'Enable Google Calendar',
+    })
+    await waitFor(() => {
+      expect(gmailSwitch).toBeEnabled()
+      expect(calendarSwitch).toBeEnabled()
+    })
+    expect(gmailSwitch).toHaveAttribute('aria-checked', 'true')
+    expect(calendarSwitch).toHaveAttribute('aria-checked', 'true')
+    expect(screen.queryByText('Default Calendar account')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Default Calendar account')).not.toBeInTheDocument()
 
-    await waitFor(() => expect(updateUserMetadata).toHaveBeenCalledWith({
-      default_calendar_connection_id: 'connection-1',
+    fireEvent.click(gmailSwitch)
+
+    await waitFor(() => {
+      expect(updateUserMetadata).toHaveBeenCalledWith({
+        gmail_enabled: false,
+      })
+    })
+    expect(api.delete).not.toHaveBeenCalled()
+    expect(screen.getByText('Gmail: Connected · Google Calendar: Connected'))
+      .toBeInTheDocument()
+  })
+
+  it('persists Calendar OFF without disconnecting the Google account', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        ...googleConnection.capabilities,
+        calendar: true,
+        calendar_events_read: true,
+      },
+    }], {
+      connected: true,
+      events_read: true,
+      freebusy: false,
+      api_available: true,
+      api_complete: false,
+      chat_available: true,
+      google_connection_available: true,
+      permissions_need_consent: true,
+      write_available: false,
     }))
+    renderConnectors()
+
+    const calendarSwitch = await screen.findByRole('switch', {
+      name: 'Enable Google Calendar',
+    })
+    await waitFor(() => expect(calendarSwitch).toBeEnabled())
+    fireEvent.click(calendarSwitch)
+
+    await waitFor(() => {
+      expect(updateUserMetadata).toHaveBeenCalledWith({
+        calendar_enabled: false,
+      })
+    })
+    expect(api.delete).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', {
+      name: 'Disconnect Google account',
+    })).toBeInTheDocument()
+  })
+
+  it('restores persisted OFF states instead of inferring them from OAuth status', async () => {
+    userMetadata.current = {
+      gmail_enabled: false,
+      calendar_enabled: false,
+    }
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        ...googleConnection.capabilities,
+        gmail: true,
+        calendar: true,
+        calendar_events_read: true,
+      },
+    }], {
+      connected: true,
+      events_read: true,
+      freebusy: false,
+      api_available: true,
+      api_complete: false,
+      chat_available: true,
+      google_connection_available: true,
+      permissions_need_consent: true,
+      write_available: false,
+    }))
+    renderConnectors()
+
+    const gmailSwitch = await screen.findByRole('switch', {
+      name: 'Enable Gmail',
+    })
+    const calendarSwitch = screen.getByRole('switch', {
+      name: 'Enable Google Calendar',
+    })
+    await waitFor(() => {
+      expect(gmailSwitch).toBeEnabled()
+      expect(calendarSwitch).toBeEnabled()
+    })
+    expect(gmailSwitch)
+      .toHaveAttribute('aria-checked', 'false')
+    expect(calendarSwitch).toHaveAttribute('aria-checked', 'false')
+    expect(screen.getByText('Gmail: Connected · Google Calendar: Connected'))
+      .toBeInTheDocument()
   })
 })

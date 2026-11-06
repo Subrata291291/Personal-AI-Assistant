@@ -193,6 +193,8 @@ def test_calendar_tools_are_reported_when_scopes_and_route_are_available():
         "default_connection_selected": False,
         "selected_event_scope_missing": False,
         "selected_freebusy_scope_missing": False,
+        "write_permission_granted": False,
+        "write_execution_available": False,
         "write_available": False,
     }
     assert "read-only event search" in result["assistant_response"]
@@ -401,6 +403,50 @@ def test_calendar_changes_are_never_planned_as_read_operations():
     )
     assert routed["assistant_route"] == "google_calendar"
     assert routed["gmail_plan"]["calendar_tool"] == "clarify"
+
+
+def test_calendar_create_reaches_llm_planner_only_with_write_capability(
+    monkeypatch,
+):
+    response = LLMResponse(
+        content=json.dumps({
+            "intent": "google_calendar",
+            "calendar_tool": "create_calendar_event_proposal",
+            "calendar_arguments": {
+                "calendar_id": "primary",
+                "summary": "Design review",
+                "start": "2026-06-10T10:00:00-07:00",
+                "end": "2026-06-10T11:00:00-07:00",
+                "time_zone": "America/Los_Angeles",
+                "all_day": False,
+            },
+        }),
+        provider="test",
+        model="test-model",
+        latency_ms=0,
+        finish_reason="stop",
+    )
+    calls = []
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda request: calls.append(request) or response,
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Schedule a meeting with John tomorrow.",
+        assistant_capabilities={
+            "google_calendar": {
+                "write_execution_available": True,
+            },
+        },
+    ))
+
+    assert len(calls) == 1
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
 
 
 def test_gmail_and_general_requests_keep_existing_routing():

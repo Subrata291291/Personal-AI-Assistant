@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 from app.schemas.email_draft import normalize_email_address
+from app.schemas.calendar_approval import CalendarCreateEventParameters
 
 
 ActionType = Literal[
@@ -85,14 +86,14 @@ ACTION_PARAMETER_FIELDS: dict[str, tuple[set[str], set[str]]] = {
     ),
     "drive.delete_file": ({"file_id"}, set()),
     "calendar.create_event": (
-        {"title", "starts_at", "ends_at", "time_zone"},
-        {"attendees"},
+        {"calendar_id", "summary", "start", "end", "all_day"},
+        {"description", "time_zone", "location", "attendees"},
     ),
     "calendar.update_event": (
-        {"event_id"},
+        {"calendar_id", "event_id"},
         {"title", "starts_at", "ends_at", "time_zone", "attendees"},
     ),
-    "calendar.delete_event": ({"event_id"}, set()),
+    "calendar.delete_event": ({"calendar_id", "event_id"}, set()),
     "contacts.create_contact": (
         {"display_name"},
         {"email", "phone"},
@@ -105,6 +106,7 @@ ACTION_PARAMETER_FIELDS: dict[str, tuple[set[str], set[str]]] = {
 }
 
 _RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,512}$")
+_CALENDAR_ID_PATTERN = re.compile(r"^[A-Za-z0-9._@+-]{1,1024}$")
 _SAFE_RESULT_DENIED_KEYS = re.compile(
     r"(?:access|refresh|client)?_?(?:token|secret|credential|authorization|"
     r"password|api[_-]?key|private[_-]?key)",
@@ -139,6 +141,12 @@ class ApprovalProposalCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_action_parameters(self) -> "ApprovalProposalCreate":
+        if self.action_type == "calendar.create_event":
+            validated = CalendarCreateEventParameters.model_validate(
+                self.parameters
+            )
+            self.parameters = validated.model_dump(mode="json")
+            return self
         required, optional = ACTION_PARAMETER_FIELDS[self.action_type]
         supplied = set(self.parameters)
         if not required.issubset(supplied):
@@ -200,10 +208,23 @@ class ApprovalProposalCreate(BaseModel):
         } and not str(self.parameters.get("body", "")).strip():
             raise ValueError("body cannot be empty.")
 
-        for key in ("message_id", "thread_id", "file_id", "event_id", "contact_id"):
+        for key in (
+            "message_id",
+            "thread_id",
+            "file_id",
+            "event_id",
+            "contact_id",
+        ):
             value = self.parameters.get(key)
             if isinstance(value, str) and not _RESOURCE_ID_PATTERN.fullmatch(value):
                 raise ValueError(f"{key} is invalid.")
+        calendar_id = self.parameters.get("calendar_id")
+        if calendar_id is not None and (
+            not isinstance(calendar_id, str)
+            or calendar_id in {".", ".."}
+            or not _CALENDAR_ID_PATTERN.fullmatch(calendar_id)
+        ):
+            raise ValueError("calendar_id is invalid.")
         draft_id = self.parameters.get("draft_id")
         if isinstance(draft_id, str) and not _RESOURCE_ID_PATTERN.fullmatch(draft_id):
             raise ValueError("draft_id is invalid.")
@@ -297,6 +318,10 @@ class ActionApprovalProposal(BaseModel):
     execution_started_at: datetime | None = None
     completed_at: datetime | None = None
     result: dict[str, JsonValue] | None = None
+    integrity_schema_version: int | None = None
+    payload_fingerprint: str | None = None
+    operation_id: UUID | None = None
+    calendar_event_id: str | None = None
 
     @model_validator(mode="after")
     def require_aware_timestamps(self) -> "ActionApprovalProposal":

@@ -1,6 +1,9 @@
 CALENDAR_EVENTS_READ_SCOPE = (
     "https://www.googleapis.com/auth/calendar.events.readonly"
 )
+CALENDAR_EVENTS_WRITE_SCOPE = (
+    "https://www.googleapis.com/auth/calendar.events"
+)
 CALENDAR_FREEBUSY_SCOPE = (
     "https://www.googleapis.com/auth/calendar.events.freebusy"
 )

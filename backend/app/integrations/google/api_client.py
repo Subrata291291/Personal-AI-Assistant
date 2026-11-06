@@ -8,11 +8,13 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
-from sqlalchemy import exc
 from sqlalchemy.orm import Session
 
 from app.core.request_metrics import record_timing, request_id
-from app.integrations.google.exceptions import GoogleAPIError
+from app.integrations.google.exceptions import (
+    GoogleAPIError,
+    GoogleAPIMutationError,
+)
 from app.services.oauth_credential_service import OAuthCredentialService
 
 
@@ -296,14 +298,10 @@ class GoogleAPIClient:
                     params=params,
                     json_data=json_data,
                 )
-
             except GoogleAPIError as exc:
-
-                # Step 3: Only handle the first 401 response.
                 if exc.status_code != 401:
                     raise
 
-                # Step 4: Refresh or reuse a newer access token.
                 try:
                     new_access_token = (
                         await credential_service.get_valid_access_token(
@@ -312,18 +310,12 @@ class GoogleAPIClient:
                             rejected_access_token=access_token,
                         )
                     )
-
                     db.commit()
-
                 except Exception:
                     db.rollback()
                     raise
 
-                # Step 5: Retry the original request exactly once.
-                headers["Authorization"] = (
-                    f"Bearer {new_access_token}"
-                )
-
+                headers["Authorization"] = f"Bearer {new_access_token}"
                 return await self._send_request(
                     client=client,
                     method=normalized_method,
@@ -332,3 +324,146 @@ class GoogleAPIClient:
                     params=params,
                     json_data=json_data,
                 )
+
+    async def request_mutation(
+        self,
+        db: Session,
+        user_id: str,
+        connection_id: str,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        json_data: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> dict[str, Any]:
+        """Send one mutation request without automatic retries."""
+        self._validate_url(url)
+
+        normalized_user_id = UUID(str(user_id))
+        normalized_connection_id = UUID(str(connection_id))
+        if not isinstance(method, str):
+            raise ValueError("Invalid Google API mutation method.")
+        normalized_method = method.upper()
+        if normalized_method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            raise ValueError("Unsupported Google API mutation method.")
+
+        mutation_headers = dict(headers or {})
+        for name, value in mutation_headers.items():
+            if (
+                name.lower() != "if-match"
+                or not isinstance(value, str)
+                or not value.strip()
+                or "\r" in value
+                or "\n" in value
+            ):
+                raise ValueError("Unsupported Google API mutation header.")
+        if normalized_method in {"PUT", "PATCH", "DELETE"} and not any(
+            name.lower() == "if-match" for name in mutation_headers
+        ):
+            raise ValueError(
+                "Conditional If-Match is required for this mutation method."
+            )
+
+        credential_service = OAuthCredentialService(db)
+        try:
+            access_token = await credential_service.get_valid_access_token(
+                user_id=normalized_user_id,
+                connection_id=normalized_connection_id,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+        request_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            **mutation_headers,
+        }
+        async with self._client_context(http_client) as client:
+            return await self._send_mutation_request(
+                client=client,
+                method=normalized_method,
+                url=url,
+                headers=request_headers,
+                params=params,
+                json_data=json_data,
+            )
+
+    async def _send_mutation_request(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        params: dict[str, Any] | None,
+        json_data: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        response = None
+        started_at = perf_counter()
+        try:
+            response = await client.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                json=json_data,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            raise GoogleAPIMutationError(
+                status_code=503,
+                message="Google API connection failed before transmission.",
+                outcome_unknown=False,
+                reason="request_not_transmitted",
+            ) from exc
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ) as exc:
+            raise GoogleAPIMutationError(
+                status_code=503,
+                message="Google API mutation outcome could not be confirmed.",
+                outcome_unknown=True,
+                reason="transport_outcome_unknown",
+            ) from exc
+        finally:
+            record_timing("google_mutation_api", (perf_counter() - started_at) * 1000)
+            logger.info(
+                "google_api_mutation_request_completed | request_id=%s "
+                "| method=%s | duration_ms=%.2f | status=%s",
+                request_id(),
+                method,
+                (perf_counter() - started_at) * 1000,
+                response.status_code if response is not None else "network_error",
+            )
+
+        if response.is_success:
+            if response.status_code == 204 or not response.content:
+                return {}
+            try:
+                result = response.json()
+            except ValueError as exc:
+                raise GoogleAPIMutationError(
+                    status_code=response.status_code,
+                    message="Google API mutation response could not be confirmed.",
+                    outcome_unknown=True,
+                    reason="invalid_success_response",
+                ) from exc
+            if not isinstance(result, dict):
+                raise GoogleAPIMutationError(
+                    status_code=response.status_code,
+                    message="Google API mutation response could not be confirmed.",
+                    outcome_unknown=True,
+                    reason="invalid_success_response",
+                )
+            return result
+
+        status_code = response.status_code
+        raise GoogleAPIMutationError(
+            status_code=status_code,
+            message="Google API mutation request was rejected.",
+            outcome_unknown=status_code >= 500,
+            reason=self._error_reason(response),
+        )

@@ -22,6 +22,7 @@ function updateProposalMessage(message, proposal, onUpdated) {
 
 function ActionApprovalCard({ message, isDark, onUpdated }) {
   const proposal = message.metadata.action_approval
+  const isCalendarCreate = proposal.action_type === 'calendar.create_event'
   const [error, setError] = useState('')
   const [expired, setExpired] = useState(false)
   const requestInProgress = useRef(false)
@@ -64,10 +65,10 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       updateProposalMessage(message, response.proposal, onUpdated)
     },
     onError: async (mutationError) => {
-      setError(formatRequestError(
-        mutationError,
-        'The Gmail send outcome could not be confirmed.',
-      ))
+      const fallback = isCalendarCreate
+        ? 'The Calendar event outcome could not be confirmed.'
+        : 'The Gmail send outcome could not be confirmed.'
+      setError(formatRequestError(mutationError, fallback))
       try {
         const latest = await actionApprovalService.getProposal(
           proposal.proposal_id,
@@ -75,12 +76,11 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
         updateProposalMessage(message, latest, onUpdated)
       } catch (statusError) {
         setError(
-          `${formatRequestError(
-            mutationError,
-            'The Gmail send outcome could not be confirmed.',
-          )} Status check failed: ${formatRequestError(
+          `${formatRequestError(mutationError, fallback)} Status check failed: ${formatRequestError(
             statusError,
-            'Check the send status before taking further action.',
+            isCalendarCreate
+              ? 'Check the event status before taking further action.'
+              : 'Check the send status before taking further action.',
           )}`,
         )
       }
@@ -100,7 +100,9 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
     onError: (mutationError) => {
       setError(formatRequestError(
         mutationError,
-        'Unable to refresh the Gmail send status.',
+        isCalendarCreate
+          ? 'Unable to refresh the Calendar event status.'
+          : 'Unable to refresh the Gmail send status.',
       ))
     },
     onSettled: () => {
@@ -131,7 +133,7 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       requestInProgress.current ||
       mutation.isPending ||
       executeMutation.isPending ||
-      proposal.action_type !== 'gmail.send' ||
+      !['gmail.send', 'calendar.create_event'].includes(proposal.action_type) ||
       proposal.status !== 'approved'
     ) {
       return
@@ -189,7 +191,9 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
         <div>
           <h3 className="text-sm font-semibold">Review proposed action</h3>
           <p className={`mt-0.5 text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-            {proposal.action_type} · Approval and execution are separate
+            {isCalendarCreate
+              ? 'Google Calendar event creation · Approval and execution are separate'
+              : `${proposal.action_type} · Approval and execution are separate`}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -219,7 +223,17 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
           {Object.entries(proposal.parameters).map(([key, value]) => (
             <div key={key} className="grid gap-1 py-2 sm:grid-cols-[110px_1fr]">
               <dt className={`font-semibold ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-                {key.replaceAll('_', ' ')}
+                {key === 'summary' && isCalendarCreate
+                  ? 'Event title'
+                  : key === 'calendar_id' && isCalendarCreate
+                    ? 'Calendar'
+                    : key === 'start' && isCalendarCreate
+                      ? 'Start'
+                      : key === 'end' && isCalendarCreate
+                        ? 'End (exclusive for all-day)'
+                        : key === 'all_day' && isCalendarCreate
+                          ? 'All-day event'
+                          : key.replaceAll('_', ' ')}
               </dt>
               <dd className={`break-words whitespace-pre-wrap ${
                 isDark ? 'text-slate-200' : 'text-slate-700'
@@ -242,12 +256,16 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
 
         {visibleStatus === 'approved' && (
           <p role="status" className="text-xs text-emerald-500">
-            Approved by you. No email will be sent until you explicitly choose Execute.
+            {isCalendarCreate
+              ? 'Approved by you. No event will be created until you separately choose Execute.'
+              : 'Approved by you. No email will be sent until you explicitly choose Execute.'}
           </p>
         )}
         {visibleStatus === 'executing' && (
           <p role="status" className="text-xs text-violet-400">
-            The send was claimed. If the worker was interrupted, recovery will mark it uncertain; it will not be sent again automatically.
+            {isCalendarCreate
+              ? 'The event creation was claimed. If interrupted, the result will be reconciled without issuing another create request.'
+              : 'The send was claimed. If the worker was interrupted, recovery will mark it uncertain; it will not be sent again automatically.'}
           </p>
         )}
         {['executing', 'execution_uncertain'].includes(visibleStatus) && (
@@ -262,14 +280,25 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
                   : 'border-slate-200 text-slate-700 hover:bg-slate-50'
               }`}
             >
-              {statusMutation.isPending ? 'Checking...' : 'Check send status'}
+              {statusMutation.isPending
+                ? 'Checking...'
+                : isCalendarCreate
+                  ? 'Check event status'
+                  : 'Check send status'}
             </button>
           </div>
         )}
         {visibleStatus === 'completed' && (
           <p role="status" className="text-xs text-emerald-500">
-            Gmail confirmed the message was sent.
-            {proposal.result?.gmail_message_id && (
+            {isCalendarCreate
+              ? 'Google Calendar confirmed the event was created.'
+              : 'Gmail confirmed the message was sent.'}
+            {isCalendarCreate && proposal.result?.google_event_id && (
+              <span className="ml-1 font-mono">
+                Event ID: {proposal.result.google_event_id}
+              </span>
+            )}
+            {!isCalendarCreate && proposal.result?.gmail_message_id && (
               <span className="ml-1 font-mono">
                 Message ID: {proposal.result.gmail_message_id}
               </span>
@@ -278,12 +307,16 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
         )}
         {visibleStatus === 'failed' && (
           <p role="alert" className="text-xs text-rose-400">
-            Gmail rejected the send request. This proposal cannot be retried.
+            {isCalendarCreate
+              ? 'Google Calendar rejected the create request. This proposal cannot be retried.'
+              : 'Gmail rejected the send request. This proposal cannot be retried.'}
           </p>
         )}
         {visibleStatus === 'execution_uncertain' && (
           <p role="alert" className="text-xs text-rose-400">
-            Gmail may have sent the message, but the result is unconfirmed. Do not retry this proposal.
+            {isCalendarCreate
+              ? 'The event may have been created, but the outcome is unconfirmed. Do not retry or create a replacement event.'
+              : 'Gmail may have sent the message, but the result is unconfirmed. Do not retry this proposal.'}
           </p>
         )}
         {isExpired && (
@@ -320,7 +353,7 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
             </button>
           </div>
         )}
-        {proposal.status === 'approved' && proposal.action_type === 'gmail.send' && (
+        {proposal.status === 'approved' && ['gmail.send', 'calendar.create_event'].includes(proposal.action_type) && (
           <div className={`flex justify-end border-t pt-3 ${
             isDark ? 'border-[#303245]' : 'border-slate-100'
           }`}>
@@ -330,7 +363,13 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
               disabled={mutation.isPending || executeMutation.isPending}
               className="rounded-lg bg-violet-600 px-4 py-2 text-xs font-semibold text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {executeMutation.isPending ? 'Sending...' : 'Execute Gmail send'}
+              {executeMutation.isPending
+                ? isCalendarCreate
+                  ? 'Creating event...'
+                  : 'Sending...'
+                : isCalendarCreate
+                  ? 'Create Calendar event'
+                  : 'Execute Gmail send'}
             </button>
           </div>
         )}

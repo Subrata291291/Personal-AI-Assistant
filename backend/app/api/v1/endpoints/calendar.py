@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import EmailStr
 from sqlalchemy.orm import Session
 
-from app.api.deps import CurrentUser
+from app.api.deps import CurrentUser, require_integration_enabled
 from app.db.session import get_db
 from app.integrations.google.exceptions import GoogleAPIError
 from app.schemas.calendar import (
@@ -18,7 +18,9 @@ from app.schemas.calendar import (
 from app.services.calendar_service import CalendarService
 
 
-router = APIRouter()
+router = APIRouter(
+    dependencies=[Depends(require_integration_enabled("calendar"))],
+)
 
 
 def _get_user_id(current_user: dict) -> UUID:

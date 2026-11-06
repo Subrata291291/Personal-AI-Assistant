@@ -118,7 +118,10 @@ def build_runtime_capabilities(
     calendar = calendar_capabilities or {}
     calendar_chat_available = (
         "google_calendar" not in unavailable_routes
-        and bool(calendar.get("api_available", False))
+        and bool(
+            calendar.get("api_available", False)
+            or calendar.get("write_execution_available", False)
+        )
     )
 
     return {
@@ -162,6 +165,12 @@ def build_runtime_capabilities(
             "selected_freebusy_scope_missing": bool(
                 calendar.get("selected_freebusy_scope_missing", False)
             ),
+            "write_permission_granted": bool(
+                calendar.get("write_permission_granted", False)
+            ),
+            "write_execution_available": bool(
+                calendar.get("write_execution_available", False)
+            ),
             "write_available": False,
         },
         "unavailable_integrations": [
@@ -197,10 +206,22 @@ def _plan_prompt(state: ChatState) -> str:
         f"{local_now.isoformat(timespec='minutes')} ({timezone}). "
         "Use daily_planning for making or adjusting a personal day schedule; "
         "use conversation history later in the chat workflow for constraints. "
-        "Use google_calendar for read-only Calendar requests. For that intent, "
+        "Use google_calendar for Calendar requests. For read operations select "
+        "the matching read tool. For a request to create one event, use "
+        "create_calendar_event_proposal only when runtime "
+        "write_execution_available is true; this prepares an approval "
+        "proposal only and never executes a mutation. Its arguments must be "
+        "calendar_id, summary, start, end, all_day, and optionally "
+        "description, location, attendees, time_zone. Use a valid RFC3339 "
+        "offset-aware timestamp with an explicit IANA time_zone for timed "
+        "events. For all-day events use YYYY-MM-DD start/end with exclusive "
+        "end date and set time_zone to null. Ask clarification when details "
+        "or timezone are ambiguous. Never mix Calendar creation with Gmail "
+        "actions. For that intent, "
         "select calendar_tool from list_calendar_events, get_calendar_event, "
         "get_today_schedule, get_calendar_schedule, "
-        "check_calendar_availability, or clarify, and provide only that tool's "
+        "check_calendar_availability, create_calendar_event_proposal, "
+        "or clarify, and provide only that tool's "
         "arguments in calendar_arguments. list_calendar_events accepts "
         "time_min, time_max, query, attendee, time_zone, max_results, and "
         "page_token; attendee must be an explicitly known email address. "
@@ -327,6 +348,17 @@ def _calendar_local_datetime(
     return first
 
 
+def _calendar_create_request(text: str) -> bool:
+    lowered = text.casefold()
+    return bool(re.search(
+        r"\b(?:create|add|book|schedule)\b.{0,60}"
+        r"\b(?:meetings?|events?|calendar)\b|"
+        r"\b(?:meetings?|events?)\b.{0,60}"
+        r"\b(?:create|add|book|schedule)\b",
+        lowered,
+    ))
+
+
 def _deterministic_calendar_plan(
     state: ChatState,
 ) -> tuple[dict[str, Any], str] | None:
@@ -366,6 +398,17 @@ def _deterministic_calendar_plan(
         lowered,
     ))
     if creation_request:
+        calendar_capabilities = (
+            (state.get("assistant_capabilities") or {}).get(
+                "google_calendar",
+                {},
+            )
+        )
+        if (
+            _calendar_create_request(lowered)
+            and calendar_capabilities.get("write_execution_available")
+        ):
+            return None
         return _calendar_plan("clarify")
 
     explicit_availability = bool(re.search(
@@ -694,6 +737,17 @@ def _deterministic_assistant_plan(
     calendar_plan = _deterministic_calendar_plan(state)
     if calendar_plan is not None:
         return calendar_plan
+    calendar_capabilities = (
+        (state.get("assistant_capabilities") or {}).get(
+            "google_calendar",
+            {},
+        )
+    )
+    if (
+        _calendar_create_request(state["user_message"])
+        and calendar_capabilities.get("write_execution_available")
+    ):
+        return None
 
     approval_match = re.search(
         r"\b(approve|reject|execute)\b.{0,60}\b"
@@ -1115,6 +1169,20 @@ def gmail_agent_node(
 ) -> dict[str, Any]:
     plan_data = state.get("gmail_plan") or {}
     intent = plan_data.get("intent", "")
+    if (
+        runtime.context.get("gmail_enabled", True) is False
+        and (
+            intent in SUPPORTED_READ_INTENTS
+            or intent in SUPPORTED_DRAFT_INTENTS
+        )
+    ):
+        return gmail_response_node(
+            state,
+            direct_response=(
+                "Gmail is turned off in Connected Apps. Turn it on there "
+                "to use Gmail; your Google account remains connected."
+            ),
+        )
 
     if intent in SUPPORTED_DRAFT_INTENTS:
         if (

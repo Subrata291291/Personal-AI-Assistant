@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import CurrentUser
+from app.api.deps import CurrentUser, is_integration_enabled
 from app.core.logging import get_logger
 from app.core.request_metrics import request_id
 from app.db.session import get_db
@@ -24,6 +24,10 @@ from app.services.action_approval_service import (
 from app.services.gmail_action_executor import (
     ExecutionStatePersistenceError,
     GmailActionExecutor,
+)
+from app.services.calendar_action_executor import (
+    CalendarActionExecutor,
+    CalendarExecutionStatePersistenceError,
 )
 
 
@@ -59,6 +63,11 @@ async def create_gmail_draft_send_approval(
     ],
     db: Session = Depends(get_db),
 ):
+    if not is_integration_enabled(user, "gmail"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Gmail is turned off in Connected Apps.",
+        )
     user_id = UUID(str(user["id"]))
     approval_id = ActionApprovalService._gmail_draft_proposal_id(
         user_id,
@@ -350,6 +359,18 @@ def create_action_approval(
     user: CurrentUser,
     service: ActionApprovalServiceDependency,
 ):
+    integration = (
+        "gmail"
+        if payload.action_type.startswith("gmail.")
+        else "calendar"
+        if payload.action_type.startswith("calendar.")
+        else None
+    )
+    if integration and not is_integration_enabled(user, integration):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"{integration.title()} is turned off in Connected Apps.",
+        )
     try:
         proposal = service.create_proposal(
             user_id=UUID(str(user["id"])),
@@ -410,6 +431,17 @@ async def get_action_approval(
                 user_id=UUID(str(user["id"])),
                 proposal_id=proposal_id,
             )
+        elif (
+            proposal.action_type == "calendar.create_event"
+            and proposal.status in {"execution_uncertain", "executing"}
+        ):
+            proposal = await CalendarActionExecutor(
+                db=db,
+                approval_service=service,
+            ).reconcile(
+                user_id=UUID(str(user["id"])),
+                proposal_id=proposal_id,
+            )
         return proposal
     except LookupError as exc:
         raise HTTPException(
@@ -417,6 +449,11 @@ async def get_action_approval(
             detail=str(exc),
         ) from exc
     except ExecutionStatePersistenceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except CalendarExecutionStatePersistenceError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
@@ -469,15 +506,46 @@ async def execute_action(
     user: CurrentUser,
     service: ActionApprovalServiceDependency,
 ):
-    executor = GmailActionExecutor(
-        db=service.db,
-        approval_service=service,
-    )
     try:
-        proposal = await executor.execute(
-            user_id=UUID(str(user["id"])),
+        user_id = UUID(str(user["id"]))
+        current = service.get_proposal(
+            user_id=user_id,
             proposal_id=proposal_id,
         )
+        integration = (
+            "gmail"
+            if current.action_type.startswith("gmail.")
+            else "calendar"
+            if current.action_type.startswith("calendar.")
+            else None
+        )
+        if integration and not is_integration_enabled(user, integration):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"{integration.title()} is turned off in Connected Apps."
+                ),
+            )
+        if current.action_type in GmailActionExecutor.SUPPORTED_ACTION_TYPES:
+            proposal = await GmailActionExecutor(
+                db=service.db,
+                approval_service=service,
+            ).execute(
+                user_id=user_id,
+                proposal_id=proposal_id,
+            )
+        elif current.action_type in CalendarActionExecutor.SUPPORTED_ACTION_TYPES:
+            proposal = await CalendarActionExecutor(
+                db=service.db,
+                approval_service=service,
+            ).execute(
+                user_id=user_id,
+                proposal_id=proposal_id,
+            )
+        else:
+            raise PermissionError(
+                "This action type cannot be executed."
+            )
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -502,6 +570,34 @@ async def execute_action(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
+        ) from exc
+    except CalendarExecutionStatePersistenceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except GoogleAPIError as exc:
+        if exc.status_code in {401, 403}:
+            response_status = status.HTTP_403_FORBIDDEN
+            detail = (
+                "The selected Google account is no longer authorized for "
+                "this Calendar."
+            )
+        elif exc.status_code == 404:
+            response_status = status.HTTP_404_NOT_FOUND
+            detail = "The selected Google Calendar is unavailable."
+        elif exc.status_code == 429 or exc.status_code >= 500:
+            response_status = status.HTTP_503_SERVICE_UNAVAILABLE
+            detail = (
+                "Google Calendar is temporarily unavailable. The event "
+                "request was not automatically retried."
+            )
+        else:
+            response_status = status.HTTP_502_BAD_GATEWAY
+            detail = "Google Calendar could not process the request."
+        raise HTTPException(
+            status_code=response_status,
+            detail=detail,
         ) from exc
     except ValueError as exc:
         raise HTTPException(

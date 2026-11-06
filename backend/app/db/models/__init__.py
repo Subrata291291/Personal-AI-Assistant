@@ -6,6 +6,7 @@ from app.db.models.user_connection import UserConnection
 from app.db.models.oauth_credential import OAuthCredential
 from app.db.models.oauth_state import OAuthState
 from app.db.models.memory_review import MemoryReview
+from app.db.models.calendar_action_operation import CalendarActionOperation
 
 __all__ = [
     "Conversation",
@@ -16,4 +17,5 @@ __all__ = [
     "OAuthCredential",
     "OAuthState",
     "MemoryReview",
+    "CalendarActionOperation",
 ]

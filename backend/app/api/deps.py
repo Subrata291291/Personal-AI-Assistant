@@ -59,3 +59,26 @@ CurrentUser = Annotated[
     dict[str, Any],
     Depends(get_current_user),
 ]
+
+
+def is_integration_enabled(
+    user: dict[str, Any],
+    integration: str,
+) -> bool:
+    metadata = user.get("user_metadata")
+    if not isinstance(metadata, dict):
+        return True
+    return metadata.get(f"{integration}_enabled") is not False
+
+
+def require_integration_enabled(integration: str):
+    async def dependency(user: CurrentUser) -> None:
+        if not is_integration_enabled(user, integration):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"{integration.title()} is turned off in Connected Apps."
+                ),
+            )
+
+    return dependency

@@ -50,6 +50,8 @@ def test_connections_endpoint_returns_authoritative_aggregate_capabilities(
         "chat_available": True,
         "google_connection_available": True,
         "permissions_need_consent": False,
+        "write_permission_granted": False,
+        "write_execution_available": False,
         "write_available": False,
     }
     expected_user_id = user_id

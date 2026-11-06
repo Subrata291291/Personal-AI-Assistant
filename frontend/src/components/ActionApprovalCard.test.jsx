@@ -37,9 +37,33 @@ function createProposal(status = 'pending') {
 }
 
 function renderCard(initialStatus = 'pending') {
+  return renderProposalCard(createProposal(initialStatus))
+}
+
+function createCalendarProposal(status = 'pending') {
+  return {
+    proposal_id: 'calendar-proposal-1',
+    action_type: 'calendar.create_event',
+    status,
+    connection_id: 'connection-1',
+    account_email: 'owner@example.com',
+    parameters: {
+      calendar_id: 'primary',
+      summary: 'Design review',
+      start: '2026-06-10T10:00:00-07:00',
+      end: '2026-06-10T11:00:00-07:00',
+      time_zone: 'America/Los_Angeles',
+      all_day: false,
+    },
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    result: null,
+  }
+}
+
+function renderProposalCard(proposal) {
   const message = {
     id: 'approval-message-1',
-    metadata: { action_approval: createProposal(initialStatus) },
+    metadata: { action_approval: proposal },
   }
   const queryClient = new QueryClient({
     defaultOptions: { mutations: { retry: false } },
@@ -114,6 +138,55 @@ describe('ActionApprovalCard Gmail send safety', () => {
       expect(actionApprovalService.getProposal).toHaveBeenCalledWith('proposal-1')
     })
     expect(screen.queryByRole('button', { name: 'Execute Gmail send' }))
+      .not.toBeInTheDocument()
+    expect(actionApprovalService.execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('requires a separate execute action for an approved Calendar event', async () => {
+    actionApprovalService.approve.mockResolvedValue({
+      proposal: createCalendarProposal('approved'),
+    })
+    actionApprovalService.execute.mockResolvedValue({
+      proposal: {
+        ...createCalendarProposal('completed'),
+        result: { outcome: 'created', google_event_id: 'event-1' },
+      },
+    })
+    renderProposalCard(createCalendarProposal())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => {
+      expect(actionApprovalService.approve)
+        .toHaveBeenCalledWith('calendar-proposal-1')
+    })
+    expect(actionApprovalService.execute).not.toHaveBeenCalled()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Create Calendar event',
+    }))
+    await waitFor(() => {
+      expect(actionApprovalService.execute)
+        .toHaveBeenCalledWith('calendar-proposal-1')
+    })
+    expect(await screen.findByText(/Google Calendar confirmed the event/))
+      .toBeInTheDocument()
+  })
+
+  it('reconciles an uncertain Calendar create without offering a retry', async () => {
+    actionApprovalService.execute.mockRejectedValue(
+      new Error('The Calendar event outcome is uncertain.'),
+    )
+    actionApprovalService.getProposal.mockResolvedValue(
+      createCalendarProposal('execution_uncertain'),
+    )
+    renderProposalCard(createCalendarProposal('approved'))
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Create Calendar event',
+    }))
+    expect(await screen.findByRole('button', { name: 'Check event status' }))
+      .toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Create Calendar event' }))
       .not.toBeInTheDocument()
     expect(actionApprovalService.execute).toHaveBeenCalledTimes(1)
   })

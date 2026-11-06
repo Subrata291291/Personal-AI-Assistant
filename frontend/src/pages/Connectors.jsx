@@ -42,8 +42,6 @@ function Connectors() {
   const [searchParams, setSearchParams] = useSearchParams()
 
   const [notice, setNotice] = useState(null)
-  const [isUpdatingCalendarDefault, setIsUpdatingCalendarDefault] =
-    useState(false)
 
   const userId = user?.id
 
@@ -103,6 +101,27 @@ function Connectors() {
     user?.user_metadata?.default_calendar_connection_id
   const isGmailConnected = gmailConnections.length > 0
 
+  const integrationPreferenceMutation = useMutation({
+    mutationFn: ({ preference, enabled }) =>
+      updateUserMetadata({ [preference]: enabled }),
+    onSuccess: (_user, { integration, enabled }) => {
+      setNotice({
+        type: 'success',
+        message: `${integration} turned ${enabled ? 'on' : 'off'}. ${
+          enabled
+            ? 'Its Google account connection was not changed.'
+            : 'Your Google account remains connected.'
+        }`,
+      })
+    },
+    onError: (error) => {
+      setNotice({
+        type: 'error',
+        message: error.message || 'Unable to update integration preference.',
+      })
+    },
+  })
+
   async function clearDisconnectedPreferences(connectionIds) {
     const metadata = {}
     if (connectionIds.includes(
@@ -123,28 +142,13 @@ function Connectors() {
     }
   }
 
-  async function handleDefaultCalendarChange(event) {
-    const connectionId = event.target.value || null
-    setIsUpdatingCalendarDefault(true)
+  function handleIntegrationToggle(integration, enabled) {
     setNotice(null)
-    try {
-      await updateUserMetadata({
-        default_calendar_connection_id: connectionId,
-      })
-      setNotice({
-        type: 'success',
-        message: connectionId
-          ? 'Default Calendar account updated.'
-          : 'Calendar account selection will be automatic when unambiguous.',
-      })
-    } catch (error) {
-      setNotice({
-        type: 'error',
-        message: error.message || 'Unable to update the default Calendar account.',
-      })
-    } finally {
-      setIsUpdatingCalendarDefault(false)
-    }
+    integrationPreferenceMutation.mutate({
+      integration,
+      enabled,
+      preference: `${integration}_enabled`,
+    })
   }
 
   // Connect Google account
@@ -376,6 +380,7 @@ function Connectors() {
               description: 'Connect your account to access Gmail in your workspace.',
               available: true,
               connected: isGmailConnected,
+              enabled: user?.user_metadata?.gmail_enabled !== false,
             },
             {
               id: 'calendar',
@@ -384,6 +389,7 @@ function Connectors() {
               available: true,
               connected: isCalendarApiComplete,
               partial: calendarNeedsConsent,
+              enabled: user?.user_metadata?.calendar_enabled !== false,
             },
             {
               id: 'drive',
@@ -391,6 +397,7 @@ function Connectors() {
               description: 'Access and organize your files.',
               available: false,
               connected: false,
+              enabled: false,
             },
             {
               id: 'contacts',
@@ -398,6 +405,7 @@ function Connectors() {
               description: 'Access and manage your contacts.',
               available: false,
               connected: false,
+              enabled: false,
             },
           ].map((service) => {
             const isConnected = service.connected
@@ -406,6 +414,7 @@ function Connectors() {
               || connectionsQuery.isError
               || connectMutation.isPending
               || disconnectMutation.isPending
+              || integrationPreferenceMutation.isPending
 
             return (
               <article
@@ -467,22 +476,75 @@ function Connectors() {
                         </p>
                       )}
 
-                      <button
-                        type="button"
-                        onClick={() => handleConnect(service.id)}
-                        disabled={toggleDisabled || isConnected}
-                        className={`mt-3 rounded-lg border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                          isDark
-                            ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
-                            : 'border-slate-200 text-slate-600 hover:bg-slate-50'
-                        }`}
-                      >
-                        {isConnected
-                          ? `${service.name} connected`
-                          : service.partial
-                            ? 'Grant missing Calendar permissions'
-                            : `Connect ${service.name}`}
-                      </button>
+                      <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                        {!isConnected && (
+                          <button
+                            type="button"
+                            onClick={() => handleConnect(service.id)}
+                            disabled={toggleDisabled}
+                            className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                              isDark
+                                ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                                : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                            }`}
+                          >
+                            {service.partial
+                              ? 'Grant missing Calendar permissions'
+                              : `Connect ${service.name}`}
+                          </button>
+                        )}
+                        <div className="flex shrink-0 items-center gap-3">
+                          <span
+                            aria-live="polite"
+                            className={`min-w-8 text-right text-xs font-bold tracking-wide ${
+                              service.enabled
+                                ? 'text-violet-500'
+                                : isDark
+                                  ? 'text-slate-400'
+                                  : 'text-slate-500'
+                            }`}
+                          >
+                            {service.enabled ? 'ON' : 'OFF'}
+                          </span>
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-label={`Enable ${service.name}`}
+                            aria-checked={service.enabled}
+                            aria-busy={integrationPreferenceMutation.isPending}
+                            title={`${service.name} ${service.enabled ? 'ON' : 'OFF'}`}
+                            disabled={toggleDisabled}
+                            onClick={() => handleIntegrationToggle(
+                              service.id,
+                              !service.enabled,
+                            )}
+                            className={`group relative inline-flex h-7 w-[3.25rem] shrink-0 cursor-pointer items-center rounded-full p-1 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-60 ${
+                              isDark
+                                ? 'focus-visible:ring-offset-slate-900'
+                                : 'focus-visible:ring-offset-white'
+                            } ${
+                              service.enabled
+                                ? 'bg-gradient-to-r from-violet-600 to-indigo-600 shadow-sm shadow-violet-500/25'
+                                : isDark
+                                  ? 'bg-slate-700 hover:bg-slate-600'
+                                  : 'bg-slate-300 hover:bg-slate-400'
+                            }`}
+                          >
+                            <span
+                              aria-hidden="true"
+                              className={`h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                                integrationPreferenceMutation.isPending
+                                  ? 'animate-pulse'
+                                  : ''
+                              } ${
+                                service.enabled
+                                  ? 'translate-x-5'
+                                  : 'translate-x-0'
+                              }`}
+                            />
+                          </button>
+                        </div>
+                      </div>
                     </>
                   ) : (
                     <div className="flex items-center justify-between">
@@ -551,46 +613,6 @@ function Connectors() {
                 </button>
               </article>
             ))}
-          </div>
-          <div className={`mt-5 rounded-xl border p-4 ${colors.service}`}>
-            <label
-              htmlFor="default-calendar-account"
-              className={`block text-sm font-medium ${colors.heading}`}
-            >
-              Default Calendar account
-            </label>
-            <p className={`mt-1 text-xs ${colors.muted}`}>
-              Calendar reads and availability checks use this account when
-              selected. If you leave it unset, an account is chosen only when
-              the requested permission is unambiguous. Missing permissions on
-              your selected account will not fall back to another account.
-            </p>
-            <select
-              id="default-calendar-account"
-              value={configuredDefaultConnectionId || ''}
-              onChange={handleDefaultCalendarChange}
-              disabled={isUpdatingCalendarDefault}
-              className={`mt-3 w-full rounded-lg border px-3 py-2 text-sm ${
-                isDark
-                  ? 'border-slate-700 bg-[#11131c] text-slate-200'
-                  : 'border-slate-200 bg-white text-slate-700'
-              }`}
-            >
-              <option value="">
-                Automatically select when unambiguous
-              </option>
-              {connectedGoogleConnections.map((connection) => (
-                <option key={connection.id} value={connection.id}>
-                  {connection.email || 'Google account'}
-                  {connection.capabilities?.calendar_events_read
-                    ? ' — event access'
-                    : ''}
-                  {connection.capabilities?.calendar_freebusy
-                    ? ' — free/busy access'
-                    : ''}
-                </option>
-              ))}
-            </select>
           </div>
           <p className={`mt-3 text-xs ${colors.muted}`}>
             Disconnect removes the shared credentials from this app, so all enabled Google services for that account stop working. It does not revoke the app’s authorization in Google Account settings.

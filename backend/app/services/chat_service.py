@@ -4,7 +4,7 @@ import json
 import re
 from threading import Event, Thread
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 from app.core.error_logging import log_exception_traceback
 from app.memory.memory_pipeline import MemoryPipeline
@@ -20,6 +20,8 @@ from app.services.user_connection_service import UserConnectionService
 from app.workflows.chat_graph import ASSISTANT_ROUTE_NODES, chat_graph
 from app.workflows.gmail_agent_nodes import build_runtime_capabilities
 from app.services import message_service
+from app.schemas.action_approval import ApprovalProposalCreate
+from app.services.action_approval_service import ActionApprovalService
 
 
 class ChatRequestInProgressError(Exception):
@@ -65,6 +67,8 @@ class ChatService:
         gmail_connection_id: UUID | None = None,
         user_timezone: str = "UTC",
         default_calendar_connection_id: str | None = None,
+        gmail_enabled: bool = True,
+        calendar_enabled: bool = True,
     ) -> str:
         """Generate a deterministic SHA-256 fingerprint."""
 
@@ -80,6 +84,10 @@ class ChatService:
             payload["default_calendar_connection_id"] = (
                 str(default_calendar_connection_id)
             )
+        if not gmail_enabled:
+            payload["gmail_enabled"] = False
+        if not calendar_enabled:
+            payload["calendar_enabled"] = False
 
         canonical_payload = json.dumps(
             payload,
@@ -369,6 +377,8 @@ class ChatService:
         gmail_connection_id: UUID | None = None,
         user_timezone: str = "UTC",
         default_calendar_connection_id: str | None = None,
+        gmail_enabled: bool = True,
+        calendar_enabled: bool = True,
     ) -> dict[str, Any]:
         """Process an idempotent chat request using LangGraph."""
 
@@ -395,6 +405,8 @@ class ChatService:
             gmail_connection_id=gmail_connection_id,
             user_timezone=user_timezone,
             default_calendar_connection_id=default_calendar_connection_id,
+            gmail_enabled=gmail_enabled,
+            calendar_enabled=calendar_enabled,
         )
 
         # 3. Create or retrieve the idempotent request.
@@ -534,16 +546,20 @@ class ChatService:
                 conversation_id=conversation_id,
                 limit=100,
             )
+            effective_gmail_connection_id = (
+                gmail_connection_id if gmail_enabled else None
+            )
             available_gmail_sources = self._available_gmail_sources(
                 history,
-                gmail_connection_id,
+                effective_gmail_connection_id,
             )
             granted_gmail_scopes = (
                 self.user_connection_service.get_granted_google_scopes(
                     user_id=user_id,
-                    connection_id=gmail_connection_id,
+                    connection_id=effective_gmail_connection_id,
                 )
                 if self.user_connection_service and gmail_connection_id
+                and gmail_enabled
                 else None
             )
             calendar_access = (
@@ -566,25 +582,43 @@ class ChatService:
                     "selected_freebusy_scope_missing": False,
                 }
             )
+            event_read_connection_id = (
+                calendar_access["event_read_connection_id"]
+                if calendar_enabled
+                else None
+            )
+            freebusy_connection_id = (
+                calendar_access["freebusy_connection_id"]
+                if calendar_enabled
+                else None
+            )
+            write_connection_id = (
+                calendar_access.get("write_connection_id")
+                if calendar_enabled
+                else None
+            )
             calendar_capabilities = {
                 **calendar_access["capabilities"],
                 "events_read": bool(
-                    calendar_access["event_read_connection_id"]
+                    event_read_connection_id
                 ),
                 "freebusy": bool(
-                    calendar_access["freebusy_connection_id"]
+                    freebusy_connection_id
                 ),
                 "api_available": bool(
-                    calendar_access["event_read_connection_id"]
-                    or calendar_access["freebusy_connection_id"]
+                    event_read_connection_id
+                    or freebusy_connection_id
                 ),
                 "api_complete": bool(
-                    calendar_access["event_read_connection_id"]
-                    and calendar_access["freebusy_connection_id"]
+                    event_read_connection_id
+                    and freebusy_connection_id
                 ),
                 "selection_required": bool(
-                    calendar_access["event_selection_required"]
-                    or calendar_access["freebusy_selection_required"]
+                    calendar_enabled
+                    and (
+                        calendar_access["event_selection_required"]
+                        or calendar_access["freebusy_selection_required"]
+                    )
                 ),
                 "default_connection_invalid": bool(
                     calendar_access["default_connection_invalid"]
@@ -600,6 +634,14 @@ class ChatService:
                 ),
                 "google_connection_available": (
                     calendar_access["google_connection_available"]
+                ),
+                "write_permission_granted": bool(
+                    write_connection_id
+                ),
+                "write_execution_available": bool(
+                    calendar_enabled
+                    and
+                    calendar_access.get("calendar_write_execution_available")
                 ),
             }
             assistant_capabilities = build_runtime_capabilities(
@@ -680,17 +722,25 @@ class ChatService:
                     context={
                         "user_id": str(user_id),
                         "gmail_connection_id": (
-                            str(gmail_connection_id)
+                            str(effective_gmail_connection_id)
                             if granted_gmail_scopes is not None
                             else None
                         ),
+                        "gmail_enabled": gmail_enabled,
                         "user_timezone": user_timezone,
                         "calendar_event_connection_id": (
-                            calendar_access["event_read_connection_id"]
+                            event_read_connection_id
+                        ),
+                        "calendar_write_connection_id": (
+                            write_connection_id
+                        ),
+                        "calendar_write_connection_email": (
+                            calendar_access.get("write_connection_email")
                         ),
                         "calendar_freebusy_connection_id": (
-                            calendar_access["freebusy_connection_id"]
+                            freebusy_connection_id
                         ),
+                        "calendar_enabled": calendar_enabled,
                         "google_connection_available": (
                             calendar_access["google_connection_available"]
                         ),
@@ -711,6 +761,18 @@ class ChatService:
                         ),
                         "calendar_selected_event_scope_missing": (
                             calendar_access["selected_event_scope_missing"]
+                        ),
+                        "calendar_write_selection_required": (
+                            calendar_access.get(
+                                "calendar_write_selection_required",
+                                False,
+                            )
+                        ),
+                        "calendar_selected_write_scope_missing": (
+                            calendar_access.get(
+                                "calendar_selected_write_scope_missing",
+                                False,
+                            )
                         ),
                         "calendar_selected_freebusy_scope_missing": (
                             calendar_access["selected_freebusy_scope_missing"]
@@ -811,6 +873,91 @@ class ChatService:
 
                     if assistant_message is None:
                         raise
+
+            calendar_parameters = result.get(
+                "calendar_create_event_proposal"
+            )
+            if calendar_parameters is not None:
+                try:
+                    write_connection_id = calendar_access.get(
+                        "write_connection_id"
+                    )
+                    if (
+                        not isinstance(calendar_parameters, dict)
+                        or not write_connection_id
+                        or self.user_connection_service is None
+                    ):
+                        raise RuntimeError(
+                            "Calendar proposal context is unavailable."
+                        )
+                    source_message_id = UUID(str(assistant_message["id"]))
+                    stable_proposal_id = uuid5(
+                        NAMESPACE_URL,
+                        f"calendar-create-proposal:{user_id}:{request_id}",
+                    )
+                    proposal = ActionApprovalService(
+                        self.user_connection_service.db
+                    ).create_proposal(
+                        user_id=user_id,
+                        proposal_id=stable_proposal_id,
+                        payload=ApprovalProposalCreate.model_validate({
+                            "conversation_id": conversation_id,
+                            "source_message_id": source_message_id,
+                            "connection_id": UUID(str(write_connection_id)),
+                            "action_type": "calendar.create_event",
+                            "parameters": calendar_parameters,
+                        }),
+                    )
+                    assistant_metadata = dict(
+                        assistant_message.get("metadata") or {}
+                    )
+                    assistant_metadata["action_approval"] = (
+                        proposal.model_dump(mode="json")
+                    )
+                    assistant_message = {
+                        **assistant_message,
+                        "metadata": assistant_metadata,
+                    }
+                except Exception as exc:
+                    logger.exception(
+                        "Calendar approval proposal could not be persisted "
+                        "| conversation_id=%s | request_id=%s",
+                        conversation_id,
+                        request_id,
+                    )
+                    assistant_content = (
+                        "I couldn’t securely save the Calendar approval "
+                        "request. No event was created. Please check the "
+                        "connection and try again."
+                    )
+                    try:
+                        updated_message = (
+                            self.message_service.update_request_message_content(
+                                user_id=user_id,
+                                conversation_id=conversation_id,
+                                chat_request_id=request_id,
+                                message_id=UUID(str(assistant_message["id"])),
+                                content=assistant_content,
+                            )
+                        )
+                        if updated_message is not None:
+                            assistant_message = updated_message
+                        else:
+                            assistant_message = {
+                                **assistant_message,
+                                "content": assistant_content,
+                            }
+                    except Exception:
+                        logger.exception(
+                            "Calendar proposal failure notice could not be "
+                            "persisted | request_id=%s | error_type=%s",
+                            request_id,
+                            type(exc).__name__,
+                        )
+                        assistant_message = {
+                            **assistant_message,
+                            "content": assistant_content,
+                        }
 
             # 15. Complete request using worker fencing.
             completed = self.request_repository.update_status(

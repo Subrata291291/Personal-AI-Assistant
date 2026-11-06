@@ -35,3 +35,23 @@ class GoogleOAuthTransientError(GoogleAPIError):
             message="Google authentication is temporarily unavailable.",
             retryable=True,
         )
+
+
+class GoogleAPIMutationError(GoogleAPIError):
+    """A mutation request failed, with explicit execution-outcome knowledge."""
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        outcome_unknown: bool,
+        reason: str | None = None,
+    ) -> None:
+        self.outcome_unknown = outcome_unknown
+        super().__init__(
+            status_code=status_code,
+            message=message,
+            retryable=False,
+            reason=reason,
+        )

@@ -51,6 +51,8 @@ def test_list_connections_reports_service_capabilities_from_granted_scopes():
         "calendar_api_available": False,
         "calendar_api_complete": False,
         "calendar_chat_available": False,
+        "calendar_write_permission_granted": False,
+        "calendar_write_execution_available": False,
         "calendar_write_available": False,
     }
     assert connections[1]["capabilities"] == {
@@ -63,6 +65,8 @@ def test_list_connections_reports_service_capabilities_from_granted_scopes():
         "calendar_api_available": True,
         "calendar_api_complete": False,
         "calendar_chat_available": True,
+        "calendar_write_permission_granted": True,
+        "calendar_write_execution_available": False,
         "calendar_write_available": False,
     }
     assert credentials.get_by_connection.call_args_list[0].kwargs == {
@@ -101,6 +105,8 @@ def test_list_connections_does_not_report_non_google_as_gmail():
         "calendar_api_available": False,
         "calendar_api_complete": False,
         "calendar_chat_available": False,
+        "calendar_write_permission_granted": False,
+        "calendar_write_execution_available": False,
         "calendar_write_available": False,
     }
     credentials.get_by_connection.assert_not_called()
@@ -145,6 +151,8 @@ def test_list_connections_reports_both_services_only_when_both_scopes_are_grante
         "calendar_api_available": True,
         "calendar_api_complete": True,
         "calendar_chat_available": True,
+        "calendar_write_permission_granted": False,
+        "calendar_write_execution_available": False,
         "calendar_write_available": False,
     }
     credentials.get_by_connection.assert_called_once_with(
@@ -182,6 +190,8 @@ def test_legacy_calendar_events_grant_is_partial_and_requests_new_consent():
     assert reported["calendar_api_available"] is True
     assert reported["calendar_api_complete"] is False
     assert reported["calendar_chat_available"] is True
+    assert reported["calendar_write_permission_granted"] is True
+    assert reported["calendar_write_execution_available"] is False
     assert reported["calendar_write_available"] is False
 
 
@@ -233,6 +243,8 @@ def test_user_calendar_capabilities_aggregate_only_owned_connections():
         "chat_available": True,
         "google_connection_available": True,
         "permissions_need_consent": False,
+        "write_permission_granted": False,
+        "write_execution_available": False,
         "write_available": False,
     }
     service.list_connections.assert_called_once_with(user_id=user_id)
@@ -413,6 +425,8 @@ def test_aggregate_calendar_capabilities_combine_independent_owned_grants():
         "chat_available": True,
         "google_connection_available": True,
         "permissions_need_consent": False,
+        "write_permission_granted": False,
+        "write_execution_available": False,
         "write_available": False,
     }
 

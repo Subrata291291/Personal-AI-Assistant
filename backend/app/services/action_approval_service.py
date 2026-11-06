@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.repositories.action_approval_repository import (
     ActionApprovalRepository,
+    CalendarActionOperationRepository,
 )
 from app.repositories.oauth_credential_repository import (
     OAuthCredentialRepository,
@@ -16,6 +17,12 @@ from app.schemas.action_approval import (
     ActionApprovalProposal,
     ApprovalProposalCreate,
     validate_safe_result,
+)
+from app.schemas.calendar_approval import CalendarCreateEventParameters
+from app.services.calendar_action_identity import (
+    CalendarOperationConflictError,
+    build_calendar_operation_identity,
+    verify_calendar_proposal_integrity,
 )
 
 
@@ -66,6 +73,9 @@ class ActionApprovalService:
     ):
         self.db = db
         self.repository = repository or ActionApprovalRepository()
+        self.calendar_operation_repository = CalendarActionOperationRepository(
+            database_engine=self.repository.engine,
+        )
         self.connection_repository = UserConnectionRepository(db)
         self.credential_repository = OAuthCredentialRepository(db)
 
@@ -101,14 +111,50 @@ class ActionApprovalService:
         self,
         user_id: UUID,
         payload: ApprovalProposalCreate,
+        proposal_id: UUID | None = None,
     ) -> ActionApprovalProposal:
+        if payload.action_type.startswith("calendar.") and (
+            payload.action_type != "calendar.create_event"
+        ):
+            raise PermissionError(
+                "Only Calendar event creation proposals are available."
+            )
+        if payload.action_type == "calendar.create_event":
+            parameters = CalendarCreateEventParameters.model_validate(
+                payload.parameters
+            )
+            payload.parameters = parameters.model_dump(mode="json")
         connection = self._validate_connection(
             user_id=user_id,
             connection_id=payload.connection_id,
             action_type=payload.action_type,
         )
+        proposal_id = proposal_id or uuid4()
+        calendar_operation = None
+        if payload.action_type.startswith("calendar."):
+            identity = build_calendar_operation_identity(
+                proposal_id=proposal_id,
+                user_id=user_id,
+                connection_id=payload.connection_id,
+                action_type=payload.action_type,
+                parameters=payload.parameters,
+            )
+            calendar_operation = {
+                "proposal_id": str(identity.proposal_id),
+                "operation_id": str(identity.operation_id),
+                "user_id": str(identity.user_id),
+                "connection_id": str(identity.connection_id),
+                "idempotency_key": None,
+                "payload_fingerprint": identity.payload_fingerprint,
+                "action_type": identity.action_type,
+                "calendar_id": identity.calendar_id,
+                "event_id": identity.event_id,
+                "integrity_schema_version": (
+                    identity.integrity_schema_version
+                ),
+            }
         row = self.repository.create_proposal(
-            proposal_id=uuid4(),
+            proposal_id=proposal_id,
             user_id=user_id,
             conversation_id=payload.conversation_id,
             source_message_id=payload.source_message_id,
@@ -117,6 +163,7 @@ class ActionApprovalService:
             connection_id=payload.connection_id,
             account_email=connection.email,
             expiration_minutes=self.PROPOSAL_TTL_MINUTES,
+            calendar_operation=calendar_operation,
         )
         if row is None:
             raise LookupError(
@@ -243,7 +290,52 @@ class ActionApprovalService:
         row = self.repository.get_proposal(user_id, proposal_id)
         if row is None:
             raise LookupError("Approval proposal was not found.")
-        return ActionApprovalProposal.model_validate(row)
+        proposal = ActionApprovalProposal.model_validate(row)
+        if proposal.action_type.startswith("calendar."):
+            self._verify_calendar_operation(proposal, user_id)
+        return proposal
+
+    def _verify_calendar_operation(
+        self,
+        proposal: ActionApprovalProposal,
+        user_id: UUID,
+    ) -> None:
+        try:
+            identity = verify_calendar_proposal_integrity(
+                proposal,
+                user_id,
+            )
+            operation = self.calendar_operation_repository.get_for_user(
+                user_id,
+                proposal.proposal_id,
+            )
+            matches = (
+                operation is not None
+                and UUID(str(operation["operation_id"]))
+                == identity.operation_id
+                and UUID(str(operation["user_id"])) == user_id
+                and UUID(str(operation["connection_id"]))
+                == identity.connection_id
+                and operation["action_type"] == identity.action_type
+                and operation["calendar_id"] == identity.calendar_id
+                and operation["event_id"] == identity.event_id
+                and operation["payload_fingerprint"]
+                == identity.payload_fingerprint
+                and operation["execution_state"] == proposal.status
+            )
+        except (
+            CalendarOperationConflictError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ApprovalConflictError(
+                "Calendar approval integrity verification failed."
+            ) from exc
+        if not matches:
+            raise ApprovalConflictError(
+                "Calendar approval integrity verification failed."
+            )
 
     def approve(
         self,
@@ -298,6 +390,72 @@ class ActionApprovalService:
         raise ApprovalConflictError(
             "This proposal changed while it was being rejected."
         )
+
+    def claim_calendar_execution(
+        self,
+        user_id: UUID,
+        proposal_id: UUID,
+    ) -> ActionApprovalProposal:
+        proposal = self.get_proposal(user_id, proposal_id)
+        if proposal.action_type != "calendar.create_event":
+            raise PermissionError(
+                "Only Calendar event creation can be executed."
+            )
+        if proposal.status != "approved":
+            raise ApprovalConflictError(
+                "Only an approved Calendar proposal can be executed."
+            )
+        self._validate_connection(
+            user_id=user_id,
+            connection_id=proposal.connection_id,
+            action_type=proposal.action_type,
+        )
+        try:
+            claimed = self.calendar_operation_repository.claim_execution(
+                user_id=user_id,
+                proposal_id=proposal_id,
+            )
+        except CalendarOperationConflictError as exc:
+            raise ApprovalConflictError(
+                "Calendar approval integrity verification failed."
+            ) from exc
+        if claimed is None:
+            current = self.get_proposal(user_id, proposal_id)
+            if current.status == "expired":
+                raise ApprovalExpiredError(
+                    "This approval proposal has expired."
+                )
+            raise ApprovalConflictError(
+                "This proposal is already being executed or was resolved."
+            )
+        return ActionApprovalProposal.model_validate(claimed)
+
+    def finish_calendar_execution(
+        self,
+        user_id: UUID,
+        proposal_id: UUID,
+        *,
+        expected_state: str,
+        state: str,
+        provider_result_classification: str,
+        reconciliation_status: str,
+        safe_result: dict[str, Any],
+    ) -> ActionApprovalProposal:
+        result = validate_safe_result(safe_result)
+        transitioned = self.calendar_operation_repository.finish_execution(
+            user_id=user_id,
+            proposal_id=proposal_id,
+            expected_state=expected_state,
+            new_state=state,
+            provider_result_classification=provider_result_classification,
+            reconciliation_status=reconciliation_status,
+            safe_result=result,
+        )
+        if transitioned is None:
+            raise ApprovalConflictError(
+                "The Calendar proposal is not in the expected execution state."
+            )
+        return ActionApprovalProposal.model_validate(transitioned)
 
     def claim_execution(
         self,

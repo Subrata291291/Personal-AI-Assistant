@@ -58,7 +58,7 @@ def _frontend_connector_url(status_value: str) -> str:
 def connect_google(
     current_user: CurrentUser,
     db: Session = Depends(get_db),
-    service: Literal["gmail", "calendar"] = "gmail",
+    service: Literal["gmail", "calendar", "calendar_write"] = "gmail",
 ):
     """
     Start Google OAuth authorization for an authenticated user.

@@ -11,7 +11,7 @@ from fastapi import (
 )
 from sqlalchemy.orm import Session
 
-from app.api.deps import CurrentUser
+from app.api.deps import CurrentUser, require_integration_enabled
 from app.db.session import get_db
 from app.integrations.google.exceptions import GoogleAPIError
 from app.schemas.gmail import (
@@ -26,7 +26,9 @@ from app.schemas.gmail import (
 from app.services.gmail_service import GmailService
 
 
-router = APIRouter()
+router = APIRouter(
+    dependencies=[Depends(require_integration_enabled("gmail"))],
+)
 
 
 SUPPORTED_GMAIL_FOLDERS = {

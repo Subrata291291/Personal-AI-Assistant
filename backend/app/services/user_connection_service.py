@@ -3,6 +3,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.integrations.google import scopes as google_scopes
+from app.core.config import settings
 from app.repositories.oauth_credential_repository import (
     OAuthCredentialRepository,
 )
@@ -22,6 +23,7 @@ class UserConnectionService:
         "https://www.googleapis.com/auth/gmail.readonly"
     )
     CALENDAR_EVENTS_READ_SCOPE = google_scopes.CALENDAR_EVENTS_READ_SCOPE
+    CALENDAR_EVENTS_WRITE_SCOPE = google_scopes.CALENDAR_EVENTS_WRITE_SCOPE
     CALENDAR_FREEBUSY_SCOPE = google_scopes.CALENDAR_FREEBUSY_SCOPE
     CALENDAR_EVENT_READ_SCOPES = google_scopes.CALENDAR_EVENT_READ_SCOPES
     CALENDAR_FREEBUSY_SCOPES = google_scopes.CALENDAR_FREEBUSY_SCOPES
@@ -156,6 +158,10 @@ class UserConnectionService:
                     "calendar_api_available": calendar_api_available,
                     "calendar_api_complete": calendar_api_complete,
                     "calendar_chat_available": calendar_api_available,
+                    "calendar_write_permission_granted": (
+                        self.CALENDAR_EVENTS_WRITE_SCOPE in granted_scopes
+                    ),
+                    "calendar_write_execution_available": False,
                     "calendar_write_available": False,
                 },
             })
@@ -193,6 +199,10 @@ class UserConnectionService:
             item["calendar_freebusy"] for item in capabilities
         )
         connected = any(item["calendar"] for item in capabilities)
+        write_permission_granted = any(
+            item.get("calendar_write_permission_granted", False)
+            for item in capabilities
+        )
         return {
             "connected": connected,
             "events_read": events_read,
@@ -203,6 +213,8 @@ class UserConnectionService:
             "google_connection_available": bool(google_connections),
             "permissions_need_consent": bool(google_connections)
             and not (events_read and freebusy),
+            "write_permission_granted": write_permission_granted,
+            "write_execution_available": False,
             "write_available": False,
         }
 
@@ -230,6 +242,14 @@ class UserConnectionService:
             connection
             for connection in connections
             if connection["capabilities"]["calendar_freebusy"]
+        ]
+        write_candidates = [
+            connection
+            for connection in connections
+            if connection["capabilities"].get(
+                "calendar_write_permission_granted",
+                False,
+            )
         ]
 
         selected_connection = None
@@ -274,6 +294,20 @@ class UserConnectionService:
                 else None
             )
 
+        write_connection = (
+            selected_connection
+            if selected_connection
+            and selected_connection["capabilities"].get(
+                "calendar_write_permission_granted",
+                False,
+            )
+            else (
+                write_candidates[0]
+                if not default_connection_id and len(write_candidates) == 1
+                else None
+            )
+        )
+
         capabilities = {
             "connected": any(
                 item["calendar"] for item in connection_capabilities
@@ -294,6 +328,14 @@ class UserConnectionService:
                 any(item["calendar_events_read"] for item in connection_capabilities)
                 and any(item["calendar_freebusy"] for item in connection_capabilities)
             ),
+            "write_permission_granted": any(
+                item["capabilities"].get(
+                    "calendar_write_permission_granted",
+                    False,
+                )
+                for item in connections
+            ),
+            "write_execution_available": False,
         }
         return {
             "google_connection_available": bool(connections),
@@ -332,6 +374,29 @@ class UserConnectionService:
                 and not selected_connection["capabilities"]["calendar_freebusy"]
             ),
             "calendar_write_available": False,
+            "calendar_write_permission_granted": (
+                bool(write_connection)
+            ),
+            "calendar_write_execution_available": (
+                bool(write_connection)
+                and settings.CALENDAR_CREATE_EVENT_ENABLED
+            ),
+            "calendar_write_selection_required": (
+                not default_connection_id and len(write_candidates) > 1
+            ),
+            "calendar_selected_write_scope_missing": (
+                bool(selected_connection)
+                and not selected_connection["capabilities"].get(
+                    "calendar_write_permission_granted",
+                    False,
+                )
+            ),
+            "write_connection_id": (
+                str(write_connection["id"]) if write_connection else None
+            ),
+            "write_connection_email": (
+                write_connection["email"] if write_connection else None
+            ),
         }
 
     def get_granted_google_scopes(
