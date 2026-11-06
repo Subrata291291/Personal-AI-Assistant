@@ -158,6 +158,7 @@ class OAuthStateService:
             stored_provider = oauth_state.provider
             stored_redirect_uri = oauth_state.redirect_uri
             consumed_at = oauth_state.consumed_at
+            stored_state_hash = oauth_state.state_hash
 
             # Commit before decryption to prevent state replay.
             self.db.commit()
@@ -174,8 +175,36 @@ class OAuthStateService:
             "code_verifier": code_verifier,
             "redirect_uri": stored_redirect_uri,
             "consumed_at": consumed_at,
+            "state_hash": stored_state_hash,
         }
-    
+
+    def lock_consumed_state_for_callback(
+        self,
+        user_id: UUID,
+        provider: str,
+        state: str,
+    ) -> bool:
+        """Lock a consumed state while the callback creates its connection."""
+        if not state or not state.strip():
+            return False
+        oauth_state = self.repository.get_consumed_state_for_update(
+            user_id=user_id,
+            provider=provider,
+            state_hash=self._hash_state(state),
+        )
+        return oauth_state is not None
+
+    def invalidate_user_states(
+        self,
+        user_id: UUID,
+        provider: str,
+    ) -> int:
+        """Invalidate outstanding and consumed OAuth flows for an account."""
+        return self.repository.delete_by_user_provider(
+            user_id=user_id,
+            provider=provider,
+        )
+
 
     def delete_expired_states(self) -> int:
         """Delete expired OAuth states."""

@@ -639,6 +639,9 @@ def test_google_api_client_retries_once_after_token_refresh(monkeypatch):
             return "fresh-token" if rejected_access_token else "old-token"
 
     class FakeDB:
+        def scalar(self, _statement):
+            return object()
+
         def commit(self):
             pass
 

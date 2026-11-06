@@ -1,5 +1,5 @@
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   useInfiniteQuery,
@@ -7,7 +7,7 @@ import {
   useMutation,
   useQueryClient,
 } from '@tanstack/react-query'
-import { useOutletContext } from 'react-router-dom'
+import { Link, useOutletContext } from 'react-router-dom'
 
 import { api } from '../lib/api.js'
 import { formatRequestError } from '../lib/errorMessage.js'
@@ -127,6 +127,7 @@ export default function Gmail() {
   const { user } = useAuth()
 
   const userId = user?.id
+  const isGmailEnabled = user?.user_metadata?.gmail_enabled !== false
 
   const [connectionId, setConnectionId] = useState('')
   const [activeFolder, setActiveFolder] = useState('inbox')
@@ -233,11 +234,11 @@ export default function Gmail() {
 
     enabled: Boolean(userId),
 
-    staleTime: CACHE_TIME,
+    staleTime: 0,
     gcTime: GC_TIME,
 
-    refetchOnMount: true,
-    refetchOnWindowFocus: true,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: 'always',
   })
 
   const connections =
@@ -259,6 +260,13 @@ export default function Gmail() {
         (item) => item.id === connectionId,
       ),
     [googleConnections, connectionId],
+  )
+  const connectionsVerified =
+    connectionsQuery.isSuccess &&
+    !connectionsQuery.isFetching &&
+    !connectionsQuery.isError
+  const canUseGmail = Boolean(
+    connectionsVerified && selectedConnection && isGmailEnabled,
   )
 
   const sendEmailMutation = useMutation({
@@ -759,26 +767,120 @@ export default function Gmail() {
     },
   })
 
-  // Restore selected account after navigating between tabs.
+  const clearWorkspaceData = useCallback((targetConnectionId) => {
+    if (userId && targetConnectionId) {
+      queryClient.removeQueries({
+        queryKey: ['gmail-messages', userId, targetConnectionId],
+      })
+      queryClient.removeQueries({
+        queryKey: ['gmail-message', userId, targetConnectionId],
+      })
+
+      const approvalPrefix =
+        `gmail-draft-send-approval:${userId}:${targetConnectionId}:`
+      for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+        const key = sessionStorage.key(index)
+        if (key?.startsWith(approvalPrefix)) {
+          sessionStorage.removeItem(key)
+        }
+      }
+    }
+
+    setSelectedMessageId(null)
+    setShowCompose(false)
+    setComposeData({
+      to: '',
+      cc: '',
+      bcc: '',
+      subject: '',
+      body: '',
+    })
+    setComposeError('')
+    setComposeSuccess('')
+    setAttachmentDownloadError('')
+    setDownloadingAttachmentId(null)
+    setDraftReviewOpen(false)
+    setDraftReviewStep('edit')
+    setDraftReviewData({
+      to: '',
+      cc: '',
+      bcc: '',
+      subject: '',
+      body: '',
+    })
+    setDraftReviewError('')
+    setDraftSendApproval(null)
+    setDraftApprovalStatusUncertain(false)
+    setCheckingDraftApprovalStatus(false)
+    setTrashNotice(null)
+    setMessageActionConfirmation(null)
+    setSearchInput('')
+    setSearchQuery('')
+  }, [queryClient, userId])
+
+  // Restore the selection only after the backend has confirmed account status.
   useEffect(() => {
-    if (!userId || googleConnections.length === 0) return
+    if (
+      !userId ||
+      connectionsQuery.isLoading ||
+      connectionsQuery.isFetching ||
+      connectionsQuery.isError
+    ) return
 
     const storageKey = `gmail-selected-account-${userId}`
-
     const savedConnectionId = sessionStorage.getItem(storageKey)
-
-    const savedConnectionExists = googleConnections.some(
+    const savedConnectionExists = Boolean(savedConnectionId) &&
+      googleConnections.some(
       (item) => item.id === savedConnectionId,
     )
 
-    const nextConnectionId = savedConnectionExists
-      ? savedConnectionId
-      : googleConnections[0].id
+    if (savedConnectionId && !savedConnectionExists) {
+      sessionStorage.removeItem(storageKey)
+      setConnectionId('')
+      clearWorkspaceData(savedConnectionId)
+      return
+    }
 
+    if (googleConnections.length === 0) {
+      sessionStorage.removeItem(storageKey)
+      if (connectionId) clearWorkspaceData(connectionId)
+      setConnectionId('')
+      return
+    }
+
+    if (connectionId) {
+      const currentConnectionExists = googleConnections.some(
+        (item) => item.id === connectionId,
+      )
+      if (currentConnectionExists) return
+      clearWorkspaceData(connectionId)
+      setConnectionId('')
+      return
+    }
+
+    if (savedConnectionExists) {
+      setConnectionId(savedConnectionId)
+      return
+    }
+
+    const nextConnectionId = googleConnections[0].id
     setConnectionId(nextConnectionId)
-
     sessionStorage.setItem(storageKey, nextConnectionId)
-  }, [userId, googleConnections])
+  }, [
+    connectionsQuery.isError,
+    connectionsQuery.isFetching,
+    connectionsQuery.isLoading,
+    googleConnections,
+    connectionId,
+    userId,
+    clearWorkspaceData,
+  ])
+
+  useEffect(() => {
+    if (!isGmailEnabled && connectionId) {
+      clearWorkspaceData(connectionId)
+    }
+  }, [isGmailEnabled, connectionId, clearWorkspaceData])
 
   function handleConnectionChange(nextId) {
     setConnectionId(nextId)
@@ -809,7 +911,7 @@ export default function Gmail() {
       searchQuery,
     ],
 
-    enabled: Boolean(userId && connectionId),
+    enabled: canUseGmail,
 
     initialPageParam: undefined,
 
@@ -833,12 +935,15 @@ export default function Gmail() {
   })
 
   const messages = useMemo(
-    () => sortGmailMessagesByReceivedTime(
-      messagesQuery.data?.pages.flatMap(
-        (page) => page.messages || [],
-      ) || [],
-    ),
-    [messagesQuery.data],
+    () => canUseGmail &&
+      ![403, 404].includes(messagesQuery.error?.status)
+      ? sortGmailMessagesByReceivedTime(
+        messagesQuery.data?.pages.flatMap(
+          (page) => page.messages || [],
+        ) || [],
+      )
+      : [],
+    [canUseGmail, messagesQuery.data, messagesQuery.error],
   )
 
   // Individual email details query
@@ -856,9 +961,7 @@ export default function Gmail() {
         messageId: selectedMessageId,
       }),
 
-    enabled: Boolean(
-      userId && connectionId && selectedMessageId,
-    ),
+    enabled: Boolean(canUseGmail && selectedMessageId),
 
     staleTime: CACHE_TIME,
     gcTime: GC_TIME,
@@ -866,6 +969,42 @@ export default function Gmail() {
     refetchOnMount: true,
     refetchOnWindowFocus: true,
   })
+  const gmailDataAccessDenied = [403, 404].includes(
+    messagesQuery.error?.status,
+  ) || [403, 404].includes(messageDetailQuery.error?.status)
+
+  useEffect(() => {
+    const unavailableConnectionErrors = [
+      messagesQuery.error,
+      messageDetailQuery.error,
+    ]
+    const connectionWasRemoved = unavailableConnectionErrors.some(
+      (error) =>
+        error?.status === 404 &&
+        [
+          'Connected Google account was not found.',
+          'Google OAuth credentials were not found.',
+        ].includes(error.message),
+    )
+    if (!connectionWasRemoved || !connectionId || !userId) return
+
+    const storageKey = `gmail-selected-account-${userId}`
+    if (sessionStorage.getItem(storageKey) === connectionId) {
+      sessionStorage.removeItem(storageKey)
+    }
+    clearWorkspaceData(connectionId)
+    setConnectionId('')
+    queryClient.invalidateQueries({
+      queryKey: ['oauth-connections', userId],
+    })
+  }, [
+    clearWorkspaceData,
+    connectionId,
+    messageDetailQuery.error,
+    messagesQuery.error,
+    queryClient,
+    userId,
+  ])
 
   function handleSearch(event) {
     event.preventDefault()
@@ -1527,15 +1666,17 @@ export default function Gmail() {
           <button
             type="button"
             onClick={() => openCompose('compose')}
-            disabled={!connectionId}
+            disabled={!canUseGmail}
             className="rounded-xl bg-violet-600 px-5 py-3 text-sm font-semibold text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             ✉ Compose
           </button>
 
           <div className="flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs font-semibold text-emerald-500">
-            <span className="h-2 w-2 rounded-full bg-emerald-400" />
-            Read, Send &amp; Manage access
+            <span className={`h-2 w-2 rounded-full ${
+              isGmailEnabled ? 'bg-emerald-400' : 'bg-amber-400'
+            }`} />
+            {isGmailEnabled ? 'Read, Send & Manage access' : 'Gmail is turned off'}
           </div>
         </div>
 
@@ -1551,9 +1692,9 @@ export default function Gmail() {
           Connected Google account
         </label>
 
-        {connectionsQuery.isLoading ? (
+        {connectionsQuery.isLoading || connectionsQuery.isFetching ? (
           <p className={`text-sm ${colors.muted}`}>
-            Loading connected accounts...
+            Checking connected accounts...
           </p>
         ) : connectionsQuery.isError ? (
           <div className="text-sm text-rose-500">
@@ -1586,7 +1727,7 @@ export default function Gmail() {
           </select>
         )}
 
-        {selectedConnection && (
+        {connectionsVerified && selectedConnection && (
           <p className="mt-3 text-xs text-emerald-500">
             Connected: {selectedConnection.email}
           </p>
@@ -1657,7 +1798,9 @@ export default function Gmail() {
               </p>
 
               <p className={`mt-2 break-all px-3 text-xs font-medium ${colors.text}`}>
-                {selectedConnection?.email || 'No account selected'}
+                {connectionsVerified
+                  ? selectedConnection?.email || 'No account selected'
+                  : 'Checking connection status'}
               </p>
             </div>
 
@@ -1687,7 +1830,7 @@ export default function Gmail() {
 
                 <button
                   type="button"
-                  disabled={!connectionId || manualRefreshing}
+                  disabled={!canUseGmail || manualRefreshing}
                   onClick={handleManualRefresh}
                   className={`rounded-lg border px-3 py-2 text-xs font-semibold transition disabled:opacity-50 ${
                     colors.input
@@ -1722,14 +1865,14 @@ export default function Gmail() {
                   onChange={(event) =>
                     handleSearchInputChange(event.target.value)
                   }
-                  disabled={!connectionId}
+                  disabled={!canUseGmail}
                   placeholder={`Search in ${activeFolderInfo?.label || 'Gmail'}...`}
                   className={`min-w-0 flex-1 rounded-xl border px-4 py-2.5 text-sm outline-none focus:border-violet-500 disabled:opacity-50 ${colors.input}`}
                 />
 
                 <button
                   type="submit"
-                  disabled={!connectionId}
+                  disabled={!canUseGmail}
                   className="rounded-xl bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-violet-500 disabled:opacity-50"
                 >
                   Search
@@ -1750,18 +1893,62 @@ export default function Gmail() {
             </div>
 
             {/* Messages */}
-            {!connectionId ? (
+            {!connectionsVerified ? (
+              <div className="p-12 text-center">
+                <p className="text-sm text-rose-500">
+                  {connectionsQuery.isError
+                    ? connectionsQuery.error.message
+                    : 'Checking Google account status...'}
+                </p>
+                {connectionsQuery.isError && (
+                  <button
+                    type="button"
+                    onClick={() => connectionsQuery.refetch()}
+                    className="mt-4 rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white"
+                  >
+                    Retry
+                  </button>
+                )}
+              </div>
+            ) : !isGmailEnabled ? (
+              <div className="p-12 text-center">
+                <h3 className={`mt-4 font-semibold ${colors.heading}`}>
+                  Gmail is turned off
+                </h3>
+                <p className={`mt-2 text-sm ${colors.muted}`}>
+                  Your Google account remains connected. Turn Gmail on in Connected Apps to use this workspace.
+                </p>
+                <Link
+                  to="/dashboard/connectors"
+                  className="mt-4 inline-block rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white"
+                >
+                  Open Connected Apps
+                </Link>
+              </div>
+            ) : !selectedConnection ? (
               <div className="p-12 text-center">
 
                 <div className="text-4xl">📩</div>
 
                 <h3 className={`mt-4 font-semibold ${colors.heading}`}>
-                  Select a Google account
+                  {googleConnections.length > 0
+                    ? 'Select a Google account'
+                    : 'Gmail is disconnected'}
                 </h3>
 
                 <p className={`mt-2 text-sm ${colors.muted}`}>
-                  Choose a connected account to load your emails.
+                  {googleConnections.length > 0
+                    ? 'Choose a connected account to load your emails.'
+                    : 'Connect a Google account again in Connected Apps before loading emails.'}
                 </p>
+                {googleConnections.length === 0 && (
+                  <Link
+                    to="/dashboard/connectors"
+                    className="mt-4 inline-block rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white"
+                  >
+                    Connect Gmail
+                  </Link>
+                )}
 
               </div>
             ) : loading ? (
@@ -1775,7 +1962,7 @@ export default function Gmail() {
                 ))}
 
               </div>
-            ) : error && !messagesQuery.data ? (
+            ) : error ? (
               <div className="p-8 text-center">
 
                 <p className="text-sm text-rose-500">
@@ -1793,11 +1980,6 @@ export default function Gmail() {
               </div>
             ) : (
               <>
-                {error && (
-                  <p role="status" className="px-5 pt-4 text-sm text-rose-500">
-                    Unable to refresh this folder. Showing previously loaded emails.
-                  </p>
-                )}
                 {messages.length === 0 ? (
                   <div className="p-12 text-center">
 
@@ -2028,7 +2210,7 @@ export default function Gmail() {
             )}
 
             {/* Pagination */}
-            {connectionId && messagesQuery.hasNextPage && (
+            {canUseGmail && messagesQuery.hasNextPage && (
               <div className={`border-t p-5 text-center ${colors.divider}`}>
 
                 <button
@@ -2071,7 +2253,7 @@ export default function Gmail() {
       )}
 
       {/* Compose Email Modal */}
-      {showCompose && (
+      {showCompose && canUseGmail && !gmailDataAccessDenied && (
         <div
           className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-3 sm:p-6"
           onMouseDown={(event) => {
@@ -2251,7 +2433,7 @@ export default function Gmail() {
 
                   <button
                     type="submit"
-                    disabled={sendEmailMutation.isPending || !connectionId}
+                    disabled={sendEmailMutation.isPending || !canUseGmail}
                     className="rounded-lg bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {sendEmailMutation.isPending
@@ -2451,7 +2633,7 @@ export default function Gmail() {
       )}
 
       {/* Email Details Modal */}
-      {selectedMessageId && (
+      {selectedMessageId && canUseGmail && !gmailDataAccessDenied && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-3 sm:p-6"
           onMouseDown={(event) => {

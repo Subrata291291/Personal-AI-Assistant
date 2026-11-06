@@ -312,6 +312,44 @@ def test_declined_calendar_authorization_does_not_change_existing_grants():
     service.credential_service.save_credentials.assert_not_called()
 
 
+def test_disconnect_cancels_an_in_flight_oauth_callback():
+    service = GoogleOAuthCallbackService(db=Mock())
+    service.state_service = Mock()
+    service.state_service.consume_state.return_value = {
+        "user_id": uuid4(),
+        "code_verifier": "verifier",
+        "redirect_uri": "https://example.test/callback",
+    }
+    service.state_service.lock_consumed_state_for_callback.return_value = False
+    service.oauth_client = Mock()
+    service.oauth_client.exchange_authorization_code = AsyncMock(
+        return_value={
+            "access_token": "access-token",
+            "expires_in": 3600,
+            "scope": "https://www.googleapis.com/auth/gmail.readonly",
+        }
+    )
+    service.oauth_client.get_user_info = AsyncMock(
+        return_value={
+            "provider_account_id": "google-user-id",
+            "email": "user@example.com",
+        }
+    )
+    service.connection_service = Mock()
+    service.credential_service = Mock()
+
+    with pytest.raises(ValueError, match="canceled by disconnect"):
+        asyncio.run(
+            service.handle_callback(
+                code="authorization-code",
+                state="opaque-state",
+            )
+        )
+
+    service.connection_service.connect_account.assert_not_called()
+    service.credential_service.save_credentials.assert_not_called()
+
+
 def test_credential_update_preserves_existing_refresh_token(monkeypatch):
     credential = SimpleNamespace(
         refresh_token_encrypted="encrypted-old-refresh",

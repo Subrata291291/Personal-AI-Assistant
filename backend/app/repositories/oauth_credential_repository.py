@@ -92,22 +92,28 @@ class OAuthCredentialRepository:
         token refresh and connection status changes during the transaction.
         """
 
-        statement = (
-            select(OAuthCredential)
-            .join(
-                UserConnection,
-                UserConnection.id == OAuthCredential.connection_id,
-            )
+        connection_statement = (
+            select(UserConnection)
             .where(
-                OAuthCredential.user_id == user_id,
-                OAuthCredential.connection_id == connection_id,
+                UserConnection.id == connection_id,
                 UserConnection.user_id == user_id,
                 UserConnection.provider == "google",
                 UserConnection.status == "connected",
             )
-            .with_for_update(of=OAuthCredential)
+            .with_for_update()
         )
+        connection = self.db.scalar(connection_statement)
+        if connection is None:
+            return None
 
+        statement = (
+            select(OAuthCredential)
+            .where(
+                OAuthCredential.user_id == user_id,
+                OAuthCredential.connection_id == connection_id,
+            )
+            .with_for_update()
+        )
         return self.db.scalar(statement)
 
 

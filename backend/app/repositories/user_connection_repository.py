@@ -78,6 +78,20 @@ class UserConnectionRepository:
 
         return self.db.scalar(statement)
 
+    def get_by_id_for_update(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> UserConnection | None:
+        statement = (
+            select(UserConnection)
+            .where(
+                UserConnection.id == connection_id,
+                UserConnection.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        return self.db.scalar(statement)
 
     def get_active_google_connection(
         self,
@@ -92,6 +106,23 @@ class UserConnectionRepository:
             UserConnection.status == "connected",
         )
 
+        return self.db.scalar(statement)
+
+    def get_active_google_connection_for_update(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> UserConnection | None:
+        statement = (
+            select(UserConnection)
+            .where(
+                UserConnection.id == connection_id,
+                UserConnection.user_id == user_id,
+                UserConnection.provider == "google",
+                UserConnection.status == "connected",
+            )
+            .with_for_update()
+        )
         return self.db.scalar(statement)
 
 
@@ -114,7 +145,7 @@ class UserConnectionRepository:
         connection_id: UUID,
     ) -> bool:
 
-        connection = self.get_by_id(
+        connection = self.get_by_id_for_update(
             user_id=user_id,
             connection_id=connection_id,
         )

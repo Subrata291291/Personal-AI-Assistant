@@ -498,7 +498,7 @@ def test_mutation_request_api_passes_if_match_without_refresh_retry(monkeypatch)
     assert len(fake_client.calls) == 1
     assert fake_client.calls[0]["headers"]["If-Match"] == '"etag-2"'
     assert fake_client.calls[0]["headers"]["Authorization"] == "Bearer token"
-    db.commit.assert_called_once_with()
+    assert db.commit.call_count == 2
     token_service.get_valid_access_token.assert_awaited_once()
 
 

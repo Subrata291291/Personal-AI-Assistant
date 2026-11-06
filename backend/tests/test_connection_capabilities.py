@@ -431,26 +431,59 @@ def test_aggregate_calendar_capabilities_combine_independent_owned_grants():
     }
 
 
-def test_disconnect_deletes_only_the_authenticated_users_shared_connection():
+def test_disconnect_invalidates_only_the_authenticated_users_google_connection():
     user_id = uuid4()
     connection_id = uuid4()
     repository = Mock()
-    repository.delete_by_id.return_value = True
+    connection = SimpleNamespace(provider="google")
+    repository.get_by_id.return_value = connection
+    repository.get_by_id_for_update.return_value = connection
     db = Mock()
 
     service = UserConnectionService(db=db)
     service.repository = repository
+    service.credential_repository = Mock()
+    service.oauth_state_service = Mock()
 
     assert service.disconnect_account(
         user_id=user_id,
         connection_id=connection_id,
     )
 
-    repository.delete_by_id.assert_called_once_with(
+    repository.get_by_id.assert_called_once_with(
         user_id=user_id,
         connection_id=connection_id,
     )
+    repository.get_by_id_for_update.assert_called_once_with(
+        user_id=user_id,
+        connection_id=connection_id,
+    )
+    service.oauth_state_service.invalidate_user_states.assert_called_once_with(
+        user_id=user_id,
+        provider="google",
+    )
+    service.credential_repository.delete.assert_called_once_with(
+        user_id=user_id,
+        connection_id=connection_id,
+    )
+    db.delete.assert_called_once_with(connection)
     db.commit.assert_called_once_with()
+
+
+def test_disconnect_does_not_invalidate_connections_for_another_user():
+    service = UserConnectionService(db=Mock())
+    service.repository = Mock()
+    service.repository.get_by_id.return_value = None
+    service.oauth_state_service = Mock()
+    service.credential_repository = Mock()
+
+    assert service.disconnect_account(
+        user_id=uuid4(),
+        connection_id=uuid4(),
+    ) is False
+
+    service.oauth_state_service.invalidate_user_states.assert_not_called()
+    service.credential_repository.delete.assert_not_called()
 
 
 def test_runtime_scopes_are_only_retrieved_for_active_connection_owned_by_user():

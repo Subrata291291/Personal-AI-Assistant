@@ -11,6 +11,12 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.core.request_metrics import record_timing, request_id
+from app.repositories.oauth_credential_repository import (
+    OAuthCredentialRepository,
+)
+from app.repositories.user_connection_repository import (
+    UserConnectionRepository,
+)
 from app.integrations.google.exceptions import (
     GoogleAPIError,
     GoogleAPIMutationError,
@@ -72,6 +78,39 @@ class GoogleAPIClient:
             follow_redirects=False,
         ) as owned_client:
             yield owned_client
+
+    @asynccontextmanager
+    async def _active_connection_request(
+        self,
+        db: Session,
+        user_id: UUID,
+        connection_id: UUID,
+    ):
+        """Serialize provider requests with disconnect and verify credentials."""
+        connection = (
+            UserConnectionRepository(db).get_active_google_connection_for_update(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+        )
+        if connection is None:
+            db.rollback()
+            raise ValueError("Connected Google account was not found.")
+
+        credential = OAuthCredentialRepository(db).get_by_connection(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+        if credential is None:
+            db.rollback()
+            raise ValueError("Google OAuth credentials were not found.")
+
+        try:
+            yield
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
     def _validate_url(self, url: str) -> None:
 
@@ -290,14 +329,19 @@ class GoogleAPIClient:
 
             try:
                 # Step 2: Execute the original request.
-                return await self._send_request(
-                    client=client,
-                    method=normalized_method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    json_data=json_data,
-                )
+                async with self._active_connection_request(
+                    db,
+                    normalized_user_id,
+                    normalized_connection_id,
+                ):
+                    return await self._send_request(
+                        client=client,
+                        method=normalized_method,
+                        url=url,
+                        headers=headers,
+                        params=params,
+                        json_data=json_data,
+                    )
             except GoogleAPIError as exc:
                 if exc.status_code != 401:
                     raise
@@ -316,14 +360,19 @@ class GoogleAPIClient:
                     raise
 
                 headers["Authorization"] = f"Bearer {new_access_token}"
-                return await self._send_request(
-                    client=client,
-                    method=normalized_method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    json_data=json_data,
-                )
+                async with self._active_connection_request(
+                    db,
+                    normalized_user_id,
+                    normalized_connection_id,
+                ):
+                    return await self._send_request(
+                        client=client,
+                        method=normalized_method,
+                        url=url,
+                        headers=headers,
+                        params=params,
+                        json_data=json_data,
+                    )
 
     async def request_mutation(
         self,
@@ -382,14 +431,19 @@ class GoogleAPIClient:
             **mutation_headers,
         }
         async with self._client_context(http_client) as client:
-            return await self._send_mutation_request(
-                client=client,
-                method=normalized_method,
-                url=url,
-                headers=request_headers,
-                params=params,
-                json_data=json_data,
-            )
+            async with self._active_connection_request(
+                db,
+                normalized_user_id,
+                normalized_connection_id,
+            ):
+                return await self._send_mutation_request(
+                    client=client,
+                    method=normalized_method,
+                    url=url,
+                    headers=request_headers,
+                    params=params,
+                    json_data=json_data,
+                )
 
     async def _send_mutation_request(
         self,

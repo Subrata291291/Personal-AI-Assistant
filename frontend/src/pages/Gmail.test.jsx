@@ -10,8 +10,12 @@ import {
 import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+const gmailUser = vi.hoisted(() => ({
+  current: { id: 'user-1', user_metadata: {} },
+}))
+
 vi.mock('../context/AuthContext', () => ({
-  useAuth: () => ({ user: { id: 'user-1' } }),
+  useAuth: () => ({ user: gmailUser.current }),
 }))
 
 vi.mock('../lib/api.js', () => ({
@@ -82,6 +86,7 @@ describe('Gmail archive flow', () => {
 
   beforeEach(() => {
     archived = false
+    gmailUser.current = { id: 'user-1', user_metadata: {} }
     sessionStorage.clear()
     api.get.mockResolvedValue({
       connections: [{
@@ -807,5 +812,57 @@ describe('Gmail archive flow', () => {
       .toHaveLength(1)
     expect(screen.queryByRole('button', { name: 'Send approved draft' }))
       .not.toBeInTheDocument()
+  })
+
+  it('clears cached emails and the selected account after disconnect', async () => {
+    let disconnected = false
+    api.get.mockImplementation(async () => ({
+      connections: disconnected
+        ? []
+        : [{
+            id: 'connection-1',
+            provider: 'google',
+            status: 'connected',
+            email: 'user@example.com',
+          }],
+    }))
+    gmailService.getMessages.mockImplementation(async () => {
+      if (disconnected) {
+        const error = new Error('Connected Google account was not found.')
+        error.status = 404
+        throw error
+      }
+      return {
+        messages: [message],
+        next_page_token: null,
+      }
+    })
+    renderGmail()
+
+    expect(await screen.findByText('Quarterly update')).toBeInTheDocument()
+    expect(screen.getByText('Connected: user@example.com')).toBeInTheDocument()
+
+    disconnected = true
+    fireEvent.click(screen.getByRole('button', { name: '↻ Refresh' }))
+
+    expect(await screen.findByText('Gmail is disconnected'))
+      .toBeInTheDocument()
+    expect(screen.queryByText('Quarterly update')).not.toBeInTheDocument()
+    expect(screen.queryByText('Connected: user@example.com'))
+      .not.toBeInTheDocument()
+  })
+
+  it('keeps the Google account connected while Gmail is switched off', async () => {
+    gmailUser.current = {
+      id: 'user-1',
+      user_metadata: { gmail_enabled: false },
+    }
+    renderGmail()
+
+    expect(await screen.findByText('Gmail is turned off'))
+      .toBeInTheDocument()
+    expect(await screen.findByText('Connected: user@example.com'))
+      .toBeInTheDocument()
+    expect(gmailService.getMessages).not.toHaveBeenCalled()
   })
 })

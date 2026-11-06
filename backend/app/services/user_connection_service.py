@@ -10,6 +10,7 @@ from app.repositories.oauth_credential_repository import (
 from app.repositories.user_connection_repository import (
     UserConnectionRepository,
 )
+from app.services.oauth_state_service import OAuthStateService
 
 
 class UserConnectionService:
@@ -35,6 +36,7 @@ class UserConnectionService:
         self.db = db
         self.repository = UserConnectionRepository(db)
         self.credential_repository = OAuthCredentialRepository(db)
+        self.oauth_state_service = OAuthStateService(db)
 
     def connect_account(
         self,
@@ -428,13 +430,39 @@ class UserConnectionService:
     ) -> bool:
 
         try:
-            deleted = self.repository.delete_by_id(
+            connection = self.repository.get_by_id(
                 user_id=user_id,
                 connection_id=connection_id,
             )
-
-            if not deleted:
+            if connection is None:
+                self.db.rollback()
                 return False
+
+            if connection.provider == "google":
+                # OAuth callbacks lock their consumed state before saving
+                # credentials. Delete states first to prevent an in-flight
+                # callback from recreating a just-disconnected connection.
+                self.oauth_state_service.invalidate_user_states(
+                    user_id=user_id,
+                    provider="google",
+                )
+
+            connection = self.repository.get_by_id_for_update(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            if connection is None:
+                self.db.rollback()
+                return False
+
+            if connection.provider == "google":
+                self.credential_repository.delete(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                )
+
+            self.db.delete(connection)
+            self.db.flush()
 
             self.db.commit()
 

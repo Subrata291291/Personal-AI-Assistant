@@ -104,6 +104,38 @@ class OAuthStateRepository:
 
         return self.db.scalar(statement)
 
+    def get_consumed_state_for_update(
+        self,
+        user_id: UUID,
+        provider: str,
+        state_hash: str,
+    ) -> OAuthState | None:
+        statement = (
+            select(OAuthState)
+            .where(
+                OAuthState.user_id == user_id,
+                OAuthState.provider == provider.strip().lower(),
+                OAuthState.state_hash == state_hash,
+                OAuthState.consumed_at.is_not(None),
+            )
+            .with_for_update()
+        )
+        return self.db.scalar(statement)
+
+    def delete_by_user_provider(
+        self,
+        user_id: UUID,
+        provider: str,
+    ) -> int:
+        from sqlalchemy import delete
+
+        statement = delete(OAuthState).where(
+            OAuthState.user_id == user_id,
+            OAuthState.provider == provider.strip().lower(),
+        )
+        result = self.db.execute(statement)
+        return result.rowcount or 0
+
     def delete_expired(
         self,
         now: datetime,

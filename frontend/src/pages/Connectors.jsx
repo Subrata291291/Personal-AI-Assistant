@@ -14,7 +14,6 @@ import { api } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import GoogleServiceIcon from '../components/GoogleServiceIcon'
 
-const CACHE_TIME = 5 * 60 * 1000
 const GC_TIME = 30 * 60 * 1000
 
 const CONNECTIONS_KEY = (userId) => [
@@ -32,6 +31,46 @@ function formatDate(value) {
   }
 
   return date.toLocaleString()
+}
+
+function removeDisconnectedConnections(data, connectionIds) {
+  if (!data) return data
+
+  const connections = (data.connections || []).filter(
+    (connection) => !connectionIds.includes(connection.id),
+  )
+  const googleConnections = connections.filter(
+    (connection) =>
+      connection.provider === 'google' &&
+      connection.status === 'connected',
+  )
+  const capabilities = googleConnections.map(
+    (connection) => connection.capabilities || {},
+  )
+  const eventsRead = capabilities.some((item) => item.calendar_events_read)
+  const freebusy = capabilities.some((item) => item.calendar_freebusy)
+
+  return {
+    ...data,
+    connections,
+    total: connections.length,
+    calendar_capabilities: {
+      connected: capabilities.some((item) => item.calendar),
+      events_read: eventsRead,
+      freebusy,
+      api_available: eventsRead || freebusy,
+      api_complete: eventsRead && freebusy,
+      chat_available: eventsRead || freebusy,
+      google_connection_available: googleConnections.length > 0,
+      permissions_need_consent: googleConnections.length > 0 &&
+        !(eventsRead && freebusy),
+      write_permission_granted: capabilities.some(
+        (item) => item.calendar_write_permission_granted,
+      ),
+      write_execution_available: false,
+      write_available: false,
+    },
+  }
 }
 
 function Connectors() {
@@ -72,11 +111,11 @@ function Connectors() {
 
     enabled: Boolean(userId),
 
-    staleTime: CACHE_TIME,
+    staleTime: 0,
     gcTime: GC_TIME,
 
-    refetchOnMount: false,
-    refetchOnWindowFocus: false,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: 'always',
     refetchOnReconnect: true,
   })
 
@@ -142,6 +181,14 @@ function Connectors() {
     }
   }
 
+  function updateDisconnectedConnectionCache(connectionIds) {
+    if (connectionIds.length === 0) return
+    queryClient.setQueryData(
+      CONNECTIONS_KEY(userId),
+      (data) => removeDisconnectedConnections(data, connectionIds),
+    )
+  }
+
   function handleIntegrationToggle(integration, enabled) {
     setNotice(null)
     integrationPreferenceMutation.mutate({
@@ -203,6 +250,7 @@ function Connectors() {
     },
 
     onSuccess: async (_result, disconnectedConnectionIds) => {
+      updateDisconnectedConnectionCache(disconnectedConnectionIds)
       const defaultPreferenceError =
         await clearDisconnectedPreferences(disconnectedConnectionIds)
 
@@ -229,6 +277,7 @@ function Connectors() {
     onError: async (error) => {
       const disconnectedConnectionIds =
         error.disconnectedConnectionIds || []
+      updateDisconnectedConnectionCache(disconnectedConnectionIds)
       const defaultPreferenceError = await clearDisconnectedPreferences(
         disconnectedConnectionIds,
       )

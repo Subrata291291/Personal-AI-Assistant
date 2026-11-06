@@ -61,6 +61,14 @@ def _handle_gmail_error(exc: Exception) -> None:
         ) from exc
 
     if isinstance(exc, ValueError):
+        if str(exc) in {
+            "Connected Google account was not found.",
+            "Google OAuth credentials were not found.",
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
@@ -101,6 +109,7 @@ def _handle_gmail_error(exc: Exception) -> None:
     response_model=GmailMessageListResponse,
 )
 async def list_gmail_messages(
+    response: Response,
     current_user: CurrentUser,
     connection_id: UUID,
     max_results: int = Query(default=20, ge=1, le=50),
@@ -110,6 +119,7 @@ async def list_gmail_messages(
     db: Session = Depends(get_db),
 ):
     """List messages in the authenticated user's connected Gmail account."""
+    response.headers["Cache-Control"] = "private, no-store"
     user_id = _get_user_id(current_user)
     folder = folder.strip().lower()
 
@@ -145,11 +155,13 @@ async def list_gmail_messages(
 )
 async def get_gmail_message(
     message_id: str,
+    response: Response,
     current_user: CurrentUser,
     connection_id: UUID,
     db: Session = Depends(get_db),
 ):
     """Retrieve the full details of one Gmail message."""
+    response.headers["Cache-Control"] = "private, no-store"
     user_id = _get_user_id(current_user)
     service = GmailService(db)
 

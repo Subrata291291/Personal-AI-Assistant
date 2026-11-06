@@ -370,6 +370,11 @@ describe('Connected Apps', () => {
       )
     })
     await screen.findByText('Google account disconnected successfully.')
+    expect(await screen.findByRole('button', { name: 'Connect Gmail' }))
+      .toBeInTheDocument()
+    expect(screen.queryByRole('button', {
+      name: 'Disconnect Google account',
+    })).not.toBeInTheDocument()
   })
 
   it('keeps Calendar and unrelated Google services distinct', async () => {

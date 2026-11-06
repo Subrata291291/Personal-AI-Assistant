@@ -118,6 +118,15 @@ class GoogleOAuthCallbackService:
             else:
                 scopes = []
 
+            if not self.state_service.lock_consumed_state_for_callback(
+                user_id=user_id,
+                provider=self.PROVIDER,
+                state=state,
+            ):
+                raise ValueError(
+                    "Google authorization was canceled by disconnect."
+                )
+
             # Create or reconnect the user's Google account.
             connection = self.connection_service.connect_account(
                 user_id=user_id,
