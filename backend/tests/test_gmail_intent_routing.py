@@ -10,7 +10,8 @@ from app.schemas.gmail_agent import (
     SearchEmailsPlan,
     parse_assistant_intent,
 )
-from app.workflows.chat_nodes import capabilities_node
+from app.workflows.chat_nodes import capabilities_node, llm_node
+from app.workflows import chat_nodes
 from app.workflows import gmail_agent_nodes
 
 
@@ -337,6 +338,100 @@ def test_common_calendar_requests_route_to_read_only_calendar_tools():
         assert routed["gmail_plan"]["calendar_tool"] == expected_tool
 
 
+def test_calendar_relative_dates_use_one_request_time_in_user_timezone():
+    request_time = "2026-11-06T18:45:00+00:00"
+    today = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "What's on my calendar today?",
+            user_timezone="Asia/Kolkata",
+            request_time=request_time,
+        )
+    )
+    tomorrow = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "What events do I have tomorrow?",
+            user_timezone="Asia/Kolkata",
+            request_time=request_time,
+        )
+    )
+
+    assert today["assistant_route"] == "google_calendar"
+    assert today["gmail_plan"]["calendar_tool"] == "get_today_schedule"
+    assert tomorrow["gmail_plan"]["calendar_arguments"]["date"] == "2026-11-08"
+    assert tomorrow["gmail_plan"]["calendar_arguments"]["time_zone"] == (
+        "Asia/Kolkata"
+    )
+
+
+def test_calendar_date_ranges_afternoon_search_and_implicit_today_freebusy():
+    date_range = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Show my calendar from 2026-11-06 to 2026-11-08.",
+            user_timezone="Asia/Kolkata",
+            request_time="2026-11-06T18:45:00+00:00",
+        )
+    )["gmail_plan"]
+    afternoon = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Do I have any meetings this afternoon?",
+            user_timezone="Asia/Kolkata",
+            request_time="2026-11-06T04:30:00+00:00",
+        )
+    )["gmail_plan"]
+    availability = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Am I free between 2 PM and 4 PM?",
+            user_timezone="Asia/Kolkata",
+            request_time="2026-11-06T04:30:00+00:00",
+        )
+    )["gmail_plan"]
+    title_search = gmail_agent_nodes.gmail_intent_router_node(
+        _state("Find my meeting titled product review.")
+    )["gmail_plan"]
+
+    assert date_range["calendar_tool"] == "list_calendar_events"
+    assert date_range["calendar_arguments"]["time_min"].startswith(
+        "2026-11-06T00:00:00"
+    )
+    assert date_range["calendar_arguments"]["time_max"].startswith(
+        "2026-11-09T00:00:00"
+    )
+    assert afternoon["calendar_arguments"]["time_min"].startswith(
+        "2026-11-06T12:00:00"
+    )
+    assert afternoon["calendar_arguments"]["time_max"].startswith(
+        "2026-11-06T17:00:00"
+    )
+    assert availability["calendar_tool"] == "check_calendar_availability"
+    assert availability["calendar_arguments"]["time_min"].startswith(
+        "2026-11-06T14:00:00"
+    )
+    assert title_search["calendar_arguments"]["query"] == "product review"
+
+
+def test_calendar_route_ignores_stale_conversation_events_and_clarifies():
+    stale_event = "2024-11-06 Old product launch meeting"
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "What's on my calendar today?",
+            messages=[{"role": "assistant", "content": stale_event}],
+            user_timezone="Asia/Kolkata",
+            request_time="2026-11-06T18:45:00+00:00",
+        )
+    )
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "get_today_schedule"
+    assert stale_event not in json.dumps(routed)
+
+
+def test_general_assistant_questions_do_not_route_to_calendar():
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state("Explain how time zones work.")
+    )
+    assert routed["assistant_route"] == "general"
+
+
 def test_calendar_availability_without_a_complete_interval_clarifies():
     routed = gmail_agent_nodes.gmail_intent_router_node(
         _state("Am I free tomorrow?")
@@ -459,6 +554,55 @@ def test_gmail_and_general_requests_keep_existing_routing():
     assert gmail["assistant_route"] == "gmail"
     assert gmail["gmail_plan"]["intent"] == "search_emails"
     assert general["assistant_route"] == "general"
+
+
+def test_general_response_cannot_present_unverified_calendar_facts(monkeypatch):
+    monkeypatch.setattr(
+        chat_nodes.llm_router,
+        "generate",
+        lambda request: SimpleNamespace(
+            content="You have a meeting at 2 PM from your old calendar.",
+            provider="test",
+            model="test-model",
+            completion_metadata=lambda: {},
+        ),
+    )
+
+    result = llm_node(_state(
+        "Explain photosynthesis.",
+        assistant_route="general",
+        messages=[{
+            "role": "assistant",
+            "content": "Your 2024-11-06 calendar included a design review.",
+        }],
+    ))
+
+    assert result["assistant_response"] == (
+        "I can't verify personal Calendar events in a general response. "
+        "Ask me about your calendar for a live check."
+    )
+    assert result["messages"][-1]["content"] == result["assistant_response"]
+
+
+def test_general_response_keeps_unrelated_answers(monkeypatch):
+    content = "Photosynthesis converts light energy into chemical energy."
+    monkeypatch.setattr(
+        chat_nodes.llm_router,
+        "generate",
+        lambda request: SimpleNamespace(
+            content=content,
+            provider="test",
+            model="test-model",
+            completion_metadata=lambda: {},
+        ),
+    )
+
+    result = llm_node(_state(
+        "Explain photosynthesis.",
+        assistant_route="general",
+    ))
+
+    assert result["assistant_response"] == content
 
 
 def test_compose_without_recipient_requests_only_the_recipient(monkeypatch):

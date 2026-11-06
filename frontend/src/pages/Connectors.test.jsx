@@ -122,7 +122,7 @@ describe('Connected Apps', () => {
     const [gmailCard, calendarCard] = within(services).getAllByRole('article')
     expect(within(gmailCard).getByText('Not connected'))
       .toBeInTheDocument()
-    expect(within(calendarCard).getByText('Not connected'))
+    expect(await within(calendarCard).findByText('Not connected'))
       .toBeInTheDocument()
   })
 
@@ -183,16 +183,23 @@ describe('Connected Apps', () => {
     ))
     renderConnectors()
 
-    await screen.findByText(/Calendar is not connected\./)
+    const calendarCard = screen.getByRole('heading', {
+      name: 'Google Calendar',
+    }).closest('article')
+    expect(await within(calendarCard).findByText('Not connected'))
+      .toBeInTheDocument()
+    expect(within(calendarCard).getByText(
+      'A Google account is connected, but Google Calendar permission has not been granted.',
+    )).toBeInTheDocument()
     expect(screen.getByText('Gmail: Connected · Google Calendar: Not connected'))
       .toBeInTheDocument()
     expect(screen.getByRole('button', {
-      name: 'Grant missing Calendar permissions',
+      name: 'Connect Google Calendar',
     }))
       .toBeEnabled()
   })
 
-  it('lets existing partial Calendar grants request the missing scopes', async () => {
+  it('keeps Calendar event access connected when optional FreeBusy is missing', async () => {
     api.get.mockResolvedValue(connectedResponse([{
         ...googleConnection,
         capabilities: {
@@ -217,21 +224,17 @@ describe('Connected Apps', () => {
       }))
     renderConnectors()
 
-    expect(await screen.findByText('Permissions incomplete')).toBeInTheDocument()
+    const calendarCard = screen.getByRole('heading', {
+      name: 'Google Calendar',
+    }).closest('article')
+    expect(await within(calendarCard).findByText('Connected'))
+      .toBeInTheDocument()
     expect(screen.getByText(
       'Calendar event-read: available · FreeBusy: not granted · Calendar chat: available · Calendar writes: not available.',
     )).toBeInTheDocument()
-    const grantButton = screen.getByRole('button', {
+    expect(screen.queryByRole('button', {
       name: 'Grant missing Calendar permissions',
-    })
-    expect(grantButton).toBeEnabled()
-    fireEvent.click(grantButton)
-
-    await waitFor(() => {
-      expect(api.post).toHaveBeenCalledWith(
-        '/api/v1/oauth/google/connect?service=calendar',
-      )
-    })
+    })).not.toBeInTheDocument()
   })
 
   it('reports both independently granted services on one shared account', async () => {

@@ -159,11 +159,29 @@ def _render_result(
         )
 
     events = data.get("events")
-    if not isinstance(events, list):
-        events = [data] if isinstance(data.get("id"), str) else []
+    if tool_name == "get_calendar_event":
+        if not isinstance(data.get("id"), str) or not data["id"].strip():
+            return (
+                "Google Calendar returned malformed event details, so I "
+                "couldn’t verify this event."
+            )
+        events = [data]
+    elif (
+        not isinstance(events, list)
+        or any(
+            not isinstance(event, dict)
+            or not isinstance(event.get("id"), str)
+            or not event["id"].strip()
+            for event in events
+        )
+    ):
+        return (
+            "Google Calendar returned malformed event data, so I couldn’t "
+            "provide a reliable answer."
+        )
     if not events:
-        return "I didn’t find any matching Calendar events."
-    result = f"I found {len(events)} Calendar event(s):\n\n"
+        return "Google Calendar returned no matching events for this live request."
+    result = f"Live results from Google Calendar ({len(events)} event(s)):\n\n"
     result += "\n".join(
         _format_event(event, timezone)
         for event in events
@@ -474,21 +492,31 @@ def calendar_agent_node(
         }
 
     try:
-        tools = create_calendar_tools(
-            user_id=user_id,
-            connection_id=event_connection_id or freebusy_connection_id,
-            freebusy_connection_id=freebusy_connection_id,
-            include_event_tools=bool(event_connection_id),
-            include_freebusy_tool=bool(freebusy_connection_id),
-        )
+        tool_context = {
+            "user_id": user_id,
+            "connection_id": event_connection_id or freebusy_connection_id,
+            "freebusy_connection_id": freebusy_connection_id,
+            "include_event_tools": bool(event_connection_id),
+            "include_freebusy_tool": bool(freebusy_connection_id),
+        }
+        request_time = context.get("request_time")
+        if request_time is not None:
+            tool_context["request_time"] = request_time
+        tools = create_calendar_tools(**tool_context)
         selected_tool = next(
             (tool for tool in tools if tool.name == tool_name),
             None,
         )
         if selected_tool is None:
             response = (
-                "That Calendar operation is not available with the "
-                "permissions currently granted to your account."
+                "Free/Busy is unavailable because the selected Google "
+                "account has not granted the optional Calendar free/busy "
+                "permission."
+                if is_freebusy
+                else (
+                    "That Calendar operation is not available with the "
+                    "permissions currently granted to your account."
+                )
             )
         else:
             tool_output = asyncio.run(selected_tool.ainvoke(arguments))

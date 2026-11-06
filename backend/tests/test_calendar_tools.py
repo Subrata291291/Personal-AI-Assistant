@@ -32,7 +32,14 @@ class FakeDatabase:
         return False
 
 
-def build_tools(monkeypatch, service, *, user_id=USER_ID, connection_id=CONNECTION_ID):
+def build_tools(
+    monkeypatch,
+    service,
+    *,
+    user_id=USER_ID,
+    connection_id=CONNECTION_ID,
+    request_time=None,
+):
     database = FakeDatabase()
     db_factory = Mock(return_value=database)
     monkeypatch.setattr(
@@ -43,6 +50,7 @@ def build_tools(monkeypatch, service, *, user_id=USER_ID, connection_id=CONNECTI
     tools = create_calendar_tools(
         user_id=user_id,
         connection_id=connection_id,
+        request_time=request_time,
         db_factory=db_factory,
     )
     return {tool.name: tool for tool in tools}, db_factory
@@ -148,6 +156,36 @@ def test_list_events_tool_returns_json_safe_structured_result(monkeypatch):
     assert kwargs["page_token"] == "page-token"
     assert kwargs["attendee"] == "person@example.com"
     assert db_factory.call_count == 1
+
+
+def test_today_tool_uses_the_captured_request_time(monkeypatch):
+    request_time = datetime.fromisoformat("2026-11-06T18:45:00+00:00")
+    service = SimpleNamespace(
+        get_today_schedule=AsyncMock(return_value={
+            "calendar_id": "primary",
+            "date": date(2026, 11, 7),
+            "period": "day",
+            "time_zone": "Asia/Kolkata",
+            "events": [],
+            "conflicts": [],
+            "conflicts_complete": True,
+            "next_page_token": None,
+        })
+    )
+    tools, _ = build_tools(
+        monkeypatch,
+        service,
+        request_time=request_time.isoformat(),
+    )
+
+    output = invoke(tools["get_today_schedule"], {
+        "time_zone": "Asia/Kolkata",
+    })
+
+    assert output["ok"] is True
+    assert service.get_today_schedule.await_args.kwargs["request_time"] == (
+        request_time
+    )
 
 
 @pytest.mark.parametrize(

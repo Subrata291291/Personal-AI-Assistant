@@ -11,6 +11,7 @@ class ChatContext(TypedDict):
     user_id: str
     gmail_connection_id: str | None
     user_timezone: NotRequired[str]
+    request_time: NotRequired[str]
     calendar_event_connection_id: NotRequired[str | None]
     calendar_write_connection_id: NotRequired[str | None]
     calendar_write_connection_email: NotRequired[str | None]
@@ -36,6 +37,8 @@ class ChatState(TypedDict):
     user_message: str
 
     user_timezone: NotRequired[str]
+
+    request_time: NotRequired[str]
 
     assistant_capabilities: NotRequired[dict[str, Any]]
 

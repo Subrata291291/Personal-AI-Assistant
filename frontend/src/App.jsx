@@ -14,6 +14,7 @@ import Conversations from './pages/Conversations'
 import MemoryCenter from './pages/MemoryCenter'
 import Connectors from './pages/Connectors'
 import Gmail from './pages/Gmail'
+import Calendar from './pages/Calendar'
 import Settings from './pages/Settings'
 
 import Login from './pages/Login'
@@ -76,6 +77,7 @@ function App() {
               <Route path="memory" element={<MemoryCenter />} />
               <Route path="connectors" element={<Connectors />} />
               <Route path="gmail" element={<Gmail />} />
+              <Route path="calendar" element={<Calendar />} />
               <Route path="settings" element={<Settings />} />
             </Route>
           </Route>

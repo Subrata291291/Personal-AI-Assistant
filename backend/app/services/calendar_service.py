@@ -528,12 +528,18 @@ class CalendarService:
         connection_id: UUID,
         time_zone: str,
         calendar_id: str = "primary",
+        request_time: datetime | None = None,
     ) -> dict[str, Any]:
         zone = self._validate_time_zone(time_zone)
+        reference_time = request_time or datetime.now(timezone.utc)
+        reference_time = self._require_aware(
+            reference_time,
+            "request_time",
+        )
         return await self.get_schedule(
             user_id=user_id,
             connection_id=connection_id,
-            start_date=datetime.now(zone).date(),
+            start_date=reference_time.astimezone(zone).date(),
             period="day",
             time_zone=zone.key,
             calendar_id=calendar_id,

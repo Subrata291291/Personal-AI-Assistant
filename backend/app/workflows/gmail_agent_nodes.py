@@ -184,10 +184,10 @@ def build_runtime_capabilities(
 def _plan_prompt(state: ChatState) -> str:
     timezone = state.get("user_timezone", "UTC")
     try:
-        local_now = datetime.now(ZoneInfo(timezone))
+        local_now = _request_time(state).astimezone(ZoneInfo(timezone))
     except (ValueError, ZoneInfoNotFoundError):
         timezone = "UTC"
-        local_now = datetime.now(ZoneInfo("UTC"))
+        local_now = _request_time(state).astimezone(ZoneInfo("UTC"))
     calendar_capabilities = (
         (state.get("assistant_capabilities") or {}).get("google_calendar", {})
     )
@@ -318,6 +318,24 @@ def _validated_timezone(state: ChatState) -> str:
     return timezone
 
 
+def _request_time(state: ChatState) -> datetime:
+    value = state.get("request_time")
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(
+                value[:-1] + "+00:00" if value.endswith("Z") else value
+            )
+        except ValueError:
+            parsed = None
+    else:
+        parsed = None
+    if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+        return datetime.now(ZoneInfo("UTC"))
+    return parsed
+
+
 def _calendar_plan(
     tool: str,
     arguments: dict[str, Any] | None = None,
@@ -364,6 +382,8 @@ def _deterministic_calendar_plan(
 ) -> tuple[dict[str, Any], str] | None:
     text = state["user_message"].strip()
     lowered = text.casefold()
+    if not _is_calendar_request(text):
+        return None
     timezone = _validated_timezone(state)
     iana_match = re.search(
         r"\b[A-Za-z_+-]+/[A-Za-z_+-]+\b",
@@ -376,9 +396,15 @@ def _deterministic_calendar_plan(
         except (ValueError, ZoneInfoNotFoundError):
             return _calendar_plan("clarify")
     zone = ZoneInfo(timezone)
-    today = datetime.now(zone).date()
+    request_now = _request_time(state).astimezone(zone)
+    today = request_now.date()
     date_match = re.search(r"\b(today|tomorrow)\b", lowered)
-    explicit_date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    explicit_date_matches = re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", text)
+    explicit_date_match = (
+        re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+        if explicit_date_matches
+        else None
+    )
     target_date = (
         today + timedelta(days=1)
         if date_match and date_match.group(1) == "tomorrow"
@@ -411,6 +437,40 @@ def _deterministic_calendar_plan(
             return None
         return _calendar_plan("clarify")
 
+    if len(explicit_date_matches) == 2 and re.search(
+        r"\b(?:from|between|through|until|to)\b",
+        lowered,
+    ):
+        try:
+            range_start_date, range_end_date = (
+                date.fromisoformat(value) for value in explicit_date_matches
+            )
+        except ValueError:
+            return _calendar_plan("clarify")
+        if range_end_date < range_start_date:
+            return _calendar_plan("clarify")
+        range_start = _calendar_local_datetime(
+            range_start_date,
+            datetime_time.min,
+            timezone,
+        )
+        range_end = _calendar_local_datetime(
+            range_end_date + timedelta(days=1),
+            datetime_time.min,
+            timezone,
+        )
+        if range_start is None or range_end is None:
+            return _calendar_plan("clarify")
+        return _calendar_plan(
+            "list_calendar_events",
+            {
+                "time_min": range_start.isoformat(),
+                "time_max": range_end.isoformat(),
+                "time_zone": timezone,
+                "max_results": 100,
+            },
+        )
+
     explicit_availability = bool(re.search(
         r"\b(?:free|available|availability|freebusy)\b",
         lowered,
@@ -426,8 +486,6 @@ def _deterministic_calendar_plan(
             r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b",
             clock_text,
         ))
-        if not date_match and not explicit_date_match:
-            return _calendar_plan("clarify")
         if not clock_matches or len(clock_matches) > 2:
             return _calendar_plan("clarify")
 
@@ -469,6 +527,32 @@ def _deterministic_calendar_plan(
                 "time_max": end.isoformat(),
                 "time_zone": timezone,
                 "calendar_ids": ["primary"],
+            },
+        )
+
+    if (
+        re.search(r"\b(?:this\s+)?afternoon\b", lowered)
+        and re.search(r"\b(?:meetings?|events?|calendar|schedule)\b", lowered)
+    ):
+        start = _calendar_local_datetime(
+            target_date,
+            datetime_time(12, 0),
+            timezone,
+        )
+        end = _calendar_local_datetime(
+            target_date,
+            datetime_time(17, 0),
+            timezone,
+        )
+        if start is None or end is None:
+            return _calendar_plan("clarify")
+        return _calendar_plan(
+            "list_calendar_events",
+            {
+                "time_min": start.isoformat(),
+                "time_max": end.isoformat(),
+                "time_zone": timezone,
+                "max_results": 100,
             },
         )
 
@@ -530,6 +614,23 @@ def _deterministic_calendar_plan(
                 "query": next_person_match.group(1).strip(),
                 "time_zone": timezone,
                 "max_results": 1,
+            },
+        )
+
+    title_match = re.search(
+        r"\b(?:find|search|show|list|get)\b.{0,30}"
+        r"\b(?:my\s+)?(?:calendar\s+)?(?:meeting|event)s?\s+"
+        r"(?:called|titled|named|about|with)\s+(.+?)[?.!]*$",
+        text,
+        re.IGNORECASE,
+    )
+    if title_match and title_match.group(1).strip():
+        return _calendar_plan(
+            "list_calendar_events",
+            {
+                "query": title_match.group(1).strip()[:500],
+                "time_zone": timezone,
+                "max_results": 10,
             },
         )
 
@@ -744,6 +845,14 @@ def _deterministic_assistant_plan(
         )
     )
     if (
+        _is_calendar_request(state["user_message"])
+        and not (
+            _calendar_create_request(state["user_message"])
+            and calendar_capabilities.get("write_execution_available")
+        )
+    ):
+        return _calendar_plan("clarify")
+    if (
         _calendar_create_request(state["user_message"])
         and calendar_capabilities.get("write_execution_available")
     ):
@@ -922,7 +1031,7 @@ def _requires_intent_planning(user_message: str) -> bool:
 def _is_calendar_request(user_message: str) -> bool:
     lowered = user_message.casefold()
     asks_calendar = bool(re.search(
-        r"\b(?:calendar|meetings?|events?|appointments?)\b",
+        r"\b(?:calendar|meetings?|events?|appointments?|schedule)\b",
         lowered,
     ))
     has_action = bool(re.search(
@@ -1121,6 +1230,19 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
                 if _calendar_fallback(state) is not None
                 else "gmail"
             ),
+        }
+
+    if _is_calendar_request(state["user_message"]) and (
+        plan.intent != "google_calendar"
+    ):
+        return {
+            "gmail_plan": IntegrationPlan(
+                intent="google_calendar",
+                calendar_tool="clarify",
+            ).model_dump(mode="json"),
+            "assistant_route": "google_calendar",
+            "provider": response.provider,
+            "model": response.model,
         }
 
     return {

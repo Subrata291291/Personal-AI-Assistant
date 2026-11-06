@@ -165,6 +165,7 @@ def create_calendar_tools(
     user_id: UUID | str,
     connection_id: UUID | str,
     freebusy_connection_id: UUID | str | None = None,
+    request_time: datetime | str | None = None,
     include_event_tools: bool = True,
     include_freebusy_tool: bool = True,
     db_factory: Callable[[], Session] | None = None,
@@ -182,6 +183,28 @@ def create_calendar_tools(
         str(freebusy_connection_id or connection_id)
     )
     make_db = db_factory or SessionLocal
+    captured_request_time: datetime | None = None
+    if isinstance(request_time, datetime):
+        captured_request_time = request_time
+    elif isinstance(request_time, str):
+        try:
+            captured_request_time = datetime.fromisoformat(
+                request_time[:-1] + "+00:00"
+                if request_time.endswith("Z")
+                else request_time
+            )
+        except ValueError as exc:
+            raise ValueError("Invalid Calendar request_time.") from exc
+    elif request_time is not None:
+        raise ValueError("Invalid Calendar request_time.")
+    if (
+        captured_request_time is not None
+        and (
+            captured_request_time.tzinfo is None
+            or captured_request_time.utcoffset() is None
+        )
+    ):
+        raise ValueError("Calendar request_time must include a UTC offset.")
 
     async def execute(
         method_name: str,
@@ -212,6 +235,8 @@ def create_calendar_tools(
         return await execute("get_event", arguments)
 
     async def get_today_schedule(**arguments: Any) -> str:
+        if captured_request_time is not None:
+            arguments["request_time"] = captured_request_time
         return await execute("get_today_schedule", arguments)
 
     async def get_calendar_schedule(**arguments: Any) -> str:

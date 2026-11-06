@@ -83,6 +83,7 @@ function configureDraftApproval(executeOperation) {
       provider: 'google',
       status: 'connected',
       email: 'user@example.com',
+      capabilities: { gmail: true },
     }],
   })
   api.post.mockImplementation((url) => {
@@ -153,6 +154,7 @@ describe('Gmail archive flow', () => {
         provider: 'google',
         status: 'connected',
         email: 'user@example.com',
+        capabilities: { gmail: true },
       }],
     })
     api.post.mockResolvedValue({ authorization_url: 'https://accounts.google.com/' })
@@ -767,6 +769,7 @@ describe('Gmail archive flow', () => {
           provider: 'google',
           status: 'connected',
           email: 'user@example.com',
+          capabilities: { gmail: true },
         }],
       }
     })
@@ -864,6 +867,7 @@ describe('Gmail archive flow', () => {
           provider: 'google',
           status: 'connected',
           email: 'user@example.com',
+          capabilities: { gmail: true },
         }],
       }
     })
@@ -929,6 +933,7 @@ describe('Gmail archive flow', () => {
           provider: 'google',
           status: 'connected',
           email: 'user@example.com',
+          capabilities: { gmail: true },
         }],
       }
     })
@@ -1094,6 +1099,7 @@ describe('Gmail archive flow', () => {
             provider: 'google',
             status: 'connected',
             email: 'user@example.com',
+            capabilities: { gmail: true },
           }],
     }))
     gmailService.getMessages.mockImplementation(async () => {

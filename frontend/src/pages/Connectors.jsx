@@ -136,9 +136,9 @@ function Connectors() {
   )
   const calendarCapabilities =
     connectionsQuery.data?.calendar_capabilities || {}
-  const isCalendarApiComplete = calendarCapabilities.api_complete === true
+  const isCalendarEventReadAvailable = calendarCapabilities.events_read === true
   const calendarNeedsConsent =
-    calendarCapabilities.permissions_need_consent === true
+    calendarCapabilities.connected === true && !isCalendarEventReadAvailable
   const configuredDefaultConnectionId =
     user?.user_metadata?.default_calendar_connection_id
   const isGmailConnected = gmailConnections.length > 0
@@ -437,9 +437,9 @@ function Connectors() {
             {
               id: 'calendar',
               name: 'Google Calendar',
-              description: 'Use read-only Calendar event search, schedules, event details, and optional free/busy checks in chat.',
+              description: 'Use read-only Calendar event search, schedules, event details, and optional free/busy checks.',
               available: true,
-              connected: isCalendarApiComplete,
+              connected: isCalendarEventReadAvailable,
               partial: calendarNeedsConsent,
               enabled: user?.user_metadata?.calendar_enabled !== false,
             },

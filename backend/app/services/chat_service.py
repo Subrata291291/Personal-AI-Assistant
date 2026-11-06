@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from threading import Event, Thread
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -390,6 +391,7 @@ class ChatService:
             ZoneInfo(user_timezone)
         except (ValueError, KeyError) as exc:
             raise ValueError("A valid IANA timezone is required.") from exc
+        request_time = datetime.now(timezone.utc)
 
         # 1. Verify conversation ownership.
         if not self.message_service.verify_conversation_ownership(
@@ -687,6 +689,7 @@ class ChatService:
                 "model": "",
                 "messages": previous_messages,
                 "user_timezone": user_timezone,
+                "request_time": request_time.isoformat(),
                 "assistant_capabilities": assistant_capabilities,
             }
             if available_gmail_sources:
@@ -728,6 +731,7 @@ class ChatService:
                         ),
                         "gmail_enabled": gmail_enabled,
                         "user_timezone": user_timezone,
+                        "request_time": request_time.isoformat(),
                         "calendar_event_connection_id": (
                             event_read_connection_id
                         ),

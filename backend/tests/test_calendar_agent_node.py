@@ -94,6 +94,90 @@ def test_event_tool_uses_server_selected_identity_and_renders_grounded_result(
     assert "access token" not in result["assistant_response"].casefold()
 
 
+def test_calendar_tool_receives_authenticated_account_and_request_time(monkeypatch):
+    tool = FakeTool("get_today_schedule", {
+        "ok": True,
+        "data": {"events": []},
+    })
+    factory = Mock(return_value=[tool])
+    monkeypatch.setattr(calendar_agent_node, "create_calendar_tools", factory)
+    request_time = "2026-11-06T18:45:00+00:00"
+
+    run_node(
+        _state("get_today_schedule", {"time_zone": "Asia/Kolkata"}),
+        _runtime(
+            user_id=USER_ID,
+            request_time=request_time,
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+
+    factory.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=EVENT_CONNECTION_ID,
+        freebusy_connection_id=None,
+        include_event_tools=True,
+        include_freebusy_tool=False,
+        request_time=request_time,
+    )
+
+
+def test_provider_failure_and_malformed_result_never_render_history_as_events(
+    monkeypatch,
+):
+    stale_title = "Old product launch meeting"
+    failed_tool = FakeTool("list_calendar_events", {
+        "ok": False,
+        "error": {
+            "code": "calendar_temporarily_unavailable",
+            "message": "Google Calendar is temporarily unavailable.",
+        },
+    })
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "create_calendar_tools",
+        Mock(return_value=[failed_tool]),
+    )
+    state = _state("list_calendar_events", {})
+    state["messages"] = [
+        {"role": "assistant", "content": stale_title},
+    ]
+    failed = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+    assert "temporarily unavailable" in failed["assistant_response"]
+    assert stale_title not in failed["assistant_response"]
+
+    malformed_tool = FakeTool("list_calendar_events", {
+        "ok": True,
+        "data": {"events": [{"summary": stale_title}]},
+    })
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "create_calendar_tools",
+        Mock(return_value=[malformed_tool]),
+    )
+    malformed = run_node(
+        _state("list_calendar_events", {}),
+        _runtime(
+            user_id=USER_ID,
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+    assert "malformed event data" in malformed["assistant_response"]
+    assert stale_title not in malformed["assistant_response"]
+
+
 def test_freebusy_tool_uses_its_own_granted_connection(monkeypatch):
     tool = FakeTool("check_calendar_availability", {
         "ok": True,
@@ -294,7 +378,7 @@ def test_chat_graph_routes_upcoming_events_to_calendar_tool(monkeypatch):
         },
     )
 
-    assert "didn’t find any matching Calendar events" in (
+    assert "returned no matching events" in (
         result["assistant_response"]
     )
     factory.assert_called_once()
