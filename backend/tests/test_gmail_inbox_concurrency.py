@@ -1,9 +1,15 @@
 import asyncio
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
+import httpx
 import pytest
 
+from app.integrations.google.api_client import (
+    GmailReadContext,
+    GoogleAPIClient,
+)
 from app.integrations.google.exceptions import GoogleAPIError
 from app.services.gmail_service import GmailService
 
@@ -27,13 +33,32 @@ def _metadata(message_id):
 
 
 def _prepare_service(service, monkeypatch, google_get):
+    client = object()
+    read_context = GmailReadContext(
+        user_id=uuid4(),
+        connection_id=uuid4(),
+        access_token="test-access-token",
+    )
+    session_count = 0
+
     @asynccontextmanager
     async def fake_api_session():
-        yield object()
+        nonlocal session_count
+        session_count += 1
+        yield client
+
+    async def fake_read_context(*_args):
+        return read_context
 
     monkeypatch.setattr(service, "_validate_connection", lambda *_args: None)
+    monkeypatch.setattr(
+        service,
+        "_create_gmail_read_context",
+        fake_read_context,
+    )
     monkeypatch.setattr(service, "_google_get", google_get)
-    monkeypatch.setattr(service.api_client, "session", fake_api_session)
+    monkeypatch.setattr(service.api_client, "gmail_session", fake_api_session)
+    return client, read_context, lambda: session_count
 
 
 def test_inbox_metadata_is_ordered_and_keeps_required_fields(monkeypatch):
@@ -53,7 +78,11 @@ def test_inbox_metadata_is_ordered_and_keeps_required_fields(monkeypatch):
             }
         return _metadata(kwargs["endpoint"].split("/", 1)[1])
 
-    _prepare_service(service, monkeypatch, fake_google_get)
+    client, read_context, session_count = _prepare_service(
+        service,
+        monkeypatch,
+        fake_google_get,
+    )
     result = asyncio.run(service.list_messages(
         user_id=uuid4(),
         connection_id=uuid4(),
@@ -89,6 +118,14 @@ def test_inbox_metadata_is_ordered_and_keeps_required_fields(monkeypatch):
         "Subject",
         "Date",
     ]
+    assert requests[1]["allow_concurrent_read"] is True
+    assert requests[0]["read_context"] is read_context
+    assert all(
+        request["read_context"] is read_context
+        and request["http_client"] is client
+        for request in requests
+    )
+    assert session_count() == 1
 
 
 def test_metadata_failure_still_propagates(monkeypatch):
@@ -116,9 +153,11 @@ def test_metadata_failure_still_propagates(monkeypatch):
         ))
 
 
-def test_inbox_metadata_concurrency_is_one_per_request(monkeypatch):
+def test_inbox_metadata_concurrency_is_bounded_and_preserves_order(
+    monkeypatch,
+):
     service = GmailService(db=None)
-    first_started = asyncio.Event()
+    limit_reached = asyncio.Event()
     release = asyncio.Event()
     active = 0
     maximum_active = 0
@@ -128,16 +167,19 @@ def test_inbox_metadata_concurrency_is_one_per_request(monkeypatch):
         if kwargs["endpoint"] == "messages":
             return {
                 "messages": [
-                    {"id": "message-1", "threadId": "thread-1"},
-                    {"id": "message-2", "threadId": "thread-2"},
-                    {"id": "message-3", "threadId": "thread-3"},
+                    {
+                        "id": f"message-{index}",
+                        "threadId": f"thread-{index}",
+                    }
+                    for index in range(1, 8)
                 ],
-                "resultSizeEstimate": 3,
+                "resultSizeEstimate": 7,
             }
 
         active += 1
         maximum_active = max(maximum_active, active)
-        first_started.set()
+        if active == service.MAX_CONCURRENT_LIST_METADATA_READS:
+            limit_reached.set()
         try:
             await release.wait()
             return _metadata(kwargs["endpoint"].split("/", 1)[1])
@@ -150,15 +192,18 @@ def test_inbox_metadata_concurrency_is_one_per_request(monkeypatch):
         task = asyncio.create_task(service.list_messages(
             user_id=uuid4(),
             connection_id=uuid4(),
-            max_results=3,
+            max_results=7,
         ))
-        await first_started.wait()
-        assert maximum_active == 1
+        await asyncio.wait_for(limit_reached.wait(), timeout=1)
+        assert maximum_active == service.MAX_CONCURRENT_LIST_METADATA_READS
         release.set()
-        await task
+        return await task
 
-    asyncio.run(run_test())
-    assert maximum_active == 1
+    result = asyncio.run(run_test())
+    assert maximum_active == service.MAX_CONCURRENT_LIST_METADATA_READS
+    assert [item["id"] for item in result["messages"]] == [
+        f"message-{index}" for index in range(1, 8)
+    ]
 
 
 def test_independent_inbox_requests_have_independent_semaphores(monkeypatch):
@@ -309,3 +354,88 @@ def test_gmail_list_provider_error_propagates(monkeypatch):
         ))
 
     assert error.value is failure
+
+
+def test_gmail_list_timeout_becomes_retryable_service_error(monkeypatch):
+    service = GmailService(db=None)
+    assert service.LIST_MESSAGES_TIMEOUT < 30
+    service.LIST_MESSAGES_TIMEOUT = 0.01
+
+    async def stalled_google_get(**_kwargs):
+        await asyncio.Future()
+
+    _prepare_service(service, monkeypatch, stalled_google_get)
+
+    with pytest.raises(GoogleAPIError) as error:
+        asyncio.run(service.list_messages(
+            user_id=uuid4(),
+            connection_id=uuid4(),
+        ))
+
+    assert error.value.status_code == 503
+    assert error.value.retryable is True
+    assert error.value.message == "Gmail message list request timed out."
+
+
+def test_gmail_network_errors_stop_at_the_configured_retry_limit(monkeypatch):
+    client = GoogleAPIClient()
+    request = httpx.Request(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+    )
+    failure = httpx.ConnectError("connection failed", request=request)
+    http_client = Mock()
+    http_client.request = AsyncMock(
+        side_effect=[failure, failure],
+    )
+
+    async def no_wait(_delay):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_wait)
+
+    with pytest.raises(GoogleAPIError) as error:
+        asyncio.run(
+            client._send_request(
+                client=http_client,
+                method="GET",
+                url=str(request.url),
+                headers={},
+                params=None,
+                json_data=None,
+                max_retries=1,
+            )
+        )
+
+    assert error.value.status_code == 503
+    assert error.value.retryable is True
+    assert http_client.request.await_count == 2
+
+
+def test_gmail_request_uses_httpx_trace_extension_with_mock_transport():
+    client = GoogleAPIClient()
+
+    async def run_request():
+        async def handler(_request):
+            trace = _request.extensions["trace"]
+            await trace("connection.connect_tcp.started", {})
+            await trace("connection.connect_tcp.complete", {})
+            return httpx.Response(200, json={"messages": []})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as http_client:
+            return await client._send_request(
+                client=http_client,
+                method="GET",
+                url=(
+                    "https://gmail.googleapis.com/gmail/v1/users/me/"
+                    "messages"
+                ),
+                headers={},
+                params=None,
+                json_data=None,
+                max_retries=1,
+            )
+
+    assert asyncio.run(run_request()) == {"messages": []}

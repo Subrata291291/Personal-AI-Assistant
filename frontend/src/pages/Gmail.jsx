@@ -958,6 +958,7 @@ export default function Gmail() {
 
     refetchOnMount: true,
     refetchOnWindowFocus: true,
+    retry: false,
   })
 
   const messages = useMemo(

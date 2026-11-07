@@ -124,10 +124,10 @@ function GmailLayout() {
   )
 }
 
-function renderGmail() {
+function renderGmail(queryDefaults = {}) {
   const queryClient = new QueryClient({
     defaultOptions: {
-      queries: { retry: false, gcTime: 0 },
+      queries: { retry: false, gcTime: 0, ...queryDefaults },
       mutations: { retry: false },
     },
   })
@@ -324,6 +324,16 @@ describe('Gmail archive flow', () => {
       'Gmail returned an invalid message list response.',
     )).toBeInTheDocument()
     expect(screen.queryByText('No messages found')).not.toBeInTheDocument()
+  })
+
+  it('does not automatically repeat failed inbox requests', async () => {
+    const error = new Error('Gmail service is temporarily unavailable.')
+    error.status = 503
+    gmailService.getMessages.mockRejectedValue(error)
+    renderGmail({ retry: 1, retryDelay: 0 })
+
+    expect(await screen.findByText(error.message)).toBeInTheDocument()
+    expect(gmailService.getMessages).toHaveBeenCalledTimes(1)
   })
 
   it('preserves selected folder and search query when loading a page', async () => {

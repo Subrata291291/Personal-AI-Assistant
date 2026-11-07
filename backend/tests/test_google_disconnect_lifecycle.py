@@ -6,7 +6,10 @@ from uuid import uuid4
 
 import pytest
 
-from app.integrations.google.api_client import GoogleAPIClient
+from app.integrations.google.api_client import (
+    GmailReadContext,
+    GoogleAPIClient,
+)
 from app.integrations.google.exceptions import (
     GoogleAPIError,
     GoogleOAuthAuthorizationError,
@@ -106,6 +109,252 @@ def test_disconnected_connection_rejects_google_request_before_transmission(
         )
 
     http_client.request.assert_not_awaited()
+
+
+def test_concurrent_google_read_checks_owned_connection_without_row_lock(
+    monkeypatch,
+):
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(
+        return_value="cached-token",
+    )
+    connection_repository = Mock()
+    connection_repository.get_active_google_connection.return_value = (
+        SimpleNamespace(id=CONNECTION_ID)
+    )
+    credential_repository = Mock()
+    credential_repository.get_by_connection.return_value = SimpleNamespace(
+        connection_id=CONNECTION_ID,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.UserConnectionRepository",
+        lambda _db: connection_repository,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialRepository",
+        lambda _db: credential_repository,
+    )
+    client = GoogleAPIClient()
+    client._send_request = AsyncMock(return_value={"messages": []})
+
+    result = asyncio.run(
+        client.request(
+            db=Mock(),
+            user_id=str(USER_ID),
+            connection_id=str(CONNECTION_ID),
+            method="GET",
+            url="https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            http_client=Mock(),
+            allow_concurrent_read=True,
+        )
+    )
+
+    assert result == {"messages": []}
+    connection_repository.get_active_google_connection.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    connection_repository.get_active_google_connection_for_update.assert_not_called()
+    credential_repository.get_by_connection.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    client._send_request.assert_awaited_once()
+
+
+def test_concurrent_google_read_rejects_disconnected_connection(
+    monkeypatch,
+):
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(
+        return_value="cached-token",
+    )
+    connection_repository = Mock()
+    connection_repository.get_active_google_connection.return_value = None
+    credential_repository = Mock()
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.UserConnectionRepository",
+        lambda _db: connection_repository,
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialRepository",
+        lambda _db: credential_repository,
+    )
+    http_client = Mock()
+    http_client.request = AsyncMock()
+
+    with pytest.raises(ValueError, match="Connected Google account"):
+        asyncio.run(
+            GoogleAPIClient().request(
+                db=Mock(),
+                user_id=str(USER_ID),
+                connection_id=str(CONNECTION_ID),
+                method="GET",
+                url="https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                http_client=http_client,
+                allow_concurrent_read=True,
+            )
+        )
+
+    connection_repository.get_active_google_connection.assert_called_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    credential_repository.get_by_connection.assert_not_called()
+    http_client.request.assert_not_awaited()
+
+
+def test_gmail_read_context_avoids_repeated_credential_lookups(monkeypatch):
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(
+        return_value="cached-token",
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    db = Mock()
+    http_client = Mock()
+    client = GoogleAPIClient()
+    client._send_request = AsyncMock(return_value={"messages": []})
+    context = GmailReadContext(USER_ID, CONNECTION_ID, "cached-token")
+
+    result = asyncio.run(
+        client.request(
+            db=db,
+            user_id=str(USER_ID),
+            connection_id=str(CONNECTION_ID),
+            method="GET",
+            url="https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            http_client=http_client,
+            read_context=context,
+        )
+    )
+
+    assert result == {"messages": []}
+    token_service.get_valid_access_token.assert_not_awaited()
+    db.scalar.assert_not_called()
+    db.commit.assert_not_called()
+    client._send_request.assert_awaited_once()
+
+
+def test_gmail_read_context_is_created_from_owned_connection(monkeypatch):
+    token_service = Mock()
+    token_service.get_valid_access_token = AsyncMock(
+        return_value="request-token",
+    )
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: token_service,
+    )
+    db = Mock()
+
+    context = asyncio.run(
+        GoogleAPIClient().create_gmail_read_context(
+            db=db,
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+        )
+    )
+
+    assert context.user_id == USER_ID
+    assert context.connection_id == CONNECTION_ID
+    assert context.access_token == "request-token"
+    token_service.get_valid_access_token.assert_awaited_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    db.commit.assert_called_once()
+
+
+def test_gmail_read_context_cannot_be_used_for_another_connection():
+    context = GmailReadContext(USER_ID, CONNECTION_ID, "cached-token")
+    client = GoogleAPIClient()
+    http_client = Mock()
+    http_client.request = AsyncMock()
+
+    with pytest.raises(ValueError, match="read context"):
+        asyncio.run(
+            client.request(
+                db=Mock(),
+                user_id=str(USER_ID),
+                connection_id=str(uuid4()),
+                method="GET",
+                url="https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                http_client=http_client,
+                read_context=context,
+            )
+        )
+
+    http_client.request.assert_not_awaited()
+
+
+def test_concurrent_gmail_401s_reuse_one_refreshed_token(monkeypatch):
+    context = GmailReadContext(USER_ID, CONNECTION_ID, "old-token")
+    refresh = AsyncMock(return_value="new-token")
+    monkeypatch.setattr(
+        "app.integrations.google.api_client.OAuthCredentialService",
+        lambda _db: SimpleNamespace(get_valid_access_token=refresh),
+    )
+    dbs = [Mock(), Mock()]
+    client = GoogleAPIClient()
+    initial_requests = 0
+    both_initial_requests = asyncio.Event()
+    sent_tokens = []
+
+    async def fake_send_request(**kwargs):
+        nonlocal initial_requests
+        token = kwargs["headers"]["Authorization"]
+        sent_tokens.append(token)
+        if token.endswith("old-token"):
+            initial_requests += 1
+            if initial_requests == 2:
+                both_initial_requests.set()
+            await both_initial_requests.wait()
+            raise GoogleAPIError(401, "Google API request was rejected.")
+        return {"messages": []}
+
+    client._send_request = fake_send_request
+
+    async def run_requests():
+        return await asyncio.gather(
+            *(
+                client.request(
+                    db=db,
+                    user_id=str(USER_ID),
+                    connection_id=str(CONNECTION_ID),
+                    method="GET",
+                    url=(
+                        "https://gmail.googleapis.com/gmail/v1/users/me/"
+                        "messages"
+                    ),
+                    http_client=Mock(),
+                    read_context=context,
+                )
+                for db in dbs
+            )
+        )
+
+    results = asyncio.run(run_requests())
+
+    assert results == [{"messages": []}, {"messages": []}]
+    refresh.assert_awaited_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        rejected_access_token="old-token",
+    )
+    assert context.access_token == "new-token"
+    assert sent_tokens.count("Bearer old-token") == 2
+    assert sent_tokens.count("Bearer new-token") == 2
+    assert sum(db.commit.call_count for db in dbs) == 1
 
 
 def test_revoked_google_refresh_marks_connection_disconnected(

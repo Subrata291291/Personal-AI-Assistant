@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit
@@ -26,6 +27,17 @@ from app.services.oauth_credential_service import OAuthCredentialService
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GmailReadContext:
+    user_id: UUID
+    connection_id: UUID
+    access_token: str = field(repr=False)
+    refresh_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        repr=False,
+    )
 
 
 class GoogleAPIClient:
@@ -61,10 +73,52 @@ class GoogleAPIClient:
     def __init__(self):
         self.timeout = self.REQUEST_TIMEOUT
 
+    async def create_gmail_read_context(
+        self,
+        db: Session,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> GmailReadContext:
+        credential_service = OAuthCredentialService(db)
+        try:
+            access_token = await credential_service.get_valid_access_token(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            db.commit()
+        except GoogleOAuthAuthorizationError as exc:
+            self._clear_revoked_connection_credentials(
+                db,
+                user_id,
+                connection_id,
+            )
+            raise exc
+        except Exception:
+            db.rollback()
+            raise
+
+        return GmailReadContext(
+            user_id=user_id,
+            connection_id=connection_id,
+            access_token=access_token,
+        )
+
     @asynccontextmanager
     async def session(self):
         async with httpx.AsyncClient(
             timeout=self.timeout,
+            follow_redirects=False,
+        ) as client:
+            yield client
+
+    @asynccontextmanager
+    async def gmail_session(self):
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+            ),
             follow_redirects=False,
         ) as client:
             yield client
@@ -117,14 +171,22 @@ class GoogleAPIClient:
         db: Session,
         user_id: UUID,
         connection_id: UUID,
+        serialize: bool = True,
     ):
-        """Serialize provider requests with disconnect and verify credentials."""
-        connection = (
-            UserConnectionRepository(db).get_active_google_connection_for_update(
+        """Verify connection ownership and optionally serialize provider I/O."""
+        connection_repository = UserConnectionRepository(db)
+        if serialize:
+            connection = (
+                connection_repository.get_active_google_connection_for_update(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                )
+            )
+        else:
+            connection = connection_repository.get_active_google_connection(
                 user_id=user_id,
                 connection_id=connection_id,
             )
-        )
         if connection is None:
             db.rollback()
             raise ValueError("Connected Google account was not found.")
@@ -203,27 +265,69 @@ class GoogleAPIClient:
         headers: dict[str, str],
         params: dict[str, Any] | None,
         json_data: dict[str, Any] | None,
+        max_retries: int | None = None,
     ) -> dict[str, Any]:
 
-        for attempt in range(self.MAX_RETRIES + 1):
+        retry_limit = (
+            self.MAX_RETRIES
+            if max_retries is None
+            else max_retries
+        )
+        if not 0 <= retry_limit <= self.MAX_RETRIES:
+            raise ValueError("Invalid Google API retry limit.")
+
+        for attempt in range(retry_limit + 1):
 
             try:
                 started_at = perf_counter()
                 response = None
                 try:
+                    extensions: dict[str, Any] = {}
+                    if urlsplit(url).hostname == "gmail.googleapis.com":
+                        connect_started_at: float | None = None
+
+                        async def trace(event_name, _info):
+                            nonlocal connect_started_at
+                            if event_name == "connection.connect_tcp.started":
+                                connect_started_at = perf_counter()
+                            elif event_name in {
+                                "connection.connect_tcp.complete",
+                                "connection.connect_tcp.failed",
+                            } and connect_started_at is not None:
+                                connect_duration_ms = (
+                                    perf_counter() - connect_started_at
+                                ) * 1000
+                                record_timing(
+                                    "gmail_connection_acquisition",
+                                    connect_duration_ms,
+                                )
+                                logger.info(
+                                    "gmail_connection_acquisition | "
+                                    "request_id=%s | duration_ms=%.2f | "
+                                    "result=%s",
+                                    request_id(),
+                                    connect_duration_ms,
+                                    event_name.rsplit(".", 1)[-1],
+                                )
+                                connect_started_at = None
+
+                        extensions["trace"] = trace
+
                     response = await client.request(
                         method=method,
                         url=url,
                         headers=headers,
                         params=params,
                         json=json_data,
+                        extensions=extensions,
                     )
                 finally:
                     duration_ms = (perf_counter() - started_at) * 1000
                     record_timing("gmail_api", duration_ms)
                     logger.info(
                         "google_api_request_completed | request_id=%s "
-                        "| method=%s | duration_ms=%.2f | status=%s",
+                        "| method=%s | duration_ms=%.2f | status=%s "
+                        "| attempt=%s",
                         request_id(),
                         method,
                         duration_ms,
@@ -232,20 +336,47 @@ class GoogleAPIClient:
                             if response is not None
                             else "network_error"
                         ),
+                        attempt + 1,
                     )
+
+            except asyncio.CancelledError:
+                logger.warning(
+                    "google_api_request_cancelled | request_id=%s "
+                    "| method=%s | attempt=%s",
+                    request_id(),
+                    method,
+                    attempt + 1,
+                )
+                raise
 
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
 
                 if (
                     method not in {"GET", "PUT", "DELETE"}
-                    or attempt >= self.MAX_RETRIES
+                    or attempt >= retry_limit
                 ):
+                    logger.warning(
+                        "google_api_request_failed | request_id=%s "
+                        "| method=%s | attempts=%s | error_category=%s",
+                        request_id(),
+                        method,
+                        attempt + 1,
+                        type(exc).__name__,
+                    )
                     raise GoogleAPIError(
                         status_code=503,
                         message="Google API network request failed.",
                         retryable=method in {"GET", "PUT", "DELETE"},
                     ) from exc
 
+                logger.warning(
+                    "google_api_request_retry | request_id=%s "
+                    "| method=%s | retry=%s | error_category=%s",
+                    request_id(),
+                    method,
+                    attempt + 1,
+                    type(exc).__name__,
+                )
                 await asyncio.sleep(0.5 * (2 ** attempt))
                 continue
 
@@ -278,7 +409,7 @@ class GoogleAPIClient:
                 and method in {"GET", "PUT", "DELETE"}
             ):
 
-                if attempt < self.MAX_RETRIES:
+                if attempt < retry_limit:
                     retry_after = response.headers.get("Retry-After")
 
                     try:
@@ -288,6 +419,14 @@ class GoogleAPIClient:
                     except ValueError:
                         delay = 0.5 * (2 ** attempt)
 
+                    logger.warning(
+                        "google_api_request_retry | request_id=%s "
+                        "| method=%s | retry=%s | status=%s",
+                        request_id(),
+                        method,
+                        attempt + 1,
+                        status_code,
+                    )
                     await asyncio.sleep(min(max(delay, 0), 10))
                     continue
 
@@ -322,6 +461,9 @@ class GoogleAPIClient:
         params: dict[str, Any] | None = None,
         json_data: dict[str, Any] | None = None,
         http_client: httpx.AsyncClient | None = None,
+        allow_concurrent_read: bool = False,
+        read_context: GmailReadContext | None = None,
+        max_retries: int | None = None,
     ) -> dict[str, Any]:
 
         self._validate_url(url)
@@ -336,6 +478,82 @@ class GoogleAPIClient:
 
         if normalized_method not in self.ALLOWED_METHODS:
             raise ValueError("Unsupported HTTP method.")
+        if allow_concurrent_read and (
+            normalized_method != "GET"
+            or urlsplit(url).hostname != "gmail.googleapis.com"
+        ):
+            raise ValueError(
+                "Concurrent connection access is only allowed for Gmail reads."
+            )
+        if read_context is not None and (
+            normalized_method != "GET"
+            or urlsplit(url).hostname != "gmail.googleapis.com"
+            or read_context.user_id != normalized_user_id
+            or read_context.connection_id != normalized_connection_id
+        ):
+            raise ValueError(
+                "Gmail read context does not match this request."
+            )
+
+        if read_context is not None:
+            async with self._client_context(http_client) as client:
+                request_access_token = read_context.access_token
+                try:
+                    return await self._send_request(
+                        client=client,
+                        method=normalized_method,
+                        url=url,
+                        headers={
+                            "Authorization": (
+                                f"Bearer {request_access_token}"
+                            ),
+                            "Accept": "application/json",
+                        },
+                        params=params,
+                        json_data=json_data,
+                        max_retries=max_retries,
+                    )
+                except GoogleAPIError as exc:
+                    if exc.status_code != 401:
+                        raise
+
+                async with read_context.refresh_lock:
+                    if read_context.access_token == request_access_token:
+                        credential_service = OAuthCredentialService(db)
+                        try:
+                            read_context.access_token = (
+                                await credential_service.get_valid_access_token(
+                                    user_id=normalized_user_id,
+                                    connection_id=normalized_connection_id,
+                                    rejected_access_token=request_access_token,
+                                )
+                            )
+                            db.commit()
+                        except GoogleOAuthAuthorizationError as exc:
+                            self._clear_revoked_connection_credentials(
+                                db,
+                                normalized_user_id,
+                                normalized_connection_id,
+                            )
+                            raise exc
+                        except Exception:
+                            db.rollback()
+                            raise
+
+                    return await self._send_request(
+                        client=client,
+                        method=normalized_method,
+                        url=url,
+                        headers={
+                            "Authorization": (
+                                f"Bearer {read_context.access_token}"
+                            ),
+                            "Accept": "application/json",
+                        },
+                        params=params,
+                        json_data=json_data,
+                        max_retries=max_retries,
+                    )
 
         credential_service = OAuthCredentialService(db)
 
@@ -372,6 +590,7 @@ class GoogleAPIClient:
                     db,
                     normalized_user_id,
                     normalized_connection_id,
+                    serialize=not allow_concurrent_read,
                 ):
                     return await self._send_request(
                         client=client,
@@ -380,6 +599,7 @@ class GoogleAPIClient:
                         headers=headers,
                         params=params,
                         json_data=json_data,
+                        max_retries=max_retries,
                     )
             except GoogleAPIError as exc:
                 if exc.status_code != 401:
@@ -410,6 +630,7 @@ class GoogleAPIClient:
                     db,
                     normalized_user_id,
                     normalized_connection_id,
+                    serialize=not allow_concurrent_read,
                 ):
                     return await self._send_request(
                         client=client,
@@ -418,6 +639,7 @@ class GoogleAPIClient:
                         headers=headers,
                         params=params,
                         json_data=json_data,
+                        max_retries=max_retries,
                     )
 
     async def request_mutation(

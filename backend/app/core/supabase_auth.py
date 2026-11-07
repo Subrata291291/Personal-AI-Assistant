@@ -1,5 +1,8 @@
 
+import asyncio
 from datetime import datetime
+import logging
+from time import perf_counter
 from typing import Any
 from uuid import UUID
 
@@ -7,6 +10,10 @@ import httpx
 from fastapi import HTTPException, status
 
 from app.core.config import settings
+from app.core.request_metrics import record_timing, request_id
+
+
+logger = logging.getLogger(__name__)
 
 
 def _has_verified_email(user: dict[str, Any]) -> bool:
@@ -57,6 +64,9 @@ async def verify_supabase_token(token: str) -> dict[str, Any]:
         "Authorization": f"Bearer {token}",
     }
 
+    request_started_at = perf_counter()
+    request_result = "success"
+    error_category = None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
@@ -64,17 +74,43 @@ async def verify_supabase_token(token: str) -> dict[str, Any]:
                 headers=headers,
             )
 
+    except asyncio.CancelledError:
+        request_result = "cancelled"
+        error_category = "CancelledError"
+        raise
+
     except httpx.TimeoutException as exc:
+        request_result = "error"
+        error_category = type(exc).__name__
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Authentication service timed out.",
         ) from exc
 
     except httpx.RequestError as exc:
+        request_result = "error"
+        error_category = type(exc).__name__
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Authentication service is unavailable.",
         ) from exc
+    finally:
+        duration_ms = (perf_counter() - request_started_at) * 1000
+        record_timing("supabase_auth_http", duration_ms)
+        logger.info(
+            "supabase_auth_request_completed | request_id=%s "
+            "| duration_ms=%.2f | result=%s",
+            request_id(),
+            duration_ms,
+            request_result,
+        )
+        if error_category:
+            logger.warning(
+                "supabase_auth_request_failed | request_id=%s "
+                "| error_category=%s",
+                request_id(),
+                error_category,
+            )
 
     if response.status_code in (401, 403):
         raise HTTPException(

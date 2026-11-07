@@ -1,16 +1,19 @@
 
-from typing import Annotated, Any
+import asyncio
+import logging
 from time import perf_counter
+from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.supabase_auth import verify_supabase_token
-from app.core.request_metrics import record_timing
+from app.core.request_metrics import record_timing, request_id
 from app.integrations.supabase_client import create_user_supabase_client
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 async def get_current_user(
@@ -31,13 +34,35 @@ async def get_current_user(
         )
 
     auth_started_at = perf_counter()
+    auth_result = "success"
+    error_category = None
     try:
         user = await verify_supabase_token(credentials.credentials)
+    except asyncio.CancelledError:
+        auth_result = "cancelled"
+        error_category = "CancelledError"
+        raise
+    except Exception as exc:
+        auth_result = "error"
+        error_category = type(exc).__name__
+        raise
     finally:
-        record_timing(
-            "auth",
-            (perf_counter() - auth_started_at) * 1000,
+        duration_ms = (perf_counter() - auth_started_at) * 1000
+        record_timing("auth", duration_ms)
+        logger.info(
+            "authentication_completed | request_id=%s "
+            "| duration_ms=%.2f | result=%s",
+            request_id(),
+            duration_ms,
+            auth_result,
         )
+        if error_category:
+            logger.warning(
+                "authentication_failed | request_id=%s "
+                "| error_category=%s",
+                request_id(),
+                error_category,
+            )
 
     # Preserve the verified access token for request-scoped use.
     user["access_token"] = credentials.credentials

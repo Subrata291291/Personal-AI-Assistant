@@ -1,16 +1,22 @@
 import json
+import logging
 import re
 import asyncio
 from datetime import datetime, timezone
 from email.utils import getaddresses
 from email.utils import formataddr
+from time import perf_counter
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
-from app.integrations.google.api_client import GoogleAPIClient
+from app.core.request_metrics import record_timing, request_id
+from app.integrations.google.api_client import (
+    GmailReadContext,
+    GoogleAPIClient,
+)
 from app.integrations.google.email_parser import GmailEmailParser
 from app.integrations.google.exceptions import GoogleAPIError
 from app.repositories.oauth_credential_repository import (
@@ -26,6 +32,9 @@ from app.integrations.google.attachment_handler import (
     GmailAttachmentHandler,
 )
 from app.schemas.email_draft import EmailDraftPreview
+
+
+logger = logging.getLogger(__name__)
 
 
 def _gmail_payload_has_attachments(payload: Any) -> bool:
@@ -111,6 +120,8 @@ class GmailService:
 
     MAX_LIST_RESULTS = 50
     MAX_CONCURRENT_READS = 1
+    MAX_CONCURRENT_LIST_METADATA_READS = 5
+    LIST_MESSAGES_TIMEOUT = 25.0
     MAX_THREAD_MESSAGES = 10
     MAX_THREAD_RESPONSE_BYTES = 2_000_000
     MAX_THREAD_BODY_CHARS = 3_000
@@ -176,12 +187,19 @@ class GmailService:
         endpoint: str,
         params: dict[str, Any] | None = None,
         http_client: Any | None = None,
+        allow_concurrent_read: bool = False,
+        read_context: GmailReadContext | None = None,
     ) -> dict[str, Any]:
 
         # A dedicated session isolates OAuth token commits.
         api_db = SessionLocal()
 
         try:
+            started_at = perf_counter()
+            error_category = None
+            max_retries = None
+            if allow_concurrent_read:
+                max_retries = 1
             return await self.api_client.request(
                 db=api_db,
                 user_id=str(user_id),
@@ -190,6 +208,54 @@ class GmailService:
                 url=f"{self.GMAIL_API_BASE}/{endpoint}",
                 params=params,
                 http_client=http_client,
+                allow_concurrent_read=allow_concurrent_read,
+                read_context=read_context,
+                max_retries=max_retries,
+            )
+        except asyncio.CancelledError:
+            error_category = "CancelledError"
+            raise
+        except Exception as exc:
+            error_category = type(exc).__name__
+            raise
+        finally:
+            duration_ms = (perf_counter() - started_at) * 1000
+            stage = (
+                "gmail_message_metadata"
+                if endpoint.startswith("messages/")
+                else "gmail_api_call"
+            )
+            record_timing(stage, duration_ms)
+            logger.info(
+                "gmail_stage_completed | request_id=%s | stage=%s "
+                "| duration_ms=%.2f | result=%s",
+                request_id(),
+                stage,
+                duration_ms,
+                "error" if error_category else "success",
+            )
+            if error_category:
+                logger.warning(
+                    "gmail_stage_failed | request_id=%s | stage=%s "
+                    "| error_category=%s",
+                    request_id(),
+                    stage,
+                    error_category,
+                )
+            api_db.close()
+
+
+    async def _create_gmail_read_context(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> GmailReadContext:
+        api_db = SessionLocal()
+        try:
+            return await self.api_client.create_gmail_read_context(
+                db=api_db,
+                user_id=user_id,
+                connection_id=connection_id,
             )
         finally:
             api_db.close()
@@ -265,6 +331,60 @@ class GmailService:
         query: str | None = None,
         folder: str = "inbox",
     ) -> dict[str, Any]:
+        started_at = perf_counter()
+        error_category = None
+        try:
+            return await asyncio.wait_for(
+                self._list_messages(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    max_results=max_results,
+                    page_token=page_token,
+                    query=query,
+                    folder=folder,
+                ),
+                timeout=self.LIST_MESSAGES_TIMEOUT,
+            )
+        except asyncio.TimeoutError as exc:
+            error_category = "GmailListDeadline"
+            raise GoogleAPIError(
+                status_code=503,
+                message="Gmail message list request timed out.",
+                retryable=True,
+            ) from exc
+        except asyncio.CancelledError:
+            error_category = "CancelledError"
+            raise
+        except Exception as exc:
+            error_category = type(exc).__name__
+            raise
+        finally:
+            duration_ms = (perf_counter() - started_at) * 1000
+            record_timing("gmail_list", duration_ms)
+            logger.info(
+                "gmail_stage_completed | request_id=%s | stage=list "
+                "| duration_ms=%.2f | result=%s",
+                request_id(),
+                duration_ms,
+                "error" if error_category else "success",
+            )
+            if error_category:
+                logger.warning(
+                    "gmail_stage_failed | request_id=%s | stage=list "
+                    "| error_category=%s",
+                    request_id(),
+                    error_category,
+                )
+
+    async def _list_messages(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        max_results: int = 20,
+        page_token: str | None = None,
+        query: str | None = None,
+        folder: str = "inbox",
+    ) -> dict[str, Any]:
 
         if not 1 <= max_results <= self.MAX_LIST_RESULTS:
             raise ValueError(
@@ -290,6 +410,11 @@ class GmailService:
         if folder not in folder_queries:
             raise ValueError("Unsupported Gmail folder.")
 
+        read_context = await self._create_gmail_read_context(
+            user_id,
+            connection_id,
+        )
+
         folder_query = folder_queries[folder]
 
         if query and query.strip():
@@ -305,17 +430,9 @@ class GmailService:
         if page_token:
             params["pageToken"] = page_token
 
-        result = await self._google_get(
-            user_id=user_id,
-            connection_id=connection_id,
-            endpoint="messages",
-            params=params,
+        semaphore = asyncio.Semaphore(
+            self.MAX_CONCURRENT_LIST_METADATA_READS
         )
-
-        messages, next_page_token, result_size_estimate = (
-            _validate_gmail_message_list_response(result)
-        )
-        semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_READS)
 
         async def fetch_metadata(
             item: dict[str, Any],
@@ -337,6 +454,8 @@ class GmailService:
                         ],
                     },
                     http_client=http_client,
+                    allow_concurrent_read=True,
+                    read_context=read_context,
                 )
 
             headers = GmailEmailParser.extract_headers(
@@ -354,7 +473,21 @@ class GmailService:
                 "labels": metadata.get("labelIds", []),
             }
 
-        async with self.api_client.session() as http_client:
+        async with self.api_client.gmail_session() as http_client:
+            result = await self._google_get(
+                user_id=user_id,
+                connection_id=connection_id,
+                endpoint="messages",
+                params=params,
+                http_client=http_client,
+                allow_concurrent_read=True,
+                read_context=read_context,
+            )
+            (
+                messages,
+                next_page_token,
+                result_size_estimate,
+            ) = _validate_gmail_message_list_response(result)
             fetched = await asyncio.gather(
                 *(
                     fetch_metadata(item, http_client)
