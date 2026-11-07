@@ -3,6 +3,8 @@ from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from app.llm.schemas import LLMResponse
 from app.schemas.gmail_agent import (
     DraftEmailPlan,
@@ -77,6 +79,105 @@ def test_write_and_create_email_requests_classify_as_compose():
         )[0]
         assert plan["intent"] == "gmail_compose"
         assert plan["draft_type"] == "new"
+
+
+def test_pending_calendar_time_range_revision_preserves_event_details():
+    state = _state(
+        "Change it to 2 PM to 3:30 PM.",
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+        pending_calendar_create_proposal={
+            "proposal_id": "original-proposal",
+            "parameters": {
+                "calendar_id": "primary",
+                "summary": "Gym",
+                "description": "Training",
+                "start": "2026-11-08T10:00:00+05:30",
+                "end": "2026-11-08T11:00:00+05:30",
+                "time_zone": "Asia/Kolkata",
+                "location": "Fitness center",
+                "attendees": [],
+                "all_day": False,
+            },
+        },
+    )
+
+    plan, route = gmail_agent_nodes._deterministic_assistant_plan(state)
+
+    assert route == "google_calendar"
+    assert plan["calendar_tool"] == "create_calendar_event_proposal"
+    assert plan["supersedes_proposal_id"] == "original-proposal"
+    assert plan["calendar_arguments"] == {
+        "calendar_id": "primary",
+        "summary": "Gym",
+        "description": "Training",
+        "start": "2026-11-08T14:00:00+05:30",
+        "end": "2026-11-08T15:30:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "location": "Fitness center",
+        "attendees": [],
+        "all_day": False,
+    }
+
+
+def test_pending_calendar_single_endpoint_revision_keeps_other_time():
+    state = _state(
+        "Change the start time to 9 AM.",
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+        pending_calendar_create_proposal={
+            "proposal_id": "original-proposal",
+            "parameters": {
+                "calendar_id": "primary",
+                "summary": "Gym",
+                "description": None,
+                "start": "2026-11-08T10:00:00+05:30",
+                "end": "2026-11-08T11:00:00+05:30",
+                "time_zone": "Asia/Kolkata",
+                "location": None,
+                "attendees": [],
+                "all_day": False,
+            },
+        },
+    )
+
+    plan, route = gmail_agent_nodes._deterministic_assistant_plan(state)
+
+    assert route == "google_calendar"
+    assert plan["calendar_arguments"]["start"] == (
+        "2026-11-08T09:00:00+05:30"
+    )
+    assert plan["calendar_arguments"]["end"] == (
+        "2026-11-08T11:00:00+05:30"
+    )
+    assert plan["supersedes_proposal_id"] == "original-proposal"
+
+
+def test_pending_calendar_single_time_without_endpoint_clarifies():
+    state = _state(
+        "Change it to 9 AM.",
+        pending_calendar_create_proposal={
+            "proposal_id": "original-proposal",
+            "parameters": {
+                "calendar_id": "primary",
+                "summary": "Gym",
+                "description": None,
+                "start": "2026-11-08T10:00:00+05:30",
+                "end": "2026-11-08T11:00:00+05:30",
+                "time_zone": "Asia/Kolkata",
+                "location": None,
+                "attendees": [],
+                "all_day": False,
+            },
+        },
+    )
+
+    plan, route = gmail_agent_nodes._deterministic_assistant_plan(state)
+
+    assert route == "google_calendar"
+    assert plan["calendar_tool"] == "clarify"
 
 
 def test_explicit_draft_send_search_read_reply_archive_and_delete_intents():
@@ -235,10 +336,8 @@ def test_calendar_create_request_is_never_sent_to_gmail_or_claimed_successful():
 
     assert routed["assistant_route"] == "google_calendar"
     assert routed["gmail_plan"]["calendar_tool"] == "create_calendar_event_proposal"
-    assert response == (
-        "I can read your Google Calendar, but creating events is currently "
-        "unavailable. I haven't created or modified anything."
-    )
+    assert "write permission" in response.casefold()
+    assert "nothing was created" in response.casefold()
     assert "created successfully" not in response.casefold()
     assert "gmail_search" not in str(routed["gmail_plan"])
 
@@ -277,10 +376,8 @@ def test_calendar_create_intents_short_circuit_without_requesting_more_details()
         assert routed["gmail_plan"]["calendar_tool"] == (
             "create_calendar_event_proposal"
         )
-        assert result["assistant_response"] == (
-            "I can read your Google Calendar, but creating events is "
-            "currently unavailable. I haven't created or modified anything."
-        )
+        assert "write permission" in result["assistant_response"].casefold()
+        assert "nothing was created" in result["assistant_response"].casefold()
         assert "calendar_create_event_proposal" not in result
 
 
@@ -822,7 +919,49 @@ def test_calendar_changes_route_to_approval_proposals_never_read_operations():
         assert routed["gmail_plan"]["calendar_tool"] == expected_tool
 
 
-def test_calendar_create_reaches_llm_planner_only_with_write_capability(
+def test_calendar_update_with_write_permission_routes_through_planner_when_flag_off(
+    monkeypatch,
+):
+    response = LLMResponse(
+        content=json.dumps({
+            "intent": "google_calendar",
+            "calendar_tool": "update_calendar_event_proposal",
+            "calendar_arguments": {
+                "calendar_id": "primary",
+                "event_query": "gym session",
+                "changes": {"summary": "Gym session"},
+            },
+        }),
+        provider="test",
+        model="test-model",
+        latency_ms=0,
+        finish_reason="stop",
+    )
+    calls = []
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda request: calls.append(request) or response,
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Move my gym session to 5 PM.",
+        assistant_capabilities={
+            "google_calendar": {
+                "write_permission_granted": True,
+                "update_execution_available": False,
+            },
+        },
+    ))
+
+    assert len(calls) == 1
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "update_calendar_event_proposal"
+    )
+
+
+def test_calendar_create_without_complete_details_asks_for_clarification(
     monkeypatch,
 ):
     response = LLMResponse(
@@ -854,16 +993,269 @@ def test_calendar_create_reaches_llm_planner_only_with_write_capability(
         "Schedule a meeting with John tomorrow.",
         assistant_capabilities={
             "google_calendar": {
-                "write_execution_available": True,
+                "write_permission_granted": True,
+                "create_execution_available": False,
             },
         },
     ))
 
-    assert len(calls) == 1
+    assert calls == []
     assert routed["assistant_route"] == "google_calendar"
     assert routed["gmail_plan"]["calendar_tool"] == (
         "create_calendar_event_proposal"
     )
+    assert routed["gmail_plan"]["calendar_arguments"] is None
+
+
+def test_gym_event_creation_clarifies_missing_date_and_resolves_followup():
+    request_time = datetime(
+        2026, 11, 6, 14, 30, tzinfo=ZoneInfo("UTC")
+    )
+    capabilities = {
+        "google_calendar": {
+            "write_permission_granted": True,
+            "create_execution_available": False,
+            "write_execution_available": False,
+        },
+    }
+    initial = _state(
+        "add in my calendar gym timing morning 10am to 11am",
+        user_timezone="Asia/Kolkata",
+        request_time=request_time,
+        assistant_capabilities=capabilities,
+    )
+    initial_plan = gmail_agent_nodes.gmail_intent_router_node(initial)
+    assert initial_plan["assistant_route"] == "google_calendar"
+    assert initial_plan["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
+    assert initial_plan["gmail_plan"]["calendar_arguments"] is None
+
+    followup = _state(
+        "Tomorrow",
+        messages=[
+            {"role": "user", "content": initial["user_message"]},
+            {
+                "role": "assistant",
+                "content": (
+                    "What date should I schedule this event for, "
+                    "10am–11am?"
+                ),
+            },
+        ],
+        user_timezone="Asia/Kolkata",
+        request_time=request_time,
+        assistant_capabilities=capabilities,
+    )
+    followup_plan = gmail_agent_nodes.gmail_intent_router_node(followup)
+
+    assert followup_plan["assistant_route"] == "google_calendar"
+    assert followup_plan["gmail_plan"]["calendar_arguments"] == {
+        "calendar_id": "primary",
+        "summary": "Gym",
+        "description": None,
+        "start": "2026-11-07T10:00:00+05:30",
+        "end": "2026-11-07T11:00:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "location": None,
+        "attendees": [],
+        "all_day": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("input_text", "start", "end"),
+    [
+        (
+            "Add gym in my calendar from 10 AM to 11 AM tomorrow.",
+            "2026-11-08T10:00:00+05:30",
+            "2026-11-08T11:00:00+05:30",
+        ),
+        (
+            "Add gym in my calendar from 2 PM to 3:30 PM tomorrow.",
+            "2026-11-08T14:00:00+05:30",
+            "2026-11-08T15:30:00+05:30",
+        ),
+        (
+            "Add gym in my calendar from 14:00 to 15:00 tomorrow.",
+            "2026-11-08T14:00:00+05:30",
+            "2026-11-08T15:00:00+05:30",
+        ),
+    ],
+)
+def test_calendar_create_preserves_explicit_12_and_24_hour_times(
+    input_text,
+    start,
+    end,
+):
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        input_text,
+        user_timezone="Asia/Kolkata",
+        request_time=datetime(2026, 11, 7, 6, 0, tzinfo=ZoneInfo("UTC")),
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+    ))
+
+    parameters = routed["gmail_plan"]["calendar_arguments"]
+    assert parameters["summary"] == "Gym"
+    assert parameters["start"] == start
+    assert parameters["end"] == end
+    assert parameters["time_zone"] == "Asia/Kolkata"
+
+
+def test_calendar_create_time_change_followup_preserves_date_and_title():
+    history = [
+        {
+            "role": "user",
+            "content": "Add gym in my calendar from 10 AM to 11 AM",
+        },
+        {
+            "role": "assistant",
+            "content": "What date should I schedule this event for, 10 AM–11 AM?",
+        },
+        {
+            "role": "user",
+            "content": "Actually change it to 2 PM to 3:30 PM",
+        },
+        {
+            "role": "assistant",
+            "content": "What date should I schedule this event for, 2 PM–3:30 PM?",
+        },
+    ]
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Tomorrow",
+        messages=history,
+        user_timezone="Asia/Kolkata",
+        request_time=datetime(2026, 11, 7, 6, 0, tzinfo=ZoneInfo("UTC")),
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+    ))
+
+    parameters = routed["gmail_plan"]["calendar_arguments"]
+    assert parameters["summary"] == "Gym"
+    assert parameters["start"] == "2026-11-08T14:00:00+05:30"
+    assert parameters["end"] == "2026-11-08T15:30:00+05:30"
+    assert parameters["time_zone"] == "Asia/Kolkata"
+
+
+def test_calendar_create_single_time_followup_preserves_other_endpoint():
+    history = [
+        {
+            "role": "user",
+            "content": "Add gym in my calendar from 10 AM to 11 AM",
+        },
+        {
+            "role": "assistant",
+            "content": "What date should I schedule this event for, 10 AM–11 AM?",
+        },
+        {
+            "role": "user",
+            "content": "Change the end time to 12 PM",
+        },
+        {
+            "role": "assistant",
+            "content": "What date should I schedule this event for, 10 AM–12 PM?",
+        },
+    ]
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Tomorrow",
+        messages=history,
+        user_timezone="Asia/Kolkata",
+        request_time=datetime(2026, 11, 7, 6, 0, tzinfo=ZoneInfo("UTC")),
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+    ))
+
+    parameters = routed["gmail_plan"]["calendar_arguments"]
+    assert parameters["start"] == "2026-11-08T10:00:00+05:30"
+    assert parameters["end"] == "2026-11-08T12:00:00+05:30"
+
+
+def test_calendar_create_without_end_time_asks_for_clarification():
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Add gym in my calendar tomorrow at 10 AM.",
+        user_timezone="Asia/Kolkata",
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+    ))
+
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
+    assert routed["gmail_plan"]["calendar_arguments"] is None
+
+
+def test_calendar_create_requires_explicit_overnight_for_cross_midnight():
+    capabilities = {
+        "google_calendar": {"write_permission_granted": True},
+    }
+    ambiguous = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Add gym in my calendar from 10 PM to 2 AM tomorrow.",
+        user_timezone="Asia/Kolkata",
+        assistant_capabilities=capabilities,
+    ))
+    overnight = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Add gym in my calendar from 10 PM to 2 AM overnight tomorrow.",
+        user_timezone="Asia/Kolkata",
+        assistant_capabilities=capabilities,
+    ))
+
+    assert ambiguous["gmail_plan"]["calendar_tool"] == "clarify"
+    assert overnight["gmail_plan"]["calendar_arguments"]["start"] == (
+        "2026-11-08T22:00:00+05:30"
+    )
+    assert overnight["gmail_plan"]["calendar_arguments"]["end"] == (
+        "2026-11-09T02:00:00+05:30"
+    )
+
+
+def test_calendar_all_day_request_has_date_without_timed_values():
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Add gym in my calendar all day tomorrow.",
+        user_timezone="Asia/Kolkata",
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+    ))
+
+    parameters = routed["gmail_plan"]["calendar_arguments"]
+    assert parameters["all_day"] is True
+    assert parameters["start"] == "2026-11-08"
+    assert parameters["end"] == "2026-11-09"
+    assert parameters["time_zone"] is None
+
+
+def test_calendar_capability_response_reports_disabled_execution_flags():
+    state = _state(
+        "What can you do?",
+        assistant_capabilities={
+            "google_calendar": {
+                "connected": True,
+                "api_available": True,
+                "chat_available": True,
+                "events_read": True,
+                "freebusy": True,
+                "write_permission_granted": True,
+                "create_execution_available": False,
+                "update_execution_available": False,
+                "delete_execution_available": False,
+            },
+        },
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+    response = capabilities_node({**state, **routed})
+
+    assert routed["assistant_route"] == "capabilities"
+    assert "read-only event search" in response["assistant_response"]
+    assert "Calendar write permission is granted" in response["assistant_response"]
+    assert "create execution: disabled" in response["assistant_response"]
+    assert "update execution: disabled" in response["assistant_response"]
+    assert "delete execution: disabled" in response["assistant_response"]
 
 
 def test_gmail_and_general_requests_keep_existing_routing():

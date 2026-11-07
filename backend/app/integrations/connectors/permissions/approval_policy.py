@@ -18,6 +18,7 @@ class ApprovalPolicy:
         "send_email",
         "delete_email",
         "create_calendar_event",
+        "update_calendar_event",
         "delete_calendar_event",
     }
 

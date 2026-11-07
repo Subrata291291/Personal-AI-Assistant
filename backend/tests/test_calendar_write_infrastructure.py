@@ -715,6 +715,117 @@ def test_calendar_operation_is_inserted_with_proposal_in_one_transaction():
     assert connection.statements[3][1]["event_id"] == identity.event_id
 
 
+def test_calendar_proposal_retry_reuses_existing_pending_record():
+    now = datetime.now(timezone.utc).isoformat()
+    conversation_id = uuid4()
+    source_message_id = uuid4()
+    identity = build_calendar_operation_identity(
+        proposal_id=PROPOSAL_ID,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        action_type="calendar.create_event",
+        parameters=PARAMETERS,
+    )
+    approval = {
+        "proposal_id": str(PROPOSAL_ID),
+        "source_message_id": str(source_message_id),
+        "user_id": str(USER_ID),
+        "conversation_id": str(conversation_id),
+        "connection_id": str(CONNECTION_ID),
+        "action_type": "calendar.create_event",
+        "parameters": PARAMETERS,
+        "created_at": now,
+        "expires_at": now,
+        "status": "pending",
+        "integrity_schema_version": 1,
+        "payload_fingerprint": identity.payload_fingerprint,
+        "operation_id": str(identity.operation_id),
+        "calendar_event_id": identity.event_id,
+    }
+
+    class Result:
+        def __init__(self, value=None):
+            self.value = value
+
+        def mappings(self):
+            return self
+
+        def first(self):
+            return self.value
+
+    class Connection:
+        def __init__(self):
+            self.statements = []
+            self.proposal_row = None
+
+        def execute(self, statement, params):
+            self.statements.append((statement, params))
+            if statement is _LOCK_PROPOSAL_IDEMPOTENCY:
+                return Result()
+            if statement is _GET_PROPOSAL:
+                return Result(self.proposal_row)
+            if statement is _INSERT_PROPOSAL:
+                self.proposal_row = {
+                    "message_id": str(PROPOSAL_ID),
+                    "metadata": {"action_approval": approval},
+                }
+                return Result(self.proposal_row)
+            assert statement is _INSERT_CALENDAR_OPERATION
+            return Result()
+
+    connection = Connection()
+
+    class Transaction:
+        def __enter__(self):
+            return connection
+
+        def __exit__(self, *_args):
+            return False
+
+    class Engine:
+        def begin(self):
+            return Transaction()
+
+    repository = ActionApprovalRepository(database_engine=Engine())
+    arguments = {
+        "proposal_id": PROPOSAL_ID,
+        "user_id": USER_ID,
+        "conversation_id": conversation_id,
+        "source_message_id": source_message_id,
+        "action_type": "calendar.create_event",
+        "parameters": PARAMETERS,
+        "connection_id": CONNECTION_ID,
+        "account_email": "owner@example.com",
+        "expiration_minutes": 15,
+        "calendar_operation": {
+            "proposal_id": str(PROPOSAL_ID),
+            "operation_id": str(identity.operation_id),
+            "user_id": str(USER_ID),
+            "connection_id": str(CONNECTION_ID),
+            "idempotency_key": None,
+            "payload_fingerprint": identity.payload_fingerprint,
+            "action_type": "calendar.create_event",
+            "calendar_id": PARAMETERS["calendar_id"],
+            "event_id": identity.event_id,
+            "integrity_schema_version": 1,
+        },
+    }
+
+    first = repository.create_proposal(**arguments)
+    second = repository.create_proposal(**arguments)
+
+    assert first["proposal_id"] == second["proposal_id"] == PROPOSAL_ID
+    assert first["status"] == second["status"] == "pending"
+    assert sum(
+        statement is _INSERT_PROPOSAL
+        for statement, _params in connection.statements
+    ) == 1
+    assert sum(
+        statement is _INSERT_CALENDAR_OPERATION
+        for statement, _params in connection.statements
+    ) == 1
+
+
 def _create_event_parameters(**overrides):
     values = {
         "calendar_id": "primary",
@@ -741,6 +852,16 @@ def test_calendar_create_schema_accepts_both_explicit_dst_folds():
 
     assert parameters.start.endswith("-04:00")
     assert parameters.end.endswith("-05:00")
+
+
+def test_calendar_create_schema_rejects_end_before_start():
+    with pytest.raises(ValueError, match="end must be later than start"):
+        CalendarCreateEventParameters.model_validate(
+            _create_event_parameters(
+                start="2026-06-10T11:00:00-07:00",
+                end="2026-06-10T10:00:00-07:00",
+            )
+        )
 
 
 @pytest.mark.parametrize(

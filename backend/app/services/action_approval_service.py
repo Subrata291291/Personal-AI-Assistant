@@ -70,6 +70,23 @@ class ActionApprovalService:
     PROPOSAL_TTL_MINUTES = 15
     GMAIL_SEND_STALE_AFTER_SECONDS = 120
     RESULT_STATES = {"completed", "failed", "execution_uncertain"}
+    CALENDAR_EXECUTION_FLAGS = {
+        "calendar.create_event": "CALENDAR_CREATE_EVENT_ENABLED",
+        "calendar.update_event": "CALENDAR_UPDATE_EVENT_ENABLED",
+        "calendar.delete_event": "CALENDAR_DELETE_EVENT_ENABLED",
+    }
+
+    @classmethod
+    def _with_execution_availability(
+        cls,
+        proposal: ActionApprovalProposal,
+    ) -> ActionApprovalProposal:
+        flag_name = cls.CALENDAR_EXECUTION_FLAGS.get(proposal.action_type)
+        if flag_name is None:
+            return proposal
+        return proposal.model_copy(update={
+            "execution_available": bool(getattr(settings, flag_name)),
+        })
 
     def __init__(
         self,
@@ -117,17 +134,16 @@ class ActionApprovalService:
         user_id: UUID,
         payload: ApprovalProposalCreate,
         proposal_id: UUID | None = None,
+        supersedes_proposal_id: UUID | None = None,
     ) -> ActionApprovalProposal:
+        if (
+            supersedes_proposal_id is not None
+            and payload.action_type != "calendar.create_event"
+        ):
+            raise ValueError(
+                "Only a Calendar create proposal can replace another proposal."
+            )
         if payload.action_type.startswith("calendar."):
-            feature_flag = {
-                "calendar.create_event": settings.CALENDAR_CREATE_EVENT_ENABLED,
-                "calendar.update_event": settings.CALENDAR_UPDATE_EVENT_ENABLED,
-                "calendar.delete_event": settings.CALENDAR_DELETE_EVENT_ENABLED,
-            }[payload.action_type]
-            if not feature_flag:
-                raise PermissionError(
-                    "This Calendar change is not currently enabled."
-                )
             parameter_models = {
                 "calendar.create_event": CalendarCreateEventParameters,
                 "calendar.update_event": CalendarUpdateEventParameters,
@@ -166,23 +182,32 @@ class ActionApprovalService:
                     identity.integrity_schema_version
                 ),
             }
+        repository_arguments = {
+            "proposal_id": proposal_id,
+            "user_id": user_id,
+            "conversation_id": payload.conversation_id,
+            "source_message_id": payload.source_message_id,
+            "action_type": payload.action_type,
+            "parameters": payload.parameters,
+            "connection_id": payload.connection_id,
+            "account_email": connection.email,
+            "expiration_minutes": self.PROPOSAL_TTL_MINUTES,
+            "calendar_operation": calendar_operation,
+        }
+        if supersedes_proposal_id is not None:
+            repository_arguments["supersedes_proposal_id"] = (
+                supersedes_proposal_id
+            )
         row = self.repository.create_proposal(
-            proposal_id=proposal_id,
-            user_id=user_id,
-            conversation_id=payload.conversation_id,
-            source_message_id=payload.source_message_id,
-            action_type=payload.action_type,
-            parameters=payload.parameters,
-            connection_id=payload.connection_id,
-            account_email=connection.email,
-            expiration_minutes=self.PROPOSAL_TTL_MINUTES,
-            calendar_operation=calendar_operation,
+            **repository_arguments,
         )
         if row is None:
             raise LookupError(
                 "The conversation or source assistant message was not found."
             )
-        return ActionApprovalProposal.model_validate(row)
+        return self._with_execution_availability(
+            ActionApprovalProposal.model_validate(row)
+        )
 
     def create_gmail_draft_proposal(
         self,
@@ -286,7 +311,9 @@ class ActionApprovalService:
             conversation_id=conversation_id,
         )
         return [
-            ActionApprovalProposal.model_validate(row)
+            self._with_execution_availability(
+                ActionApprovalProposal.model_validate(row)
+            )
             for row in rows
         ]
 
@@ -306,7 +333,7 @@ class ActionApprovalService:
         proposal = ActionApprovalProposal.model_validate(row)
         if proposal.action_type.startswith("calendar."):
             self._verify_calendar_operation(proposal, user_id)
-        return proposal
+        return self._with_execution_availability(proposal)
 
     def _verify_calendar_operation(
         self,
@@ -445,7 +472,9 @@ class ActionApprovalService:
             raise ApprovalConflictError(
                 "This proposal is already being executed or was resolved."
             )
-        return ActionApprovalProposal.model_validate(claimed)
+        return self._with_execution_availability(
+            ActionApprovalProposal.model_validate(claimed)
+        )
 
     def finish_calendar_execution(
         self,
@@ -472,7 +501,9 @@ class ActionApprovalService:
             raise ApprovalConflictError(
                 "The Calendar proposal is not in the expected execution state."
             )
-        return ActionApprovalProposal.model_validate(transitioned)
+        return self._with_execution_availability(
+            ActionApprovalProposal.model_validate(transitioned)
+        )
 
     def claim_execution(
         self,

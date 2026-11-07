@@ -122,6 +122,102 @@ def test_calendar_create_proposal_preflights_access_and_returns_payload(
     )
 
 
+def test_revised_calendar_proposal_carries_superseded_proposal_id(
+    monkeypatch,
+):
+    access_check = AsyncMock()
+    monkeypatch.setattr(
+        calendar_node_module,
+        "CalendarService",
+        lambda _db: SimpleNamespace(
+            validate_create_event_access=access_check,
+        ),
+    )
+    monkeypatch.setattr(
+        calendar_node_module,
+        "SessionLocal",
+        SessionContext,
+    )
+    state = _calendar_state(True)
+    state["gmail_plan"]["supersedes_proposal_id"] = str(PROPOSAL_ID)
+    context = SimpleNamespace(
+        context={
+            "user_id": str(USER_ID),
+            "calendar_write_connection_id": str(CONNECTION_ID),
+            "google_connection_available": True,
+        }
+    )
+
+    result = calendar_node_module.calendar_agent_node(state, context)
+
+    assert result["calendar_proposal_supersedes_id"] == str(PROPOSAL_ID)
+    assert result["calendar_create_event_proposal"] == PARAMETERS
+
+
+def test_calendar_create_proposal_is_prepared_while_execution_flag_is_disabled(
+    monkeypatch,
+):
+    access_check = AsyncMock()
+    monkeypatch.setattr(
+        calendar_node_module,
+        "CalendarService",
+        lambda _db: SimpleNamespace(
+            validate_create_event_access=access_check,
+        ),
+    )
+    monkeypatch.setattr(
+        calendar_node_module,
+        "SessionLocal",
+        SessionContext,
+    )
+    state = _calendar_state(False)
+    state["assistant_capabilities"]["google_calendar"] = {
+        "write_permission_granted": True,
+        "create_execution_available": False,
+        "create_feature_enabled": False,
+    }
+    context = SimpleNamespace(
+        context={
+            "user_id": str(USER_ID),
+            "calendar_write_connection_id": str(CONNECTION_ID),
+            "google_connection_available": True,
+        }
+    )
+
+    result = calendar_node_module.calendar_agent_node(state, context)
+
+    assert result["calendar_create_event_proposal"] == PARAMETERS
+    assert "approval request" in result["assistant_response"]
+    assert "unless you approve and separately execute" in (
+        result["assistant_response"]
+    )
+    access_check.assert_awaited_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        calendar_id="primary",
+    )
+
+
+def test_calendar_create_without_end_time_asks_for_end_time():
+    state = _calendar_state(True)
+    state["user_message"] = (
+        "Add gym in my calendar tomorrow at 10 AM."
+    )
+    state["gmail_plan"]["calendar_arguments"] = None
+    context = SimpleNamespace(
+        context={
+            "user_id": str(USER_ID),
+            "calendar_write_connection_id": str(CONNECTION_ID),
+            "google_connection_available": True,
+        }
+    )
+
+    result = calendar_node_module.calendar_agent_node(state, context)
+
+    assert "What end time should I use" in result["assistant_response"]
+    assert "calendar_create_event_proposal" not in result
+
+
 def test_calendar_executor_rechecks_write_access_before_claim(
     monkeypatch,
 ):

@@ -339,6 +339,7 @@ class ActionApprovalProposal(BaseModel):
     execution_started_at: datetime | None = None
     completed_at: datetime | None = None
     result: dict[str, JsonValue] | None = None
+    execution_available: bool | None = None
     integrity_schema_version: int | None = None
     payload_fingerprint: str | None = None
     operation_id: UUID | None = None

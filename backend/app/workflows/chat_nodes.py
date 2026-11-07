@@ -311,6 +311,29 @@ def capabilities_node(state: ChatState) -> dict:
             "features in chat."
         )
 
+    if calendar.get("write_permission_granted"):
+        write_status = ", ".join(
+            f"{operation} execution: "
+            f"{'available' if calendar.get(flag) else 'disabled'}"
+            for operation, flag in (
+                ("create", "create_execution_available"),
+                ("update", "update_execution_available"),
+                ("delete", "delete_execution_available"),
+            )
+        )
+        sections.append(
+            "Calendar write permission is granted; changes require an "
+            "approval request. " + write_status + "."
+        )
+    elif calendar.get("connected") or calendar.get(
+        "google_connection_available"
+    ):
+        sections.append(
+            "Calendar write permission is not granted. Create, update, and "
+            "delete requests are unavailable until the selected account "
+            "grants Calendar write access."
+        )
+
     unavailable = capabilities.get("unavailable_integrations") or []
     if unavailable:
         sections.append(

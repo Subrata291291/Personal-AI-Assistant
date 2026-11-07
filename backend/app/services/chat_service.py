@@ -166,6 +166,48 @@ class ChatService:
             for message in history
         )
 
+    @staticmethod
+    def _pending_calendar_create_proposal(
+        history: list[dict[str, Any]],
+        user_id: UUID,
+        conversation_id: UUID,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        for message in reversed(history):
+            if message.get("role") != "assistant":
+                continue
+            metadata = message.get("metadata")
+            proposal = (
+                metadata.get("action_approval")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(proposal, dict) or not str(
+                proposal.get("action_type", "")
+            ).startswith("calendar."):
+                continue
+            if (
+                proposal.get("action_type") != "calendar.create_event"
+                or proposal.get("status") != "pending"
+                or proposal.get("user_id") != str(user_id)
+                or proposal.get("conversation_id") != str(conversation_id)
+            ):
+                return None
+            try:
+                expires_at = datetime.fromisoformat(
+                    str(proposal["expires_at"]).replace("Z", "+00:00")
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                expires_at.tzinfo is None
+                or expires_at.astimezone(timezone.utc)
+                <= now.astimezone(timezone.utc)
+            ):
+                return None
+            return proposal
+        return None
+
     def _get_completed_response(
         self,
         user_id: UUID,
@@ -728,6 +770,16 @@ class ChatService:
                 "request_time": request_time.isoformat(),
                 "assistant_capabilities": assistant_capabilities,
             }
+            pending_calendar_create = self._pending_calendar_create_proposal(
+                history=history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                now=request_time,
+            )
+            if pending_calendar_create is not None:
+                initial_state["pending_calendar_create_proposal"] = (
+                    pending_calendar_create
+                )
             if available_gmail_sources:
                 initial_state["available_gmail_sources"] = (
                     available_gmail_sources
@@ -951,6 +1003,18 @@ class ChatService:
                         raise ValueError(
                             "Calendar proposal payload is invalid."
                         )
+                    supersedes_proposal_id = result.get(
+                        "calendar_proposal_supersedes_id"
+                    )
+                    if supersedes_proposal_id is not None and (
+                        pending_calendar_create is None
+                        or supersedes_proposal_id
+                        != pending_calendar_create.get("proposal_id")
+                        or action_type != "calendar.create_event"
+                    ):
+                        raise ValueError(
+                            "Calendar replacement proposal context is invalid."
+                        )
                     source_message_id = UUID(str(assistant_message["id"]))
                     stable_proposal_id = uuid5(
                         NAMESPACE_URL,
@@ -969,6 +1033,11 @@ class ChatService:
                             "action_type": action_type,
                             "parameters": calendar_parameters,
                         }),
+                        supersedes_proposal_id=(
+                            UUID(str(supersedes_proposal_id))
+                            if supersedes_proposal_id
+                            else None
+                        ),
                     )
                     assistant_metadata = dict(
                         assistant_message.get("metadata") or {}
@@ -981,16 +1050,36 @@ class ChatService:
                         "metadata": assistant_metadata,
                     }
                 except Exception as exc:
-                    logger.exception(
-                        "Calendar approval proposal could not be persisted "
-                        "| conversation_id=%s | request_id=%s",
+                    if isinstance(exc, PermissionError):
+                        failure_message = (
+                            "the selected Google account's Calendar write "
+                            "permission could not be verified"
+                        )
+                    elif isinstance(exc, LookupError):
+                        failure_message = (
+                            "the conversation, source message, or connected "
+                            "Google account could not be verified"
+                        )
+                    elif isinstance(exc, ValueError):
+                        failure_message = (
+                            "the Calendar approval details failed validation"
+                        )
+                    else:
+                        failure_message = (
+                            "a server-side storage error occurred"
+                        )
+                    logger.error(
+                        "calendar_approval_proposal_persistence_failed "
+                        "| conversation_id=%s | request_id=%s "
+                        "| error_type=%s",
                         conversation_id,
                         request_id,
+                        type(exc).__name__,
                     )
                     assistant_content = (
-                        "I couldn’t securely save the Calendar approval "
-                        "request. No event was created. Please check the "
-                        "connection and try again."
+                        "I couldn’t save the Calendar approval request because "
+                        f"{failure_message}. No event was created. Please "
+                        "check the account and try again."
                     )
                     try:
                         updated_message = (

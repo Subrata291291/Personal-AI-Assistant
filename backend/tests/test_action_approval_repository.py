@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -8,16 +8,19 @@ from sqlalchemy.dialects.postgresql.psycopg import PGDialect_psycopg
 from app.repositories.action_approval_repository import (
     ActionApprovalRepository,
     _GET_PROPOSAL,
+    _INSERT_CALENDAR_OPERATION,
     _INSERT_GMAIL_DRAFT_PROPOSAL,
     _INSERT_PROPOSAL,
     _LOCK_PROPOSAL_IDEMPOTENCY,
+    _SYNC_CALENDAR_APPROVAL_STATE,
     _TRANSITION,
 )
 
 
 class Result:
-    def __init__(self, row=None):
+    def __init__(self, row=None, rowcount=None):
         self.row = row
+        self.rowcount = rowcount
 
     def mappings(self):
         return self
@@ -195,6 +198,105 @@ def test_generic_proposal_creation_uses_typed_action_type_bind():
     assert result is None
     assert connection.statement is _INSERT_PROPOSAL
     assert connection.parameters["action_type"] == "gmail.send"
+
+
+def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically():
+    user_id = uuid4()
+    conversation_id = uuid4()
+    source_message_id = uuid4()
+    connection_id = uuid4()
+    old_proposal_id = uuid4()
+    new_proposal_id = uuid4()
+    now = datetime.now(timezone.utc)
+    old_proposal = {
+        "proposal_id": str(old_proposal_id),
+        "user_id": str(user_id),
+        "conversation_id": str(conversation_id),
+        "connection_id": str(connection_id),
+        "action_type": "calendar.create_event",
+        "parameters": {"summary": "Gym"},
+        "status": "pending",
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=10)).isoformat(),
+    }
+
+    class ReplacementConnection:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, parameters):
+            self.statements.append(statement)
+            if statement is _LOCK_PROPOSAL_IDEMPOTENCY:
+                return Result()
+            if statement is _GET_PROPOSAL:
+                if parameters["proposal_id"] == str(new_proposal_id):
+                    return Result()
+                return Result({
+                    "message_id": str(old_proposal_id),
+                    "proposal": old_proposal,
+                    "account_email": "user@example.com",
+                })
+            if statement is _TRANSITION:
+                return Result({"proposal": old_proposal})
+            if statement is _SYNC_CALENDAR_APPROVAL_STATE:
+                return Result(rowcount=1)
+            if statement is _INSERT_PROPOSAL:
+                proposal = {
+                    "proposal_id": str(new_proposal_id),
+                    "user_id": str(user_id),
+                    "conversation_id": str(conversation_id),
+                    "source_message_id": str(source_message_id),
+                    "connection_id": str(connection_id),
+                    "action_type": "calendar.create_event",
+                    "parameters": {"summary": "Gym"},
+                    "status": "pending",
+                    "created_at": now.isoformat(),
+                    "expires_at": (now + timedelta(minutes=15)).isoformat(),
+                    "operation_id": "e840d4d7-c47f-45ad-805d-b76a76372a68",
+                    "payload_fingerprint": "new-fingerprint",
+                }
+                return Result({
+                    "message_id": str(new_proposal_id),
+                    "proposal": proposal,
+                    "account_email": "user@example.com",
+                })
+            assert statement is _INSERT_CALENDAR_OPERATION
+            return Result()
+
+    connection = ReplacementConnection()
+    repository = ActionApprovalRepository(
+        ApprovalInsertEngine(connection),
+    )
+    result = repository.create_proposal(
+        proposal_id=new_proposal_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        source_message_id=source_message_id,
+        action_type="calendar.create_event",
+        parameters={"summary": "Gym"},
+        connection_id=connection_id,
+        account_email="user@example.com",
+        expiration_minutes=15,
+        calendar_operation={
+            "proposal_id": str(new_proposal_id),
+            "operation_id": "e840d4d7-c47f-45ad-805d-b76a76372a68",
+            "user_id": str(user_id),
+            "connection_id": str(connection_id),
+            "payload_fingerprint": "new-fingerprint",
+            "action_type": "calendar.create_event",
+            "calendar_id": "primary",
+            "event_id": None,
+            "integrity_schema_version": 1,
+        },
+        supersedes_proposal_id=old_proposal_id,
+    )
+
+    assert result["proposal_id"] == new_proposal_id
+    assert result["status"] == "pending"
+    assert connection.statements.index(_TRANSITION) < (
+        connection.statements.index(_INSERT_PROPOSAL)
+    )
+    assert _SYNC_CALENDAR_APPROVAL_STATE in connection.statements
 
 
 class TransitionConnection:

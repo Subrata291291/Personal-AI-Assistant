@@ -82,7 +82,8 @@ class CalendarActionExecutor:
         }.get(proposal.action_type, False)
         if not enabled_flag:
             raise PermissionError(
-                "This Google Calendar change is not currently enabled."
+                "Calendar change execution is currently disabled. No "
+                "Calendar change was made."
             )
         if proposal.action_type not in self.SUPPORTED_ACTION_TYPES:
             raise PermissionError(

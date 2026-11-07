@@ -8,8 +8,13 @@ import pytest
 from pydantic import ValidationError
 
 from app.schemas.calendar_approval import (
+    CalendarCreateEventParameters,
     CalendarDeleteEventParameters,
     CalendarUpdateEventParameters,
+)
+from app.integrations.google.exceptions import GoogleAPIError
+from app.integrations.connectors.permissions.approval_policy import (
+    ApprovalPolicy,
 )
 from app.services.calendar_action_executor import CalendarActionExecutor
 from app.services.calendar_action_identity import (
@@ -101,6 +106,7 @@ def _executor(monkeypatch, action_type, parameters, readback):
         calendar_operation_repository=Mock(),
     )
     calendar = SimpleNamespace(
+        validate_create_event_access=AsyncMock(),
         validate_event_write_access=AsyncMock(
             return_value=_normalized_event(),
         ),
@@ -259,6 +265,133 @@ def test_approved_delete_uses_conditional_delete_and_confirms_absence(
     assert request["json_data"] is None
 
 
+def test_approved_calendar_create_confirms_google_readback_for_saved_payload(
+    monkeypatch,
+):
+    parameters = CalendarCreateEventParameters.model_validate({
+        "calendar_id": "primary",
+        "summary": "A",
+        "description": None,
+        "start": "2026-11-08T14:00:00+05:30",
+        "end": "2026-11-08T15:00:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "location": None,
+        "attendees": [],
+        "all_day": False,
+    }).model_dump(mode="json")
+    event = {
+        "id": "event-123",
+        "summary": "A",
+        "description": None,
+        "location": None,
+        "start": {
+            "dateTime": "2026-11-08T14:00:00+05:30",
+            "timeZone": "Asia/Kolkata",
+        },
+        "end": {
+            "dateTime": "2026-11-08T15:00:00+05:30",
+            "timeZone": "Asia/Kolkata",
+        },
+        "attendees": [],
+    }
+    executor, approval, api, proposal, completed = _executor(
+        monkeypatch,
+        "calendar.create_event",
+        parameters,
+        event,
+    )
+    identity = build_calendar_operation_identity(
+        proposal_id=PROPOSAL_ID,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        action_type="calendar.create_event",
+        parameters=parameters,
+    )
+    event["id"] = identity.event_id
+    event["extendedProperties"] = {
+        "private": {
+            "personal_ai_operation_id": str(identity.operation_id),
+            "personal_ai_payload_fingerprint": identity.payload_fingerprint,
+        },
+    }
+    proposal.action_type = "calendar.create_event"
+    proposal.parameters = parameters
+    proposal.operation_id = identity.operation_id
+    proposal.payload_fingerprint = identity.payload_fingerprint
+    proposal.calendar_event_id = identity.event_id
+    executor._read_back = AsyncMock(return_value=event)
+
+    result = asyncio.run(
+        executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+    )
+
+    assert result is completed
+    request = api.request_mutation.call_args.kwargs
+    assert request["method"] == "POST"
+    assert "/calendars/primary/events" in request["url"]
+    assert request["json_data"]["summary"] == "A"
+    assert request["json_data"]["start"] == {
+        "dateTime": "2026-11-08T14:00:00+05:30",
+        "timeZone": "Asia/Kolkata",
+    }
+    assert request["json_data"]["end"] == {
+        "dateTime": "2026-11-08T15:00:00+05:30",
+        "timeZone": "Asia/Kolkata",
+    }
+    assert approval.finish_calendar_execution.call_args.kwargs[
+        "state"
+    ] == "completed"
+    assert approval.finish_calendar_execution.call_args.kwargs[
+        "safe_result"
+    ]["outcome"] == "created"
+
+
+def test_google_calendar_create_failure_is_persisted_as_failed(
+    monkeypatch,
+):
+    parameters = CalendarCreateEventParameters.model_validate({
+        "calendar_id": "primary",
+        "summary": "A",
+        "start": "2026-11-08T14:00:00+05:30",
+        "end": "2026-11-08T15:00:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "all_day": False,
+    }).model_dump(mode="json")
+    executor, approval, api, proposal, _completed = _executor(
+        monkeypatch,
+        "calendar.create_event",
+        parameters,
+        None,
+    )
+    identity = build_calendar_operation_identity(
+        proposal_id=PROPOSAL_ID,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        action_type="calendar.create_event",
+        parameters=parameters,
+    )
+    proposal.action_type = "calendar.create_event"
+    proposal.parameters = parameters
+    proposal.operation_id = identity.operation_id
+    proposal.payload_fingerprint = identity.payload_fingerprint
+    proposal.calendar_event_id = identity.event_id
+    api.request_mutation.side_effect = GoogleAPIError(
+        status_code=400,
+        message="invalid event",
+    )
+
+    asyncio.run(
+        executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+    )
+
+    finish_arguments = approval.finish_calendar_execution.call_args.kwargs
+    assert finish_arguments["state"] == "failed"
+    assert finish_arguments["safe_result"] == {
+        "outcome": "rejected",
+        "provider_status_code": 400,
+    }
+
+
 @pytest.mark.parametrize(
     ("action_type", "parameters", "flag"),
     [
@@ -303,9 +436,24 @@ def test_calendar_mutations_are_blocked_when_feature_flag_is_disabled(
         api_client=api,
     )
 
-    with pytest.raises(PermissionError, match="not currently enabled"):
+    with pytest.raises(PermissionError, match="execution is currently disabled"):
         asyncio.run(
             executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
         )
 
     api.request_mutation.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        "create_calendar_event",
+        "update_calendar_event",
+        "delete_calendar_event",
+    ),
+)
+def test_every_calendar_write_requires_explicit_approval(capability):
+    decision = ApprovalPolicy().check_approval(capability)
+
+    assert decision.required is True
+    assert "explicit user approval" in decision.reason

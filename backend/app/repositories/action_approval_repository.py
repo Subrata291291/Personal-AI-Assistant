@@ -20,6 +20,11 @@ from app.services.calendar_action_identity import (
 
 logger = get_logger(__name__)
 
+
+class ApprovalReplacementConflictError(RuntimeError):
+    """Raised when a pending proposal cannot be safely superseded."""
+
+
 _EMAIL_PATTERN = re.compile(
     r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
     re.IGNORECASE,
@@ -679,6 +684,7 @@ class ActionApprovalRepository:
         account_email: str | None,
         expiration_minutes: int,
         calendar_operation: dict[str, Any] | None = None,
+        supersedes_proposal_id: UUID | None = None,
     ) -> dict[str, Any] | None:
         params = {
             "proposal_id": str(proposal_id),
@@ -750,12 +756,84 @@ class ActionApprovalRepository:
                             "different event details."
                         )
                     return existing_row
+            if supersedes_proposal_id is not None:
+                superseded = (
+                    connection.execute(
+                        _GET_PROPOSAL,
+                        {
+                            "user_id": str(user_id),
+                            "proposal_id": str(supersedes_proposal_id),
+                        },
+                    )
+                    .mappings()
+                    .first()
+                )
+                if superseded is None:
+                    raise ApprovalReplacementConflictError(
+                        "The pending Calendar proposal could not be found."
+                    )
+                superseded_row = self._proposal_row(
+                    superseded,
+                    account_email,
+                )
+                if (
+                    superseded_row["status"] != "pending"
+                    or superseded_row["action_type"]
+                    != "calendar.create_event"
+                    or superseded_row["conversation_id"] != conversation_id
+                    or superseded_row["connection_id"] != connection_id
+                ):
+                    raise ApprovalReplacementConflictError(
+                        "The pending Calendar proposal is no longer eligible "
+                        "for replacement."
+                    )
+                transitioned = (
+                    connection.execute(
+                        _TRANSITION,
+                        {
+                            "user_id": str(user_id),
+                            "proposal_id": str(supersedes_proposal_id),
+                            "expected_status": "pending",
+                            "expiry_mode": "valid",
+                            "timestamp_field": "completed_at",
+                            "patch": json.dumps(
+                                {"status": "rejected"},
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    )
+                    .mappings()
+                    .first()
+                )
+                if transitioned is None:
+                    raise ApprovalReplacementConflictError(
+                        "The pending Calendar proposal changed before it "
+                        "could be replaced."
+                    )
+                synchronized = connection.execute(
+                    _SYNC_CALENDAR_APPROVAL_STATE,
+                    {
+                        "user_id": str(user_id),
+                        "proposal_id": str(supersedes_proposal_id),
+                        "expected_state": "pending",
+                        "new_state": "rejected",
+                    },
+                )
+                if synchronized.rowcount != 1:
+                    raise RuntimeError(
+                        "Calendar replacement state could not be synchronized."
+                    )
             row = (
                 connection.execute(_INSERT_PROPOSAL, params)
                 .mappings()
                 .first()
             )
             if row is None:
+                if supersedes_proposal_id is not None:
+                    raise RuntimeError(
+                        "Replacement Calendar approval could not be stored."
+                    )
                 return None
             if calendar_operation is not None:
                 connection.execute(

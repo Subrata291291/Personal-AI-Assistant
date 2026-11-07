@@ -42,6 +42,10 @@ class ChatState(TypedDict):
 
     assistant_capabilities: NotRequired[dict[str, Any]]
 
+    pending_calendar_create_proposal: NotRequired[dict[str, Any]]
+
+    calendar_proposal_supersedes_id: NotRequired[str]
+
     assistant_route: NotRequired[str]
 
     gmail_plan: NotRequired[dict[str, Any]]

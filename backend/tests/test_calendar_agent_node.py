@@ -1,6 +1,7 @@
 import json
+from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 from app.workflows import calendar_agent_node
@@ -456,7 +457,7 @@ def test_calendar_write_requests_are_refused_without_tool_execution(monkeypatch)
     factory.assert_not_called()
 
 
-def test_disabled_calendar_create_capability_returns_immediately_without_execution(
+def test_calendar_create_without_write_permission_is_not_prepared(
     monkeypatch,
 ):
     factory = Mock()
@@ -476,12 +477,40 @@ def test_disabled_calendar_create_capability_returns_immediately_without_executi
         ),
     )
 
-    assert result["assistant_response"] == (
-        "I can read your Google Calendar, but creating events is currently "
-        "unavailable. I haven't created or modified anything."
-    )
+    assert "write permission" in result["assistant_response"].casefold()
+    assert "nothing was created" in result["assistant_response"].casefold()
     assert "calendar_create_event_proposal" not in result
     factory.assert_not_called()
+
+
+def test_calendar_create_with_missing_date_asks_before_preflight():
+    state = _state("create_calendar_event_proposal", None)
+    state["user_message"] = (
+        "add in my calendar gym timing morning 10am to 11am"
+    )
+    state["user_timezone"] = "Asia/Kolkata"
+    state["assistant_capabilities"] = {
+        "google_calendar": {
+            "write_permission_granted": True,
+            "create_execution_available": False,
+            "create_feature_enabled": False,
+        },
+    }
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_write_connection_id=EVENT_CONNECTION_ID,
+            calendar_enabled=True,
+            google_connection_available=True,
+        ),
+    )
+
+    assert "What date" in result["assistant_response"]
+    assert "10am–11am" in result["assistant_response"]
+    assert "Asia/Kolkata" in result["assistant_response"]
+    assert "calendar_create_event_proposal" not in result
 
 
 def test_calendar_update_and_delete_requests_are_refused_without_execution(
@@ -510,14 +539,120 @@ def test_calendar_update_and_delete_requests_are_refused_without_execution(
                 google_connection_available=True,
             ),
         )
-        assert "Calendar changes are currently unavailable" in (
+        assert "missing Calendar write permission" in (
             result["assistant_response"]
         )
-        assert "haven't created or modified anything" in (
+        assert "nothing was changed" in (
             result["assistant_response"]
         )
 
     factory.assert_not_called()
+
+
+def test_calendar_update_proposal_can_be_prepared_while_flag_is_disabled(
+    monkeypatch,
+):
+    event = {
+        "id": "event-1",
+        "summary": "Gym",
+        "description": None,
+        "location": None,
+        "start": {
+            "date_time": datetime.fromisoformat("2026-06-10T10:00:00+05:30"),
+            "date": None,
+            "time_zone": "Asia/Kolkata",
+        },
+        "end": {
+            "date_time": datetime.fromisoformat("2026-06-10T11:00:00+05:30"),
+            "date": None,
+            "time_zone": "Asia/Kolkata",
+        },
+        "attendees": [],
+        "etag": '"etag-1"',
+    }
+
+    class SessionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": [event]}),
+        validate_event_write_access=AsyncMock(return_value=event),
+    )
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "CalendarService",
+        lambda _db: service,
+    )
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", SessionContext)
+
+    state = _state(
+        "update_calendar_event_proposal",
+        {
+            "calendar_id": "primary",
+            "event_query": "gym session",
+            "changes": {"start_time": "17:00"},
+        },
+    )
+    state["user_message"] = "Move my gym session to 5 PM."
+    state["assistant_capabilities"] = {
+        "google_calendar": {
+            "write_permission_granted": True,
+            "update_execution_available": False,
+            "update_feature_enabled": False,
+        },
+    }
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_write_connection_id=EVENT_CONNECTION_ID,
+            calendar_enabled=True,
+            google_connection_available=True,
+        ),
+    )
+
+    assert result["calendar_action_proposal"]["action_type"] == (
+        "calendar.update_event"
+    )
+    assert "Before → after" in result["assistant_response"]
+    assert "Gym" in result["assistant_response"]
+    assert result["calendar_action_proposal"]["parameters"]["changes"] == {
+        "start": {
+            "dateTime": "2026-06-10T17:00:00+05:30",
+            "timeZone": "Asia/Kolkata",
+        },
+        "end": {
+            "dateTime": "2026-06-10T18:00:00+05:30",
+            "timeZone": "Asia/Kolkata",
+        },
+    }
+
+
+def test_relative_calendar_time_change_preserves_event_date_and_duration():
+    event = {
+        "start": {
+            "date_time": datetime.fromisoformat("2026-06-10T10:00:00+05:30"),
+            "time_zone": "Asia/Kolkata",
+        },
+        "end": {
+            "date_time": datetime.fromisoformat("2026-06-10T11:00:00+05:30"),
+            "time_zone": "Asia/Kolkata",
+        },
+    }
+
+    changes, timezone_name = calendar_agent_node._resolve_relative_time_changes(
+        event,
+        {"start_time": "17:00", "duration_delta_minutes": 30},
+        "UTC",
+    )
+
+    assert timezone_name == "Asia/Kolkata"
+    assert changes["start"]["dateTime"] == "2026-06-10T17:00:00+05:30"
+    assert changes["end"]["dateTime"] == "2026-06-10T18:30:00+05:30"
 
 
 def test_calendar_write_consent_is_requested_only_for_selected_account():

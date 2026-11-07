@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 
 import { actionApprovalService } from '../services/actionApprovalService.js'
 import { formatRequestError } from '../lib/errorMessage.js'
@@ -8,6 +8,93 @@ function displayValue(value) {
   if (Array.isArray(value)) return value.join(', ')
   if (value && typeof value === 'object') return JSON.stringify(value)
   return String(value)
+}
+
+function formatEventDate(value, timeZone) {
+  const dateOnly = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+  const date = dateOnly
+    ? new Date(`${value}T12:00:00Z`)
+    : new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value || '')
+
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      month: 'long',
+      day: 'numeric',
+      year: 'numeric',
+      timeZone: dateOnly ? 'UTC' : timeZone,
+    }).format(date)
+  } catch {
+    return String(value || '')
+  }
+}
+
+function formatEventTime(value, timeZone) {
+  if (typeof value !== 'string' || !value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZone,
+    }).format(date)
+  } catch {
+    return value
+  }
+}
+
+function formatAllDayEndDate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return value
+  }
+  const date = new Date(`${value}T00:00:00Z`)
+  date.setUTCDate(date.getUTCDate() - 1)
+  return date.toISOString().slice(0, 10)
+}
+
+function eventDateTime(value) {
+  if (typeof value === 'string') {
+    return { dateTime: value, timeZone: null, allDay: false }
+  }
+  if (!value || typeof value !== 'object') {
+    return { dateTime: null, timeZone: null, allDay: false }
+  }
+  return {
+    dateTime: value.dateTime || value.date || null,
+    timeZone: value.timeZone || null,
+    allDay: Boolean(value.date && !value.dateTime),
+  }
+}
+
+function getCalendarEventDetails(proposal) {
+  const parameters = proposal.parameters
+  if (proposal.action_type === 'calendar.create_event') {
+    return {
+      title: parameters.summary,
+      start: eventDateTime(parameters.start),
+      end: eventDateTime(parameters.end),
+      timeZone: parameters.time_zone,
+      calendarId: parameters.calendar_id,
+      allDay: parameters.all_day === true,
+    }
+  }
+
+  if (proposal.action_type !== 'calendar.update_event') return null
+  const currentEvent = parameters.current_event || {}
+  const changes = parameters.changes || {}
+  const start = eventDateTime(changes.start || currentEvent.start)
+  const end = eventDateTime(changes.end || currentEvent.end)
+  return {
+    title: changes.summary || currentEvent.summary,
+    start,
+    end,
+    timeZone: parameters.time_zone || start.timeZone || end.timeZone,
+    calendarId: parameters.calendar_id,
+    allDay: start.allDay,
+  }
 }
 
 function updateProposalMessage(message, proposal, onUpdated) {
@@ -21,6 +108,7 @@ function updateProposalMessage(message, proposal, onUpdated) {
 }
 
 function ActionApprovalCard({ message, isDark, onUpdated }) {
+  const queryClient = useQueryClient()
   const proposal = message.metadata.action_approval
   const isCalendarCreate = proposal.action_type === 'calendar.create_event'
   const isCalendarUpdate = proposal.action_type === 'calendar.update_event'
@@ -47,13 +135,15 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
     delete: 'deleted',
   }[calendarActionLabel]
   const calendarActionProgress = {
-    create: 'Creating event...',
-    update: 'Updating event...',
-    delete: 'Deleting event...',
+    create: 'Checking Calendar execution...',
+    update: 'Checking Calendar execution...',
+    delete: 'Checking Calendar execution...',
   }[calendarActionLabel]
   const [error, setError] = useState('')
   const [expired, setExpired] = useState(false)
+  const [executionAttemptFailed, setExecutionAttemptFailed] = useState(false)
   const requestInProgress = useRef(false)
+  const availabilityRefreshProposalId = useRef(null)
   useEffect(() => {
     if (proposal.status !== 'pending') return undefined
 
@@ -70,9 +160,22 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       decision === 'approve'
         ? actionApprovalService.approve(proposal.proposal_id)
         : actionApprovalService.reject(proposal.proposal_id),
-    onSuccess: (response) => {
+    onSuccess: async (response, decision) => {
       setError('')
       updateProposalMessage(message, response.proposal, onUpdated)
+      if (decision === 'approve' && isCalendarAction) {
+        try {
+          const latest = await actionApprovalService.getProposal(
+            proposal.proposal_id,
+          )
+          updateProposalMessage(message, latest, onUpdated)
+        } catch (statusError) {
+          setError(formatRequestError(
+            statusError,
+            'Approval succeeded, but Calendar execution availability could not be refreshed.',
+          ))
+        }
+      }
     },
     onError: (mutationError) => {
       setError(formatRequestError(
@@ -88,20 +191,42 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
   const executeMutation = useMutation({
     mutationFn: () =>
       actionApprovalService.execute(proposal.proposal_id),
-    onSuccess: (response) => {
+    onSuccess: async (response) => {
       setError('')
+      setExecutionAttemptFailed(false)
       updateProposalMessage(message, response.proposal, onUpdated)
+      if (
+        isCalendarCreate &&
+        response.proposal.status === 'completed' &&
+        response.proposal.result?.outcome === 'created'
+      ) {
+        await Promise.all([
+          queryClient.invalidateQueries({
+            queryKey: ['calendar-events'],
+            refetchType: 'all',
+          }),
+          queryClient.invalidateQueries({
+            queryKey: ['calendar-event'],
+            refetchType: 'all',
+          }),
+        ])
+      }
     },
     onError: async (mutationError) => {
       const fallback = isCalendarAction
         ? 'The Calendar change outcome could not be confirmed.'
         : 'The Gmail send outcome could not be confirmed.'
       setError(formatRequestError(mutationError, fallback))
+      setExecutionAttemptFailed(true)
       try {
         const latest = await actionApprovalService.getProposal(
           proposal.proposal_id,
         )
         updateProposalMessage(message, latest, onUpdated)
+        if (isCalendarAction && latest.execution_available === false) {
+          setError('')
+          setExecutionAttemptFailed(false)
+        }
       } catch (statusError) {
         setError(
           `${formatRequestError(mutationError, fallback)} Status check failed: ${formatRequestError(
@@ -137,20 +262,52 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       requestInProgress.current = false
     },
   })
+  const refreshProposalStatus = statusMutation.mutate
+
+  useEffect(() => {
+    if (
+      !isCalendarAction ||
+      proposal.status !== 'approved' ||
+      typeof proposal.execution_available === 'boolean' ||
+      availabilityRefreshProposalId.current === proposal.proposal_id
+    ) {
+      return
+    }
+    availabilityRefreshProposalId.current = proposal.proposal_id
+    refreshProposalStatus()
+  }, [
+    isCalendarAction,
+    proposal.execution_available,
+    proposal.proposal_id,
+    proposal.status,
+    refreshProposalStatus,
+  ])
 
   const isExpired = proposal.status === 'pending' && expired
   const visibleStatus = isExpired ? 'expired' : proposal.status
   const isPending = visibleStatus === 'pending'
-  const approvalStatus = ['pending', 'approved', 'rejected', 'expired']
-    .includes(visibleStatus)
-    ? visibleStatus
-    : 'approved'
+  const approvalStatus = {
+    pending: 'Pending',
+    approved: 'Approved',
+    rejected: 'Rejected',
+    expired: 'Expired',
+  }[visibleStatus] || 'Approved'
   const executionStatus = visibleStatus === 'approved'
-    ? 'not started'
-    : ['executing', 'completed', 'failed', 'execution_uncertain']
-      .includes(visibleStatus)
-      ? visibleStatus.replaceAll('_', ' ')
-      : 'not started'
+    ? isCalendarAction
+      ? proposal.execution_available === false
+        ? 'Disabled'
+        : executionAttemptFailed
+          ? 'Failed'
+          : proposal.execution_available === true
+            ? 'Available'
+            : 'Not confirmed'
+      : 'Not started'
+    : {
+      executing: 'In Progress',
+      completed: 'Completed',
+      failed: 'Failed',
+      execution_uncertain: 'Unconfirmed',
+    }[visibleStatus] || 'Not started'
   function resolveProposal(decision) {
     if (requestInProgress.current || mutation.isPending) return
     requestInProgress.current = true
@@ -201,6 +358,41 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       ? 'bg-rose-500/10 text-rose-300'
       : 'bg-rose-50 text-rose-700',
   }[visibleStatus]
+  const executionStatusStyles = executionStatus === 'Disabled'
+    ? isDark
+      ? 'bg-slate-500/10 text-slate-300'
+      : 'bg-slate-100 text-slate-600'
+    : executionStatus === 'Failed' || executionStatus === 'Unconfirmed'
+      ? isDark
+        ? 'bg-rose-500/10 text-rose-300'
+        : 'bg-rose-50 text-rose-700'
+      : executionStatus === 'Available' || executionStatus === 'In Progress'
+        ? isDark
+          ? 'bg-violet-500/10 text-violet-300'
+          : 'bg-violet-50 text-violet-700'
+        : statusStyles
+  const canExecute = (
+    ['gmail.send', 'calendar.create_event', 'calendar.update_event', 'calendar.delete_event']
+      .includes(proposal.action_type)
+    && (!isCalendarAction || proposal.execution_available === true)
+  )
+  const calendarEventDetails = getCalendarEventDetails(proposal)
+  const localStartDate = calendarEventDetails?.start.dateTime
+    ? formatEventDate(
+      calendarEventDetails.start.dateTime,
+      calendarEventDetails.timeZone || 'UTC',
+    )
+    : ''
+  const localEndDate = calendarEventDetails?.end.dateTime
+    ? formatEventDate(
+      calendarEventDetails.allDay
+        ? formatAllDayEndDate(calendarEventDetails.end.dateTime)
+        : calendarEventDetails.end.dateTime,
+      calendarEventDetails.timeZone || 'UTC',
+    )
+    : ''
+  const isMultiDay = localStartDate && localEndDate &&
+    localStartDate !== localEndDate
 
   return (
     <section
@@ -226,15 +418,91 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
         </div>
         <div className="flex flex-wrap gap-2">
           <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${statusStyles}`}>
-            Approval: {approvalStatus}
+            {`Approval: ${approvalStatus}`}
           </span>
-          <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold capitalize ${statusStyles}`}>
-            Execution: {executionStatus}
+          <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${executionStatusStyles}`}>
+            {`Execution: ${executionStatus}`}
           </span>
         </div>
       </header>
 
       <div className="space-y-3 p-4">
+        {calendarEventDetails && (
+          <section
+            aria-label="Event details"
+            className={`rounded-lg px-3 py-3 ${
+              isDark ? 'bg-[#171a27] text-slate-200' : 'bg-slate-50 text-slate-700'
+            }`}
+          >
+            <h4 className={`text-[11px] font-bold uppercase tracking-wide ${
+              isDark ? 'text-slate-400' : 'text-slate-500'
+            }`}>
+              Event details
+            </h4>
+            <dl className="mt-2 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-[110px_1fr]">
+              {calendarEventDetails.title && (
+                <>
+                  <dt className="font-semibold">Title</dt>
+                  <dd className="break-words">{calendarEventDetails.title}</dd>
+                </>
+              )}
+              {calendarEventDetails.start.dateTime && (
+                <>
+                  <dt className="font-semibold">Date</dt>
+                  <dd>
+                    {isMultiDay
+                      ? `${localStartDate} – ${localEndDate}`
+                      : localStartDate}
+                  </dd>
+                </>
+              )}
+              {calendarEventDetails.allDay ? (
+                <>
+                  <dt className="font-semibold">Event timing</dt>
+                  <dd>All day</dd>
+                </>
+              ) : (
+                <>
+                  {calendarEventDetails.start.dateTime && (
+                    <>
+                      <dt className="font-semibold">Start time</dt>
+                      <dd>
+                        {formatEventTime(
+                          calendarEventDetails.start.dateTime,
+                          calendarEventDetails.timeZone || 'UTC',
+                        )}
+                      </dd>
+                    </>
+                  )}
+                  {calendarEventDetails.end.dateTime && (
+                    <>
+                      <dt className="font-semibold">End time</dt>
+                      <dd>
+                        {formatEventTime(
+                          calendarEventDetails.end.dateTime,
+                          calendarEventDetails.timeZone || 'UTC',
+                        )}
+                        {isMultiDay && ` (${localEndDate})`}
+                      </dd>
+                    </>
+                  )}
+                  {calendarEventDetails.timeZone && (
+                    <>
+                      <dt className="font-semibold">Timezone</dt>
+                      <dd>{calendarEventDetails.timeZone}</dd>
+                    </>
+                  )}
+                </>
+              )}
+              {calendarEventDetails.calendarId && (
+                <>
+                  <dt className="font-semibold">Calendar</dt>
+                  <dd>{calendarEventDetails.calendarId}</dd>
+                </>
+              )}
+            </dl>
+          </section>
+        )}
         <div className={`rounded-lg px-3 py-2 text-xs ${
           isDark ? 'bg-[#171a27] text-slate-300' : 'bg-slate-50 text-slate-700'
         }`}>
@@ -252,6 +520,9 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
             .filter(([key]) => ![
               'expected_etag',
               'current_event',
+              ...(isCalendarCreate
+                ? ['summary', 'start', 'end', 'time_zone', 'calendar_id', 'all_day']
+                : []),
             ].includes(key))
             .map(([key, value]) => (
             <div key={key} className="grid gap-1 py-2 sm:grid-cols-[110px_1fr]">
@@ -308,11 +579,22 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
 
         {visibleStatus === 'approved' && (
           <p role="status" className="text-xs text-emerald-500">
-            {isCalendarAction
-              ? `Approved by you. No Calendar change will happen until you separately choose Execute.`
+            {isCalendarAction && proposal.execution_available === false
+              ? 'Your approval has been recorded. Calendar execution is currently disabled. No event has been created.'
+              : isCalendarAction
+                ? proposal.execution_available === true
+                  ? 'Your approval has been recorded. Calendar execution is available, but no Calendar change has been made yet.'
+                  : 'Your approval has been recorded. Calendar execution availability has not been confirmed. No Calendar change has been made.'
               : 'Approved by you. No email will be sent until you explicitly choose Execute.'}
           </p>
         )}
+        {isCalendarAction &&
+          executionAttemptFailed &&
+          visibleStatus === 'approved' && (
+          <p role="alert" className="text-xs text-rose-400">
+            Calendar change execution failed. No successful change was confirmed.
+          </p>
+          )}
         {visibleStatus === 'executing' && (
           <p role="status" className="text-xs text-violet-400">
             {isCalendarAction
@@ -359,8 +641,14 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
         )}
         {visibleStatus === 'failed' && (
           <p role="alert" className="text-xs text-rose-400">
-            {isCalendarAction
-              ? 'Google Calendar rejected the change request. This proposal cannot be retried.'
+            {isCalendarAction && proposal.result?.reason === 'provider_rejected'
+              ? `Google Calendar rejected the request${
+                Number.isInteger(proposal.result.provider_status_code)
+                  ? ` (HTTP ${proposal.result.provider_status_code})`
+                  : ''
+              }. No Calendar change was made.`
+              : isCalendarAction
+                ? 'Calendar change execution failed. This proposal cannot be retried.'
               : 'Gmail rejected the send request. This proposal cannot be retried.'}
           </p>
         )}
@@ -409,7 +697,7 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
             </button>
           </div>
         )}
-        {proposal.status === 'approved' && ['gmail.send', 'calendar.create_event', 'calendar.update_event', 'calendar.delete_event'].includes(proposal.action_type) && (
+        {proposal.status === 'approved' && canExecute && (
           <div className={`flex justify-end border-t pt-3 ${
             isDark ? 'border-[#303245]' : 'border-slate-100'
           }`}>

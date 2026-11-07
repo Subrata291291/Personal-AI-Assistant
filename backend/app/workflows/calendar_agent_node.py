@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -351,6 +351,102 @@ def _event_snapshot(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resolve_relative_time_changes(
+    event: dict[str, Any],
+    changes: dict[str, Any],
+    fallback_timezone: str,
+) -> tuple[dict[str, Any], str | None]:
+    requested_start_time = changes.pop("start_time", None)
+    duration_delta_minutes = changes.pop("duration_delta_minutes", None)
+    if requested_start_time is None and duration_delta_minutes is None:
+        return changes, None
+
+    start = event.get("start")
+    end = event.get("end")
+    if (
+        not isinstance(start, dict)
+        or not isinstance(end, dict)
+        or not isinstance(start.get("date_time"), datetime)
+        or not isinstance(end.get("date_time"), datetime)
+    ):
+        raise ValueError("Relative time changes require a timed event.")
+
+    timezone_name = start.get("time_zone") or fallback_timezone
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (TypeError, ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("The event timezone is invalid.") from exc
+
+    event_start = start["date_time"]
+    event_end = end["date_time"]
+    if (
+        event_start.tzinfo is None
+        or event_start.utcoffset() is None
+        or event_end.tzinfo is None
+        or event_end.utcoffset() is None
+        or event_end.astimezone(timezone.utc)
+        <= event_start.astimezone(timezone.utc)
+    ):
+        raise ValueError("The event time range is invalid.")
+
+    resolved_start = event_start.astimezone(zone)
+    if requested_start_time is not None:
+        if not isinstance(requested_start_time, str) or not re.fullmatch(
+            r"(?:[01]\d|2[0-3]):[0-5]\d",
+            requested_start_time,
+        ):
+            raise ValueError("A local 24-hour HH:MM start time is required.")
+        hour, minute = (int(value) for value in requested_start_time.split(":"))
+        local_current_start = event_start.astimezone(zone)
+        naive_start = datetime.combine(
+            local_current_start.date(),
+            time(hour, minute),
+        )
+        first = naive_start.replace(tzinfo=zone, fold=0)
+        second = naive_start.replace(tzinfo=zone, fold=1)
+        if first.utcoffset() != second.utcoffset():
+            raise ValueError("The requested start time is ambiguous.")
+        if first.astimezone(timezone.utc).astimezone(zone).replace(
+            tzinfo=None
+        ) != naive_start:
+            raise ValueError("The requested start time does not exist.")
+        resolved_start = first
+
+    original_duration = (
+        event_end.astimezone(timezone.utc)
+        - event_start.astimezone(timezone.utc)
+    )
+    resolved_end = (
+        resolved_start.astimezone(timezone.utc) + original_duration
+    ).astimezone(zone)
+
+    if duration_delta_minutes is not None:
+        if (
+            isinstance(duration_delta_minutes, bool)
+            or not isinstance(duration_delta_minutes, int)
+            or not -1440 <= duration_delta_minutes <= 1440
+        ):
+            raise ValueError("The duration change is outside the allowed range.")
+        resolved_end = (
+            resolved_end.astimezone(timezone.utc)
+            + timedelta(minutes=duration_delta_minutes)
+        ).astimezone(zone)
+        if resolved_end.astimezone(timezone.utc) <= resolved_start.astimezone(
+            timezone.utc
+        ):
+            raise ValueError("The resulting event duration must be positive.")
+
+    changes["start"] = {
+        "dateTime": resolved_start.isoformat(timespec="seconds"),
+        "timeZone": zone.key,
+    }
+    changes["end"] = {
+        "dateTime": resolved_end.isoformat(timespec="seconds"),
+        "timeZone": zone.key,
+    }
+    return changes, zone.key
+
+
 def _prepare_event_mutation(
     state: ChatState,
     runtime: Runtime[ChatContext],
@@ -362,7 +458,6 @@ def _prepare_event_mutation(
     )
     operation = "update" if action_type == "calendar.update_event" else "delete"
     enabled_key = f"{operation}_execution_available"
-    feature_key = f"{operation}_feature_enabled"
     context = runtime.context
     if not context.get("google_connection_available", False):
         response = (
@@ -378,26 +473,12 @@ def _prepare_event_mutation(
                 {"role": "assistant", "content": response},
             ],
         }
-    if not capabilities.get(
-        feature_key,
-        capabilities.get(enabled_key, False),
-    ):
-        response = (
-            "I can read your Google Calendar, but Calendar changes are "
-            "currently unavailable. I haven't created or modified anything."
-        )
-        return {
-            "assistant_response": response,
-            "provider": "",
-            "model": "",
-            "messages": [
-                {"role": "user", "content": state["user_message"]},
-                {"role": "assistant", "content": response},
-            ],
-        }
-
     user_id = context.get("user_id")
     connection_id = context.get("calendar_write_connection_id")
+    write_permission_granted = capabilities.get(
+        "write_permission_granted",
+        capabilities.get(enabled_key, False),
+    )
     if context.get("calendar_default_connection_invalid", False):
         response = (
             "Your saved default Google Calendar account is unavailable. "
@@ -413,10 +494,10 @@ def _prepare_event_mutation(
             "Your selected Google account is missing Calendar write permission. "
             "Grant access for that account in Connected Apps; nothing was changed."
         )
-    elif not capabilities.get(enabled_key, False):
+    elif not write_permission_granted:
         response = (
-            "The selected Google account does not have the enabled Calendar "
-            "write capability. Nothing was changed."
+            "The selected Google account is missing Calendar write permission. "
+            "Grant access for that account in Connected Apps; nothing was changed."
         )
     elif not connection_id or not user_id:
         response = (
@@ -451,7 +532,23 @@ def _prepare_event_mutation(
         event_id = None
     if isinstance(event_query, str):
         normalized_query = " ".join(event_query.casefold().split())
-        if normalized_query not in " ".join(latest_message.split()):
+        recent_messages = state.get("messages", [])[-6:]
+        is_contextual_followup = bool(re.match(
+            r"^(?:move|reschedule|change|update|delete|cancel|remove|"
+            r"make)\s+(?:it|that|this)\b",
+            latest_message.strip(),
+        ))
+        query_in_recent_context = any(
+            isinstance(message, dict)
+            and isinstance(message.get("content"), str)
+            and normalized_query
+            in " ".join(message["content"].casefold().split())
+            for message in recent_messages
+        )
+        if (
+            normalized_query not in " ".join(latest_message.split())
+            and not (is_contextual_followup and query_in_recent_context)
+        ):
             event_query = None
     if event_id is None and event_query is None:
         response = (
@@ -553,15 +650,19 @@ def _prepare_event_mutation(
             if action_type == "calendar.update_event":
                 if not isinstance(changes, dict):
                     raise ValueError("Event changes are required.")
+                changes = dict(changes)
                 event_timezone = state.get("user_timezone", "UTC")
-                if "start" in changes:
+                changes, time_zone = _resolve_relative_time_changes(
+                    event,
+                    changes,
+                    event_timezone,
+                )
+                if time_zone is None and "start" in changes:
                     for endpoint in ("start", "end"):
                         event_time = changes.get(endpoint)
                         if isinstance(event_time, dict) and "date" not in event_time:
                             event_time.setdefault("timeZone", event_timezone)
                     time_zone = event_timezone
-                else:
-                    time_zone = None
                 parameters = CalendarUpdateEventParameters.model_validate({
                     "calendar_id": calendar_id,
                     "event_id": event_id,
@@ -582,6 +683,11 @@ def _prepare_event_mutation(
             "I couldn’t validate the requested Calendar change. Please clarify "
             "the event and the exact change. Nothing was changed."
         )
+    except ValueError:
+        response = (
+            "I couldn’t safely apply the requested time change to this event. "
+            "Please clarify the time and timezone. Nothing was changed."
+        )
     except PermissionError:
         response = (
             "The selected Google account is missing Calendar write permission. "
@@ -601,8 +707,53 @@ def _prepare_event_mutation(
     else:
         event_title = event.get("summary") or "Untitled event"
         verb = "update" if action_type == "calendar.update_event" else "delete"
+        details = ""
+        if action_type == "calendar.update_event":
+            current = parameters.current_event
+            labels = {
+                "summary": "Title",
+                "description": "Description",
+                "location": "Location",
+                "start": "Start",
+                "end": "End",
+                "attendees": "Attendees",
+            }
+
+            def display_value(value: object) -> str:
+                if isinstance(value, dict):
+                    return str(
+                        value.get("dateTime")
+                        or value.get("date")
+                        or value
+                    )
+                if isinstance(value, list):
+                    return ", ".join(str(item) for item in value) or "none"
+                return str(value) if value is not None else "none"
+
+            changes_summary = [
+                f"- {labels[key]}: "
+                f"{display_value(current.get(key))} → "
+                f"{display_value(value)}"
+                for key, value in parameters.changes.items()
+                if key in labels
+            ]
+            if changes_summary:
+                details = (
+                    "\n\nBefore → after:\n" + "\n".join(changes_summary)
+                )
+        else:
+            event_start = _format_event_time(
+                event.get("start"),
+                state.get("user_timezone", "UTC"),
+            )
+            event_end = _format_event_time(
+                event.get("end"),
+                state.get("user_timezone", "UTC"),
+            )
+            details = f" ({event_start} to {event_end})"
         response = (
-            f"I prepared an approval request to {verb} **{event_title}**. "
+            f"I prepared an approval request to {verb} **{event_title}**"
+            f"{details}. "
             "Review the approval card below. Google Calendar will not be "
             "changed unless you approve and separately execute the request."
         )
@@ -762,27 +913,12 @@ def calendar_agent_node(
                 ],
             }
         create_enabled = capabilities.get(
-            "create_feature_enabled",
+            "write_permission_granted",
             capabilities.get(
                 "create_execution_available",
                 capabilities.get("write_execution_available", False),
             ),
         )
-        if not create_enabled:
-            response = (
-                "I can read your Google Calendar, but creating events is "
-                "currently unavailable. I haven't created or modified anything."
-            )
-            return {
-                "assistant_response": response,
-                "provider": "",
-                "model": "",
-                "messages": [
-                    {"role": "user", "content": state["user_message"]},
-                    {"role": "assistant", "content": response},
-                ],
-            }
-
         connection_id = context.get("calendar_write_connection_id")
         user_id = context.get("user_id")
         if context.get("calendar_selected_write_scope_missing", False):
@@ -800,13 +936,11 @@ def calendar_agent_node(
                     {"role": "assistant", "content": response},
                 ],
             }
-        if not capabilities.get(
-            "create_execution_available",
-            capabilities.get("write_execution_available", False),
-        ):
+        if not create_enabled:
             response = (
-                "The selected Google account does not have the enabled "
-                "Calendar write capability. Nothing was created."
+                "The selected Google account is missing Calendar write "
+                "permission. Grant access for that account in Connected Apps. "
+                "Nothing was created."
             )
             return {
                 "assistant_response": response,
@@ -817,7 +951,7 @@ def calendar_agent_node(
                     {"role": "assistant", "content": response},
                 ],
             }
-        if not connection_id or not user_id or not isinstance(arguments, dict):
+        if not connection_id or not user_id:
             response = (
                 "I couldn’t safely select an authorized Google Calendar account "
                 "for this event. Nothing was created."
@@ -831,7 +965,55 @@ def calendar_agent_node(
                     {"role": "assistant", "content": response},
                 ],
             }
-
+        if not isinstance(arguments, dict):
+            message = state["user_message"]
+            times = re.findall(
+                r"\b\d{1,2}:\d{2}\b|"
+                r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b",
+                message,
+                re.IGNORECASE,
+            )
+            has_date = re.search(
+                r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|"
+                r"friday|saturday|sunday|20\d{2}-\d{2}-\d{2})\b",
+                message,
+                re.IGNORECASE,
+            )
+            if len(times) == 2 and not has_date:
+                response = (
+                    f"What date should I schedule this event for, "
+                    f"{times[0]}–{times[1]}? I’ll use "
+                    f"{state.get('user_timezone', 'UTC')}."
+                )
+            elif len(times) == 1 and has_date:
+                response = (
+                    f"What end time should I use for this event? "
+                    f"I’ll use {state.get('user_timezone', 'UTC')}."
+                )
+            elif len(times) == 1:
+                response = (
+                    f"What date and end time should I use for this event? "
+                    f"I’ll use {state.get('user_timezone', 'UTC')}."
+                )
+            elif not times:
+                response = (
+                    "What date and start and end times should I use for the "
+                    "Calendar event? I’ll use your selected timezone."
+                )
+            else:
+                response = (
+                    "What title and start and end times should I use for the "
+                    "Calendar event?"
+                )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
         try:
             parameters = CalendarCreateEventParameters.model_validate(arguments)
             with SessionLocal() as db:
@@ -922,7 +1104,16 @@ def calendar_agent_node(
         }
 
     if tool_name == "create_calendar_event_proposal":
-        return _create_event_proposal(state, runtime, arguments)
+        proposal_result = _create_event_proposal(state, runtime, arguments)
+        supersedes_proposal_id = plan.get("supersedes_proposal_id")
+        if (
+            proposal_result.get("calendar_create_event_proposal") is not None
+            and isinstance(supersedes_proposal_id, str)
+        ):
+            proposal_result["calendar_proposal_supersedes_id"] = (
+                supersedes_proposal_id
+            )
+        return proposal_result
 
     context = runtime.context
     user_id = context.get("user_id")

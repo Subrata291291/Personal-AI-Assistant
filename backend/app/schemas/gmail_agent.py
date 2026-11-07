@@ -56,6 +56,7 @@ class IntegrationPlan(GmailPlanBase):
         "clarify",
     ] | None = None
     calendar_arguments: dict[str, object] | None = None
+    supersedes_proposal_id: str | None = None
 
 
 class MeetingDiscoveryPlan(GmailPlanBase):
