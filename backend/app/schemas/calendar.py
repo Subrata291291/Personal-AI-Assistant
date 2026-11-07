@@ -33,6 +33,7 @@ class CalendarEvent(BaseModel):
     description: str | None = None
     location: str | None = None
     status: str | None = None
+    etag: str | None = None
     html_link: str | None = None
     start: CalendarEventTime | None = None
     end: CalendarEventTime | None = None
