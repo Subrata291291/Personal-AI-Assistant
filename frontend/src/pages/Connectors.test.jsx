@@ -289,9 +289,15 @@ describe('Connected Apps', () => {
     }).closest('article')
     expect(await within(calendarCard).findByText('Connected · Enabled'))
       .toBeInTheDocument()
-    expect(screen.getByText(
-      'Calendar event-read: available · FreeBusy: not granted · Calendar chat: available · Calendar writes: not available.',
+    expect(within(calendarCard).getByText(
+      'Assistant Calendar context: Available',
     )).toBeInTheDocument()
+    expect(within(calendarCard).getByText('Event-read: Granted'))
+      .toBeInTheDocument()
+    expect(within(calendarCard).getByText('FreeBusy: Not granted'))
+      .toBeInTheDocument()
+    expect(within(calendarCard).queryByText(/Calendar chat/))
+      .not.toBeInTheDocument()
     expect(screen.queryByRole('button', {
       name: 'Grant missing Calendar permissions',
     })).not.toBeInTheDocument()
@@ -388,11 +394,95 @@ describe('Connected Apps', () => {
     expect(await screen.findByRole('switch', {
       name: 'Enable Google Calendar',
     })).toHaveAttribute('aria-checked', 'true')
-    expect(await screen.findByText(
-      'Calendar event-read: available · FreeBusy: available · Calendar chat: available · Calendar writes: not available.',
+    const calendarCard = screen.getByRole('heading', {
+      name: 'Google Calendar',
+    }).closest('article')
+    expect(await within(calendarCard).findByText(
+      'Assistant Calendar context: Available',
     )).toBeInTheDocument()
+    expect(within(calendarCard).getByText('Event-read: Granted'))
+      .toBeInTheDocument()
+    expect(within(calendarCard).getByText('FreeBusy: Granted'))
+      .toBeInTheDocument()
     expect(screen.queryByLabelText('Default Calendar account'))
       .not.toBeInTheDocument()
+  })
+
+  it('distinguishes Calendar write permission, feature flags, and execution', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        ...googleConnection.capabilities,
+        calendar: true,
+        calendar_events_read: true,
+        calendar_freebusy: true,
+        calendar_api_available: true,
+        calendar_write_permission_granted: true,
+        calendar_create_feature_enabled: false,
+        calendar_update_feature_enabled: false,
+        calendar_delete_feature_enabled: false,
+        calendar_create_execution_available: false,
+        calendar_update_execution_available: false,
+        calendar_delete_execution_available: false,
+      },
+    }], {
+      ...noCalendarCapabilities,
+      connected: true,
+      events_read: true,
+      freebusy: true,
+      api_available: true,
+      google_connection_available: true,
+      write_permission_granted: true,
+      write_available: false,
+    }))
+    renderConnectors()
+
+    const calendarCard = screen.getByRole('heading', {
+      name: 'Google Calendar',
+    }).closest('article')
+    expect(await within(calendarCard).findByText('Write permission: Granted'))
+      .toBeInTheDocument()
+    expect(within(calendarCard).getByText(
+      'Access calendar events and availability. Write permission is granted, but event creation, updates and deletion are currently disabled.',
+    )).toBeInTheDocument()
+    expect(within(calendarCard).getByText(
+      'Create: Disabled · Execution not available',
+    )).toBeInTheDocument()
+    expect(within(calendarCard).getByText(
+      'Update: Disabled · Execution not available',
+    )).toBeInTheDocument()
+    expect(within(calendarCard).getByText(
+      'Delete: Disabled · Execution not available',
+    )).toBeInTheDocument()
+    expect(screen.queryByRole('button', {
+      name: 'Grant Calendar write access',
+    })).not.toBeInTheDocument()
+  })
+
+  it('does not offer write consent when the backend cannot verify permission status', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        ...googleConnection.capabilities,
+        calendar: true,
+        calendar_events_read: true,
+      },
+    }], {
+      ...noCalendarCapabilities,
+      connected: true,
+      events_read: true,
+      api_available: true,
+      google_connection_available: true,
+    }))
+    renderConnectors()
+
+    const account = await screen.findByText('person@example.com')
+    const accountCard = account.closest('article')
+    expect(within(accountCard).getByText(/Write permission: Not available/))
+      .toBeInTheDocument()
+    expect(within(accountCard).queryByRole('button', {
+      name: 'Grant Calendar write access',
+    })).not.toBeInTheDocument()
   })
 
   it('confirms account-wide disconnection and preserves it when declined', async () => {

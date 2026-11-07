@@ -21,8 +21,8 @@ class UserSettings(Base):
     memory_enabled: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
-        default=False,
-        server_default="false",
+        default=True,
+        server_default="true",
     )
 
     created_at: Mapped[datetime] = mapped_column(

@@ -13,6 +13,11 @@ import { api } from '../lib/api.js'
 import { formatRequestError } from '../lib/errorMessage.js'
 import { requireConnectionsResponse } from '../lib/responseValidation'
 import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
+import {
+  GOOGLE_CONNECTIONS_STALE_TIME,
+  PRIVATE_DATA_GC_TIME,
+  PRIVATE_DATA_STALE_TIME,
+} from '../lib/queryClient.js'
 import { gmailService } from '../services/gmailService.js'
 import { actionApprovalService } from '../services/actionApprovalService.js'
 import { useAuth } from '../context/AuthContext'
@@ -23,8 +28,6 @@ import {
   sortGmailMessagesByReceivedTime,
 } from '../utils/gmailTimestamp.js'
 
-const CACHE_TIME = 5 * 60 * 1000
-const GC_TIME = 30 * 60 * 1000
 const EMPTY_CONNECTIONS = []
 
 const FOLDERS = [
@@ -37,6 +40,11 @@ const FOLDERS = [
   { id: 'spam', label: 'Spam', icon: '🚫' },
   { id: 'trash', label: 'Trash', icon: '🗑️' },
 ]
+
+function getSavedWorkspaceValue(userId, key, fallback) {
+  if (!userId) return fallback
+  return sessionStorage.getItem(`gmail-workspace-${key}-${userId}`) ?? fallback
+}
 
 function getAttachmentName(attachment) {
   return (
@@ -132,10 +140,19 @@ export default function Gmail() {
   const isGmailEnabled = user?.user_metadata?.gmail_enabled !== false
 
   const [connectionId, setConnectionId] = useState('')
-  const [activeFolder, setActiveFolder] = useState('inbox')
+  const [activeFolder, setActiveFolder] = useState(() => {
+    const savedFolder = getSavedWorkspaceValue(userId, 'folder', 'inbox')
+    return FOLDERS.some((folder) => folder.id === savedFolder)
+      ? savedFolder
+      : 'inbox'
+  })
 
-  const [searchInput, setSearchInput] = useState('')
-  const [searchQuery, setSearchQuery] = useState('')
+  const [searchInput, setSearchInput] = useState(
+    () => getSavedWorkspaceValue(userId, 'search-input', ''),
+  )
+  const [searchQuery, setSearchQuery] = useState(
+    () => getSavedWorkspaceValue(userId, 'search-query', ''),
+  )
   const searchTimerRef = useRef(null)
 
   const [selectedMessageId, setSelectedMessageId] = useState(null)
@@ -192,6 +209,13 @@ export default function Gmail() {
     [],
   )
 
+  useEffect(() => {
+    if (!userId) return
+    sessionStorage.setItem(`gmail-workspace-folder-${userId}`, activeFolder)
+    sessionStorage.setItem(`gmail-workspace-search-input-${userId}`, searchInput)
+    sessionStorage.setItem(`gmail-workspace-search-query-${userId}`, searchQuery)
+  }, [activeFolder, searchInput, searchQuery, userId])
+
   const colors = {
     card: isDark
       ? 'border-[#252838] bg-[#11131c]'
@@ -239,11 +263,11 @@ export default function Gmail() {
 
     enabled: Boolean(userId),
 
-    staleTime: 0,
-    gcTime: GC_TIME,
+    staleTime: GOOGLE_CONNECTIONS_STALE_TIME,
+    gcTime: PRIVATE_DATA_GC_TIME,
 
-    refetchOnMount: 'always',
-    refetchOnWindowFocus: 'always',
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
   })
 
   const connections =
@@ -267,10 +291,8 @@ export default function Gmail() {
       ),
     [googleConnections, connectionId],
   )
-  const connectionsVerified =
-    connectionsQuery.isSuccess &&
-    !connectionsQuery.isFetching &&
-    !connectionsQuery.isError
+  const connectionsVerified = Boolean(connectionsQuery.data) &&
+    ![401, 403].includes(connectionsQuery.error?.status)
   const canUseGmail = Boolean(
     connectionsVerified && selectedConnection && isGmailEnabled,
   )
@@ -829,8 +851,7 @@ export default function Gmail() {
     if (
       !userId ||
       connectionsQuery.isLoading ||
-      connectionsQuery.isFetching ||
-      connectionsQuery.isError
+      !connectionsVerified
     ) return
 
     const storageKey = `gmail-selected-account-${userId}`
@@ -873,9 +894,8 @@ export default function Gmail() {
     setConnectionId(nextConnectionId)
     sessionStorage.setItem(storageKey, nextConnectionId)
   }, [
-    connectionsQuery.isError,
-    connectionsQuery.isFetching,
     connectionsQuery.isLoading,
+    connectionsVerified,
     googleConnections,
     connectionId,
     userId,
@@ -933,8 +953,8 @@ export default function Gmail() {
     getNextPageParam: (lastPage) =>
       lastPage.next_page_token || undefined,
 
-    staleTime: CACHE_TIME,
-    gcTime: GC_TIME,
+    staleTime: PRIVATE_DATA_STALE_TIME,
+    gcTime: PRIVATE_DATA_GC_TIME,
 
     refetchOnMount: true,
     refetchOnWindowFocus: true,
@@ -969,8 +989,8 @@ export default function Gmail() {
 
     enabled: Boolean(canUseGmail && selectedMessageId),
 
-    staleTime: CACHE_TIME,
-    gcTime: GC_TIME,
+    staleTime: PRIVATE_DATA_STALE_TIME,
+    gcTime: PRIVATE_DATA_GC_TIME,
 
     refetchOnMount: true,
     refetchOnWindowFocus: true,
@@ -1716,7 +1736,7 @@ export default function Gmail() {
           Connected Google account
         </label>
 
-        {connectionsQuery.isLoading || connectionsQuery.isFetching ? (
+        {connectionsQuery.isLoading ? (
           <p className={`text-sm ${colors.muted}`}>
             Checking connected accounts...
           </p>

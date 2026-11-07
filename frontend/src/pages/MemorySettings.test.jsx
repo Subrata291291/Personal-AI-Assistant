@@ -57,6 +57,7 @@ function renderPage(page, {
   let persistedMemoryEnabled = initialMemoryEnabled
   api.get.mockImplementation((path) => {
     if (path === '/api/v1/me/settings') {
+      if (persistedMemoryEnabled === null) return Promise.resolve({})
       return Promise.resolve({ memory_enabled: persistedMemoryEnabled })
     }
     if (path.startsWith('/api/v1/memory-reviews')) {
@@ -103,7 +104,7 @@ describe('memory preference controls', () => {
     expect(checkbox).toBeChecked()
     expect(screen.getByText('Personal details may be saved to help future conversations.'))
       .toBeInTheDocument()
-    expect(checkbox.nextElementSibling).toHaveClass('bg-emerald-600')
+    expect(checkbox.nextElementSibling).toHaveClass('bg-emerald-700')
 
     fireEvent.click(checkbox)
     await waitFor(() => {
@@ -167,6 +168,14 @@ describe('memory preference controls', () => {
         .toHaveAttribute('aria-checked', 'false')
       expect(screen.getByText('OFF')).toBeInTheDocument()
     })
+  })
+
+  it('defaults the Automatic Memory switch ON when the backend has no saved setting', async () => {
+    renderPage(<MemoryCenter />, { initialMemoryEnabled: null })
+
+    expect(await screen.findByRole('switch', { name: 'Automatic Memory' }))
+      .toHaveAttribute('aria-checked', 'true')
+    expect(api.patch).not.toHaveBeenCalled()
   })
 
   it('rolls back a failed toggle and prevents duplicate updates while saving', async () => {

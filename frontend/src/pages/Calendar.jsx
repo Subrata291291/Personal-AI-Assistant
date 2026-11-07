@@ -10,11 +10,75 @@ import {
   isGoogleServiceEnabled,
 } from '../lib/googleServiceCapabilities.js'
 import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
+import {
+  GOOGLE_CONNECTIONS_STALE_TIME,
+  PRIVATE_DATA_GC_TIME,
+  PRIVATE_DATA_STALE_TIME,
+} from '../lib/queryClient.js'
 import { calendarService } from '../services/calendarService.js'
 
 const EMPTY_CONNECTIONS = []
 const CONNECTIONS_QUERY_KEY = (userId) => ['oauth-connections', userId]
 const DAY_MINUTES = 24 * 60
+const CALENDAR_STATE_KEY = (userId, key) =>
+  `calendar-workspace-${key}-${userId}`
+const HTML_DESCRIPTION_TAG = /<\/?[a-z][^>]*>/i
+const DESCRIPTION_BLOCK_TAGS = new Set([
+  'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DIV', 'FOOTER', 'H1', 'H2',
+  'H3', 'H4', 'H5', 'H6', 'HEADER', 'LI', 'OL', 'P', 'PRE', 'SECTION',
+  'TABLE', 'TR', 'UL',
+])
+
+function formatEventDescription(description) {
+  if (typeof description !== 'string' || !description.trim()) return ''
+  if (!HTML_DESCRIPTION_TAG.test(description)) return description
+
+  const parsed = new DOMParser().parseFromString(description, 'text/html')
+  const parts = []
+  const appendLineBreak = (count = 1) => {
+    const text = parts.join('')
+    if (text && !text.endsWith('\n')) parts.push('\n')
+    if (count === 2 && !parts.join('').endsWith('\n\n')) parts.push('\n')
+  }
+  const visit = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.nodeValue || '')
+      return
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return
+
+    const { tagName } = node
+    if (['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT'].includes(tagName)) return
+    const isBlock = DESCRIPTION_BLOCK_TAGS.has(tagName)
+    if (isBlock) appendLineBreak(tagName === 'P' ? 2 : 1)
+    if (tagName === 'BR') {
+      parts.push('\n')
+      return
+    }
+    if (tagName === 'LI') parts.push('• ')
+
+    for (const child of node.childNodes) visit(child)
+
+    if (tagName === 'A') {
+      const href = node.getAttribute('href')?.trim()
+      const linkText = node.textContent.trim()
+      if (
+        href &&
+        /^(https?:\/\/|mailto:)/i.test(href) &&
+        !linkText.includes(href)
+      ) {
+        parts.push(` (${href})`)
+      }
+    }
+    if (isBlock) appendLineBreak(tagName === 'P' ? 2 : 1)
+  }
+
+  for (const child of parsed.body.childNodes) visit(child)
+  return parts.join('')
+    .replace(/[ \t]*\n[ \t]*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
 
 function getTimeZone(user) {
   const configured = user?.user_metadata?.timezone
@@ -27,6 +91,11 @@ function getTimeZone(user) {
     }
   }
   return 'Asia/Kolkata'
+}
+
+function getCalendarState(userId, key, fallback) {
+  if (!userId) return fallback
+  return sessionStorage.getItem(CALENDAR_STATE_KEY(userId, key)) ?? fallback
 }
 
 function addDays(date, count) {
@@ -259,6 +328,28 @@ function eventOccursOnDate(event, date, timeZone) {
   )
 }
 
+function getUpcomingEvent(events, today, timeZone, now) {
+  const nowParts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(now).map(({ type, value }) => [type, value]),
+  )
+  const currentMinute = Number(nowParts.hour) * 60 + Number(nowParts.minute)
+  return events
+    .map((event) => ({ event, start: eventDateTime(event.start, timeZone) }))
+    .filter(({ start }) => start && (
+      start.date > today ||
+      (start.date === today && (start.allDay || start.minutes >= currentMinute))
+    ))
+    .sort((left, right) =>
+      left.start.date.localeCompare(right.start.date) ||
+      (left.start.minutes || 0) - (right.start.minutes || 0),
+    )[0]?.event || null
+}
+
 function eventPosition(event, date, timeZone) {
   const start = eventDateTime(event.start, timeZone)
   const end = eventDateTime(event.end, timeZone)
@@ -286,29 +377,180 @@ function formatTime(value, timeZone) {
   }).format(instant)
 }
 
-function EventButton({ event, timeZone, onClick, compact = false }) {
+function formatEventTimeRange(event, timeZone) {
+  if (typeof event.start?.date === 'string') return 'All day'
+
+  const start = new Date(event.start?.date_time)
+  const end = new Date(event.end?.date_time)
+  if (
+    typeof event.start?.date_time !== 'string' ||
+    typeof event.end?.date_time !== 'string' ||
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime())
+  ) {
+    return 'Time unavailable'
+  }
+
+  const formatter = new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone,
+  })
+  return `${formatter.format(start)} – ${formatter.format(end)}`
+}
+
+function formatEventDate(event, timeZone) {
+  const start = eventDateTime(event.start, timeZone)
+  if (!start) return 'Date unavailable'
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC',
+  }).format(new Date(`${start.date}T12:00:00Z`))
+}
+
+const EVENT_CARD_PALETTES = [
+  'border-[#36899B] bg-[#D5F1F6] text-slate-900',
+  'border-[#A96B2C] bg-[#F9E3C9] text-slate-900',
+  'border-[#995487] bg-[#F4D7EE] text-slate-900',
+  'border-[#6E61A8] bg-[#DDD8F8] text-slate-900',
+  'border-[#4E8972] bg-[#DCEFE8] text-slate-900',
+]
+
+function eventPaletteIndex(event) {
+  const key = String(event.id || event.summary || '')
+  let hash = 0
+  for (const character of key) {
+    hash = (hash * 31 + character.charCodeAt(0)) >>> 0
+  }
+  return hash % EVENT_CARD_PALETTES.length
+}
+
+function attendeeLabel(attendee) {
+  return attendee.display_name?.trim() || attendee.email?.trim() || 'Attendee'
+}
+
+function attendeeInitials(attendee) {
+  const words = attendeeLabel(attendee).split(/[\s@._-]+/).filter(Boolean)
+  if (words.length > 1) {
+    return `${words[0][0]}${words[words.length - 1][0]}`.toUpperCase()
+  }
+  return (words[0] || '?').slice(0, 2).toUpperCase()
+}
+
+function AttendeeAvatars({
+  attendees = [],
+  isDark,
+  userEmail,
+  userAvatar,
+  maxVisible = 4,
+}) {
+  const namedAttendees = attendees.filter(
+    (attendee) => attendee.display_name?.trim() || attendee.email?.trim(),
+  )
+  if (namedAttendees.length === 0) return null
+
+  const visibleAttendees = namedAttendees.slice(0, maxVisible)
+  const remaining = namedAttendees.length - visibleAttendees.length
+  return (
+    <span role="group" aria-label="Attendees" className="mt-1.5 flex items-center gap-1">
+      {visibleAttendees.map((attendee, index) => {
+        const label = attendeeLabel(attendee)
+        const isCurrentUser = Boolean(
+          userAvatar &&
+          userEmail &&
+          attendee.email?.toLowerCase() === userEmail.toLowerCase(),
+        )
+        return (
+          <span
+            key={`${attendee.email || label}-${index}`}
+            role="img"
+            aria-label={`${label} avatar`}
+            title={label}
+            className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-[8px] font-semibold ${
+              isDark
+                ? 'border-slate-600 bg-slate-800 text-slate-200'
+                : 'border-white bg-white/80 text-slate-700 shadow-sm'
+            }`}
+          >
+            {isCurrentUser ? (
+              <img
+                src={userAvatar}
+                alt=""
+                referrerPolicy="no-referrer"
+                className="h-full w-full rounded-full object-cover"
+              />
+            ) : attendeeInitials(attendee)}
+          </span>
+        )
+      })}
+      {remaining > 0 && (
+        <span className={`text-[9px] font-medium ${
+          isDark ? 'text-slate-300' : 'text-slate-600'
+        }`}>
+          +{remaining}
+        </span>
+      )}
+    </span>
+  )
+}
+
+function EventButton({
+  event,
+  timeZone,
+  onClick,
+  compact = false,
+  showTime = !compact,
+  isDark,
+  userEmail,
+  userAvatar,
+}) {
+  const lightPalette = EVENT_CARD_PALETTES[eventPaletteIndex(event)]
   return (
     <button
       type="button"
       title={event.summary || 'Untitled event'}
       onClick={onClick}
-      className={`block w-full truncate rounded px-1.5 py-1 text-left text-xs ${
-        compact
-          ? 'bg-violet-500/15 text-violet-700 dark:text-violet-200'
-          : 'border border-violet-500/40 bg-violet-500/20 text-violet-800 dark:text-violet-100'
+      className={`block w-full text-left text-xs ${
+        isDark
+          ? compact
+            ? 'rounded bg-violet-500/15 px-1.5 py-1 text-violet-200'
+            : 'rounded border border-violet-500/40 bg-violet-500/20 px-1.5 py-1 text-violet-100'
+          : `rounded-lg border-l-[3px] ${lightPalette} px-2 py-1.5 font-semibold shadow-sm shadow-slate-900/[0.04] transition-colors hover:brightness-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700`
       }`}
     >
-      {event.summary?.trim() || 'Untitled event'}
-      {!compact && (
-        <span className="block truncate text-[10px] opacity-80">
-          {formatTime(event.start, timeZone)}
+      <span className="block truncate">
+        {event.summary?.trim() || 'Untitled event'}
+      </span>
+      {showTime && (
+        <span className={`block truncate text-[10px] ${
+          isDark ? 'opacity-80' : 'font-medium text-slate-700'
+        }`}>
+          {formatEventTimeRange(event, timeZone)}
         </span>
       )}
+      <AttendeeAvatars
+        attendees={event.attendees}
+        isDark={isDark}
+        userEmail={userEmail}
+        userAvatar={userAvatar}
+      />
     </button>
   )
 }
 
-function CalendarTimeline({ dates, events, timeZone, onSelect, isDark }) {
+function CalendarTimeline({
+  dates,
+  events,
+  timeZone,
+  onSelect,
+  selectedDate,
+  isDark,
+  userEmail,
+  userAvatar,
+}) {
   const hours = Array.from({ length: 24 }, (_, hour) => hour)
   const [now, setNow] = useState(() => new Date())
   useEffect(() => {
@@ -331,26 +573,44 @@ function CalendarTimeline({ dates, events, timeZone, onSelect, isDark }) {
         className="grid min-w-[760px]"
         style={{ gridTemplateColumns: `4.5rem repeat(${dates.length}, minmax(0, 1fr))` }}
       >
-        <div className="sticky top-0 z-10 border-b border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900" />
+        <div className={`sticky top-0 z-10 border-b ${
+          isDark
+            ? 'border-slate-700 bg-slate-900'
+            : 'border-[#E5EDE8] bg-[#F6FAF8]'
+        }`} />
         {dates.map((date) => (
           <div
             key={date}
-            className="sticky top-0 z-10 border-b border-l border-slate-200 bg-white px-2 py-2 text-center text-xs dark:border-slate-700 dark:bg-slate-900"
+            className={`sticky top-0 z-10 border-b border-l px-2 py-2 text-center text-xs ${
+              isDark
+                ? 'border-slate-700 bg-slate-900'
+                : 'border-[#E5EDE8] bg-[#F6FAF8]'
+            }`}
           >
-            <div className="text-slate-500">
+            <div className={isDark ? 'text-slate-500' : 'font-semibold uppercase tracking-wide text-slate-500'}>
               {new Intl.DateTimeFormat(undefined, {
                 weekday: 'short',
                 timeZone: 'UTC',
               }).format(new Date(`${date}T12:00:00Z`))}
             </div>
-            <div className={`mx-auto mt-1 flex h-7 w-7 items-center justify-center rounded-full font-semibold ${
-              date === today ? 'bg-violet-600 text-white' : ''
+            <div className={`mx-auto mt-1 flex items-center justify-center rounded-full font-semibold ${
+              isDark
+                ? `h-7 w-7 text-xs ${date === today ? 'bg-violet-600 text-white' : ''}`
+                : date === selectedDate
+                  ? 'h-9 w-9 text-base bg-[#DCEFE8] text-[#245C4B] ring-1 ring-[#B8D8CB]'
+                  : date === today
+                    ? 'h-9 w-9 text-base text-teal-800 ring-1 ring-teal-300'
+                    : 'h-9 w-9 text-base text-slate-800'
             }`}>
               {Number(date.slice(-2))}
             </div>
           </div>
         ))}
-        <div className="border-b border-slate-200 py-2 pr-2 text-right text-[10px] text-slate-500 dark:border-slate-700">
+        <div className={`border-b py-2 pr-2 text-right text-[10px] ${
+          isDark
+            ? 'border-slate-700 text-slate-500'
+            : 'border-[#E5EDE8] text-slate-500'
+        }`}>
           All day
         </div>
         {dates.map((date) => {
@@ -358,13 +618,19 @@ function CalendarTimeline({ dates, events, timeZone, onSelect, isDark }) {
             event.start?.date && eventOccursOnDate(event, date, timeZone),
           )
           return (
-            <div key={`all-day-${date}`} className="min-h-8 border-b border-l border-slate-200 p-1 dark:border-slate-700">
+            <div key={`all-day-${date}`} className={`min-h-8 border-b border-l p-1 ${
+              isDark ? 'border-slate-700' : 'border-[#E5EDE8]'
+            }`}>
               {allDay.map((event) => (
                 <EventButton
                   key={event.id}
                   event={event}
                   timeZone={timeZone}
                   compact
+                  showTime
+                  isDark={isDark}
+                  userEmail={userEmail}
+                  userAvatar={userAvatar}
                   onClick={() => onSelect(event)}
                 />
               ))}
@@ -375,7 +641,11 @@ function CalendarTimeline({ dates, events, timeZone, onSelect, isDark }) {
           {hours.map((hour) => (
             <div
               key={hour}
-              className="h-14 border-b border-slate-200 pr-2 text-right text-[10px] text-slate-500 dark:border-slate-700"
+              className={`h-14 border-b pr-2 text-right text-[10px] ${
+                isDark
+                  ? 'border-slate-700 text-slate-500'
+                  : 'border-[#E5EDE8] text-slate-500'
+              }`}
             >
               {hour === 0 ? '' : `${String(hour).padStart(2, '0')}:00`}
             </div>
@@ -388,13 +658,17 @@ function CalendarTimeline({ dates, events, timeZone, onSelect, isDark }) {
           return (
             <div
               key={date}
-              className="relative border-l border-slate-200 dark:border-slate-700"
+              className={`relative border-l ${
+                isDark ? 'border-slate-700' : 'border-[#E5EDE8]'
+              }`}
             >
               <div className="relative">
                 {hours.map((hour) => (
                   <div
                     key={hour}
-                    className="h-14 border-b border-slate-200/80 dark:border-slate-700/80"
+                    className={`h-14 border-b ${
+                      isDark ? 'border-slate-700/80' : 'border-[#EDF2EE]'
+                    }`}
                   />
                 ))}
                 {timed.map((event) => {
@@ -409,6 +683,9 @@ function CalendarTimeline({ dates, events, timeZone, onSelect, isDark }) {
                       <EventButton
                         event={event}
                         timeZone={timeZone}
+                        isDark={isDark}
+                        userEmail={userEmail}
+                        userAvatar={userAvatar}
                         onClick={() => onSelect(event)}
                       />
                     </div>
@@ -418,7 +695,7 @@ function CalendarTimeline({ dates, events, timeZone, onSelect, isDark }) {
                   <div
                     aria-label="Current time"
                     className={`pointer-events-none absolute z-[3] h-0.5 w-full ${
-                      isDark ? 'bg-red-400' : 'bg-red-600'
+                      isDark ? 'bg-red-400' : 'bg-teal-600'
                     }`}
                     style={{ top: `${(currentMinute / DAY_MINUTES) * 100}%` }}
                   />
@@ -439,13 +716,33 @@ export default function Calendar() {
   const timeZone = useMemo(() => getTimeZone(user), [user])
   const enabled = isGoogleServiceEnabled('calendar', user?.user_metadata)
   const [today, setToday] = useState(() => dateInZone(new Date(), timeZone))
-  const [selectedDate, setSelectedDate] = useState(today)
-  const [view, setView] = useState('month')
-  const [connectionId, setConnectionId] = useState('')
+  const [selectedDate, setSelectedDate] = useState(() => {
+    const savedDate = getCalendarState(userId, 'date', today)
+    return /^\d{4}-\d{2}-\d{2}$/.test(savedDate) ? savedDate : today
+  })
+  const [view, setView] = useState(() => {
+    const savedView = getCalendarState(userId, 'view', 'week')
+    return ['month', 'week', 'day'].includes(savedView) ? savedView : 'week'
+  })
+  const [showTimedEvents, setShowTimedEvents] = useState(
+    () => getCalendarState(userId, 'timed-events', 'true') !== 'false',
+  )
+  const [showAllDayEvents, setShowAllDayEvents] = useState(
+    () => getCalendarState(userId, 'all-day-events', 'true') !== 'false',
+  )
+  const [connectionId, setConnectionId] = useState(
+    () => getCalendarState(userId, 'connection', ''),
+  )
   const [eventId, setEventId] = useState('')
-  const [searchOpen, setSearchOpen] = useState(false)
-  const [searchInput, setSearchInput] = useState('')
-  const [searchQuery, setSearchQuery] = useState('')
+  const [searchOpen, setSearchOpen] = useState(
+    () => Boolean(getCalendarState(userId, 'search-query', '')),
+  )
+  const [searchInput, setSearchInput] = useState(
+    () => getCalendarState(userId, 'search-input', ''),
+  )
+  const [searchQuery, setSearchQuery] = useState(
+    () => getCalendarState(userId, 'search-query', ''),
+  )
   const [freeBusyOpen, setFreeBusyOpen] = useState(false)
   const [freeBusyStart, setFreeBusyStart] = useState(`${today}T14:00`)
   const [freeBusyEnd, setFreeBusyEnd] = useState(`${today}T16:00`)
@@ -468,9 +765,9 @@ export default function Calendar() {
       await api.get('/api/v1/oauth/connections'),
     ),
     enabled: Boolean(userId),
-    staleTime: 0,
-    gcTime: 30 * 60 * 1000,
-    refetchOnMount: 'always',
+    staleTime: GOOGLE_CONNECTIONS_STALE_TIME,
+    gcTime: PRIVATE_DATA_GC_TIME,
+    refetchOnMount: true,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
   })
@@ -509,10 +806,41 @@ export default function Calendar() {
   const selectedConnection = calendarConnections.find(
     (connection) => connection.id === selectedConnectionId,
   )
+  useEffect(() => {
+    if (!userId) return
+    sessionStorage.setItem(CALENDAR_STATE_KEY(userId, 'date'), selectedDate)
+    sessionStorage.setItem(CALENDAR_STATE_KEY(userId, 'view'), view)
+    sessionStorage.setItem(
+      CALENDAR_STATE_KEY(userId, 'timed-events'),
+      String(showTimedEvents),
+    )
+    sessionStorage.setItem(
+      CALENDAR_STATE_KEY(userId, 'all-day-events'),
+      String(showAllDayEvents),
+    )
+    sessionStorage.setItem(CALENDAR_STATE_KEY(userId, 'search-input'), searchInput)
+    sessionStorage.setItem(CALENDAR_STATE_KEY(userId, 'search-query'), searchQuery)
+  }, [
+    userId,
+    selectedDate,
+    view,
+    showTimedEvents,
+    showAllDayEvents,
+    searchInput,
+    searchQuery,
+  ])
+  useEffect(() => {
+    if (!userId || !connectionsQuery.data) return
+    const key = CALENDAR_STATE_KEY(userId, 'connection')
+    if (selectedConnectionId) {
+      sessionStorage.setItem(key, selectedConnectionId)
+    } else {
+      sessionStorage.removeItem(key)
+    }
+  }, [userId, connectionsQuery.data, selectedConnectionId])
   const connectionsVerified =
-    connectionsQuery.isSuccess &&
-    !connectionsQuery.isFetching &&
-    !connectionsQuery.isError
+    Boolean(connectionsQuery.data) &&
+    ![401, 403].includes(connectionsQuery.error?.status)
   const range = useMemo(() => getViewRange(selectedDate, view), [selectedDate, view])
   const eventsQuery = useQuery({
     queryKey: [
@@ -527,11 +855,16 @@ export default function Calendar() {
     ],
     enabled: Boolean(
       selectedConnectionId &&
+      connectionsVerified &&
       selectedConnection?.capabilities?.calendar_events_read === true &&
       enabled &&
       view !== 'freebusy' &&
       !eventId
     ),
+    staleTime: PRIVATE_DATA_STALE_TIME,
+    gcTime: PRIVATE_DATA_GC_TIME,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
     retry: false,
     queryFn: () => calendarService.listEvents({
       connectionId: selectedConnectionId,
@@ -552,22 +885,42 @@ export default function Calendar() {
       selectedConnection?.capabilities?.calendar_events_read === true &&
       eventId
     ),
+    staleTime: PRIVATE_DATA_STALE_TIME,
+    gcTime: PRIVATE_DATA_GC_TIME,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
     retry: false,
   })
-  const events = eventsQuery.data?.events || []
+  const eventDescription = formatEventDescription(eventQuery.data?.description)
+  const allEvents = eventsQuery.data?.events || []
+  const events = allEvents.filter((event) => (
+    typeof event.start?.date === 'string'
+      ? showAllDayEvents
+      : typeof event.start?.date_time === 'string' && showTimedEvents
+  ))
+  const upcomingEvent = getUpcomingEvent(events, today, timeZone, new Date())
+  const userEmail = user?.email || ''
+  const userAvatar = user?.user_metadata?.avatar_url || user?.user_metadata?.picture || ''
   const gridDates = view === 'month'
     ? getMonthGrid(selectedDate)
     : view === 'week'
       ? Array.from({ length: 7 }, (_, index) => addDays(range.start, index))
       : [selectedDate]
   const monthLabel = dateLabel(selectedDate, view, timeZone)
+  const miniMonthLabel = dateLabel(selectedDate, 'month', timeZone)
   const servicePanel = isDark
     ? 'border-[#252838] bg-[#11131c]'
-    : 'border-slate-200 bg-white'
+    : 'border-[#E0EBE5] bg-white'
   const text = isDark ? 'text-slate-300' : 'text-slate-600'
   const input = isDark
     ? 'border-[#303448] bg-[#171a27] text-slate-100'
-    : 'border-slate-200 bg-white text-slate-800'
+    : 'border-slate-200 bg-white text-slate-800 shadow-sm shadow-slate-900/[0.03]'
+  const control = isDark
+    ? 'border-[#303448] bg-[#171a27] text-slate-100'
+    : 'border-[#DCE8E1] bg-white text-slate-700 shadow-sm shadow-[#315847]/[0.04] hover:border-[#BDD9CC] hover:bg-[#F4FAF6]'
+  const calendarGrid = isDark
+    ? 'border-slate-700'
+    : 'border-[#E5EDE8]'
 
   function navigateDate(amount) {
     setSelectedDate((current) => view === 'month'
@@ -612,7 +965,11 @@ export default function Calendar() {
   }
 
   return (
-    <div className="mx-auto max-w-[1600px] space-y-5">
+    <div className={`mx-auto max-w-[1600px] ${
+      isDark
+        ? 'space-y-5'
+        : 'space-y-8 rounded-[1.375rem] bg-[#EFF7F2] p-5 text-[#263A32] sm:p-8 lg:p-10'
+    }`}>
       <header className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3">
           <img
@@ -621,7 +978,9 @@ export default function Calendar() {
             className="h-10 w-10"
           />
           <div>
-            <p className="text-xs font-bold uppercase tracking-widest text-violet-400">
+            <p className={`text-xs font-bold uppercase tracking-widest ${
+              isDark ? 'text-violet-400' : 'text-teal-800'
+            }`}>
               Google Workspace
             </p>
             <h1 className="text-2xl font-bold">Google Calendar</h1>
@@ -632,7 +991,9 @@ export default function Calendar() {
           <button
             type="button"
             onClick={() => { setSelectedDate(today); setEventId('') }}
-            className={`rounded-lg border px-3 py-2 text-sm ${input}`}
+            className={isDark
+              ? `rounded-lg border px-3 py-2 text-sm ${input}`
+              : `h-10 rounded-lg border px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700 focus-visible:ring-offset-2 focus-visible:ring-offset-white ${control}`}
           >
             Today
           </button>
@@ -640,7 +1001,9 @@ export default function Calendar() {
             type="button"
             aria-label="Previous"
             onClick={() => navigateDate(-1)}
-            className={`rounded-lg border px-3 py-2 ${input}`}
+            className={isDark
+              ? `rounded-lg border px-3 py-2 ${input}`
+              : `h-10 w-10 rounded-lg border text-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700 focus-visible:ring-offset-2 focus-visible:ring-offset-white ${control}`}
           >
             ‹
           </button>
@@ -648,7 +1011,9 @@ export default function Calendar() {
             type="button"
             aria-label="Next"
             onClick={() => navigateDate(1)}
-            className={`rounded-lg border px-3 py-2 ${input}`}
+            className={isDark
+              ? `rounded-lg border px-3 py-2 ${input}`
+              : `h-10 w-10 rounded-lg border text-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700 focus-visible:ring-offset-2 focus-visible:ring-offset-white ${control}`}
           >
             ›
           </button>
@@ -664,20 +1029,32 @@ export default function Calendar() {
                 setEventId('')
               }
             }}
-            className={`rounded-lg border px-3 py-2 text-sm ${input}`}
+            className={isDark
+              ? `rounded-lg border px-3 py-2 text-sm ${input}`
+              : `h-10 rounded-lg border px-3 py-2 text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700 focus-visible:ring-offset-2 focus-visible:ring-offset-white ${control}`}
           />
-          <div className="flex rounded-lg border p-1" role="group" aria-label="Calendar view">
+          <div className={isDark
+            ? 'flex rounded-lg border p-1'
+            : 'flex h-10 items-center rounded-lg border border-[#DDE9E2] bg-[#E8F1EB] p-1'
+          } role="group" aria-label="Calendar view">
             {['month', 'week', 'day'].map((option) => (
               <button
                 key={option}
                 type="button"
+                aria-label={option}
                 aria-pressed={view === option}
                 onClick={() => { setView(option); setEventId('') }}
-                className={`rounded-md px-3 py-1.5 text-sm capitalize ${
-                  view === option ? 'bg-violet-600 text-white' : text
-                }`}
+                className={isDark
+                  ? `rounded-md px-3 py-1.5 text-sm capitalize ${
+                    view === option ? 'bg-violet-600 text-white' : text
+                  }`
+                  : `h-8 rounded-md px-3 text-sm font-medium capitalize transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700 ${
+                    view === option
+                      ? 'bg-white text-teal-800 shadow-sm ring-1 ring-[#D9E7DF]'
+                      : `${text} hover:bg-white/70`
+                  }`}
               >
-                {option}
+                {option === 'day' ? 'Daily' : option === 'week' ? 'Weekly' : 'Monthly'}
               </button>
             ))}
           </div>
@@ -685,26 +1062,30 @@ export default function Calendar() {
             type="button"
             aria-expanded={searchOpen}
             onClick={() => setSearchOpen((open) => !open)}
-            className={`rounded-lg border px-3 py-2 text-sm ${input}`}
+            className={isDark
+              ? `rounded-lg border px-3 py-2 text-sm ${input}`
+              : `h-10 rounded-lg border px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700 focus-visible:ring-offset-2 focus-visible:ring-offset-white ${control}`}
           >
             Search
           </button>
         </div>
       </header>
 
-      <div className="grid gap-4 xl:grid-cols-[230px_minmax(0,1fr)]">
+      <div className="grid gap-5 lg:grid-cols-[260px_minmax(0,1fr)] 2xl:grid-cols-[300px_minmax(0,1fr)]">
         <aside className="space-y-4">
-          <section className={`rounded-2xl border p-4 ${servicePanel}`}>
+          <section className={`rounded-2xl border p-4 ${
+            isDark ? '' : 'rounded-[1.25rem] border-[#E0EBE5] shadow-sm shadow-[#315847]/[0.06]'
+          } ${servicePanel}`}>
             <div className="flex items-center justify-between gap-2">
-              <h2 className="text-lg font-semibold">{monthLabel}</h2>
+              <h2 className="text-lg font-semibold">{miniMonthLabel}</h2>
               <div className="flex gap-1">
-                <button type="button" aria-label="Previous mini month" onClick={() => setSelectedDate(addMonths(selectedDate, -1))} className={`rounded px-2 ${text}`}>‹</button>
-                <button type="button" aria-label="Next mini month" onClick={() => setSelectedDate(addMonths(selectedDate, 1))} className={`rounded px-2 ${text}`}>›</button>
+                <button type="button" aria-label="Previous mini month" onClick={() => setSelectedDate(addMonths(selectedDate, -1))} className={isDark ? `rounded px-2 ${text}` : 'rounded-md px-2 py-1 text-slate-600 transition-colors hover:bg-[#EFF7F2] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700'}>‹</button>
+                <button type="button" aria-label="Next mini month" onClick={() => setSelectedDate(addMonths(selectedDate, 1))} className={isDark ? `rounded px-2 ${text}` : 'rounded-md px-2 py-1 text-slate-600 transition-colors hover:bg-[#EFF7F2] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700'}>›</button>
               </div>
             </div>
-            <div className="mt-3 grid grid-cols-7 gap-y-1 text-center text-xs">
+            <div className="mt-4 grid grid-cols-7 gap-y-2.5 text-center text-xs">
               {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((day, index) => (
-                <span key={`${day}-${index}`} className="py-1 text-slate-500">{day}</span>
+                <span key={`${day}-${index}`} className={`py-1 ${isDark ? 'text-slate-500' : 'font-semibold tracking-wide text-slate-500'}`}>{day}</span>
               ))}
               {getMonthGrid(selectedDate).map((date) => {
                 const inMonth = date.slice(0, 7) === selectedDate.slice(0, 7)
@@ -714,10 +1095,20 @@ export default function Calendar() {
                     key={date}
                     aria-label={date}
                     onClick={() => { setSelectedDate(date); setEventId('') }}
-                    className={`mx-auto h-7 w-7 rounded-full ${
+                    className={`mx-auto h-8 w-8 rounded-full text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700 ${
                       date === selectedDate
-                        ? 'bg-violet-600 text-white'
-                        : inMonth ? text : 'text-slate-500/60'
+                        ? isDark
+                          ? 'bg-violet-600 text-white'
+                          : 'bg-[#DCEFE8] font-semibold text-[#245C4B] ring-1 ring-[#B8D8CB]'
+                        : inMonth
+                          ? isDark
+                            ? `${text} hover:bg-slate-800`
+                            : date === today
+                              ? 'text-teal-800 ring-1 ring-teal-300'
+                              : 'text-slate-700 hover:bg-[#EFF7F2]'
+                          : isDark
+                            ? 'text-slate-500/60 hover:bg-slate-800'
+                            : 'text-slate-500 hover:bg-[#EFF7F2]'
                     }`}
                   >
                     {Number(date.slice(-2))}
@@ -726,47 +1117,131 @@ export default function Calendar() {
               })}
             </div>
           </section>
-          {calendarConnections.length > 1 && (
-            <label className={`block rounded-2xl border p-4 text-sm ${servicePanel}`}>
-              <span className="mb-2 block font-semibold">Calendar account</span>
-              <select
-                aria-label="Calendar account"
-                value={selectedConnectionId}
-                onChange={(event) => {
-                  setConnectionId(event.target.value)
-                  setEventId('')
-                }}
-                className={`w-full rounded-lg border px-3 py-2 ${input}`}
-              >
-                <option value="">Choose an account</option>
-                {calendarConnections.map((connection) => (
-                  <option key={connection.id} value={connection.id}>
-                    {connection.email || 'Google account'}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-          {selectedConnection && (
-            <div className={`rounded-2xl border p-4 text-sm ${servicePanel}`}>
-              <p className="font-semibold">My calendars</p>
-              <p className={`mt-2 truncate ${text}`}>
-                {selectedConnection.email || 'Selected Google account'}
+          <section aria-labelledby="calendar-reminder-heading" className={`rounded-2xl border p-4 ${
+            isDark
+              ? 'border-[#252838] bg-[#11131c]'
+              : 'rounded-[1.25rem] border-[#CBE3D8] bg-[#DCEFE8] shadow-sm shadow-[#315847]/[0.06]'
+          }`}>
+            <h2 id="calendar-reminder-heading" className={`text-sm font-semibold ${
+              isDark ? 'text-slate-100' : 'text-[#245C4B]'
+            }`}>
+              Meeting reminder
+            </h2>
+            {eventsQuery.isLoading ? (
+              <p role="status" className={`mt-3 text-sm ${text}`}>Loading upcoming events…</p>
+            ) : eventsQuery.isError ? (
+              <p className={`mt-3 text-sm ${text}`}>Upcoming events are unavailable.</p>
+            ) : upcomingEvent ? (
+              <div className="mt-3 min-w-0">
+                <p className={`truncate text-base font-semibold ${
+                  isDark ? 'text-slate-100' : 'text-[#263A32]'
+                }`}>
+                  {upcomingEvent.summary?.trim() || 'Untitled event'}
+                </p>
+                <p className={`mt-1 text-xs font-medium ${
+                  isDark ? 'text-slate-400' : 'text-[#45695B]'
+                }`}>
+                  {formatEventDate(upcomingEvent, timeZone)} · {formatEventTimeRange(upcomingEvent, timeZone)}
+                </p>
+                <AttendeeAvatars
+                  attendees={upcomingEvent.attendees}
+                  isDark={isDark}
+                  userEmail={userEmail}
+                  userAvatar={userAvatar}
+                />
+              </div>
+            ) : (
+              <p className={`mt-3 text-sm ${isDark ? 'text-slate-400' : 'text-[#45695B]'}`}>
+                No upcoming meetings in this calendar view.
               </p>
-              {selectedConnection.capabilities?.calendar_freebusy === true && (
-                <button
-                  type="button"
-                  onClick={() => setFreeBusyOpen((open) => !open)}
-                  className="mt-3 text-left text-violet-400 underline"
-                >
-                  {freeBusyOpen ? 'Hide Free/Busy' : 'Check Free/Busy'}
-                </button>
-              )}
+            )}
+          </section>
+          <section aria-labelledby="calendar-filters-heading" className={`rounded-2xl border p-4 ${
+            isDark ? '' : 'rounded-[1.25rem] border-[#E0EBE5] shadow-sm shadow-[#315847]/[0.06]'
+          } ${servicePanel}`}>
+            <h2 id="calendar-filters-heading" className="text-sm font-semibold">Filters</h2>
+            <div className="mt-3 space-y-3">
+              <label className={`flex cursor-pointer items-center gap-2.5 text-sm ${text}`}>
+                <input
+                  type="checkbox"
+                  checked={showTimedEvents}
+                  onChange={(event) => setShowTimedEvents(event.target.checked)}
+                  className="h-4 w-4 accent-teal-700"
+                />
+                Timed events
+              </label>
+              <label className={`flex cursor-pointer items-center gap-2.5 text-sm ${text}`}>
+                <input
+                  type="checkbox"
+                  checked={showAllDayEvents}
+                  onChange={(event) => setShowAllDayEvents(event.target.checked)}
+                  className="h-4 w-4 accent-teal-700"
+                />
+                All-day events
+              </label>
             </div>
-          )}
+          </section>
+          <section aria-labelledby="other-calendars-heading" className={`rounded-2xl border p-4 text-sm ${
+            isDark ? '' : 'rounded-[1.25rem] border-[#E0EBE5] shadow-sm shadow-[#315847]/[0.06]'
+          } ${servicePanel}`}>
+            <h2 id="other-calendars-heading" className="font-semibold">Other calendars</h2>
+            {calendarConnections.length > 1 && (
+              <label className={`mt-3 block ${text}`}>
+                <span className="mb-2 block text-xs font-medium">Calendar account</span>
+                <select
+                  aria-label="Calendar account"
+                  value={selectedConnectionId}
+                  onChange={(event) => {
+                    setConnectionId(event.target.value)
+                    setEventId('')
+                  }}
+                  className={`w-full rounded-lg border px-3 py-2 ${input}`}
+                >
+                  <option value="">Choose an account</option>
+                  {calendarConnections.map((connection) => (
+                    <option key={connection.id} value={connection.id}>
+                      {connection.email || 'Google account'}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {selectedConnection ? (
+              <div className={`mt-3 border-t pt-3 ${
+                isDark ? 'border-slate-700' : 'border-[#E5EDE8]'
+              }`}>
+                <p className={`font-semibold ${isDark ? 'text-slate-100' : 'text-slate-800'}`}>
+                  My calendars
+                </p>
+                <p className={`mt-1 truncate ${text}`}>
+                  {selectedConnection.email || 'Selected Google account'}
+                </p>
+                {selectedConnection.capabilities?.calendar_freebusy === true && (
+                  <button
+                    type="button"
+                    onClick={() => setFreeBusyOpen((open) => !open)}
+                    className={isDark
+                      ? 'mt-3 text-left text-violet-400 underline'
+                      : 'mt-3 inline-flex min-h-9 items-center rounded-lg border border-[#C9E2D6] bg-[#EFF7F2] px-3 text-left text-xs font-semibold text-[#245C4B] transition-colors hover:border-[#A9CEBD] hover:bg-[#E3F1E9] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700'
+                    }
+                  >
+                    {freeBusyOpen ? 'Hide Free/Busy' : 'Check Free/Busy'}
+                  </button>
+                )}
+              </div>
+            ) : (
+              <p className={`mt-2 text-xs ${text}`}>
+                {calendarConnections.length
+                  ? 'Choose a connected Google account to view its calendar.'
+                  : 'No connected calendars are available.'}
+              </p>
+            )}
+          </section>
         </aside>
 
-        <main className={`min-w-0 rounded-2xl border p-4 sm:p-5 ${servicePanel}`}>
+        <main className={`min-w-0 rounded-2xl border p-4 sm:p-5 ${
+          isDark ? '' : 'rounded-[1.25rem] border-[#E0EBE5] shadow-sm shadow-[#315847]/[0.06]'
+        } ${servicePanel}`}>
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <h2 className="text-xl font-semibold">{monthLabel}</h2>
             <span className={`text-sm font-medium ${
@@ -800,7 +1275,14 @@ export default function Calendar() {
                 placeholder="Search events"
                 className={`min-w-0 flex-1 rounded-lg border px-3 py-2 ${input}`}
               />
-              <button type="submit" className="rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white">
+              <button
+                type="submit"
+                className={`min-h-10 rounded-lg px-4 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 ${
+                  isDark
+                    ? 'bg-violet-600 text-white hover:bg-violet-500'
+                    : 'bg-[#286B59] text-white hover:bg-[#205746] focus-visible:ring-offset-white'
+                }`}
+              >
                 Search
               </button>
             </form>
@@ -885,7 +1367,9 @@ export default function Calendar() {
                   {selectedConnection.capabilities?.calendar_events_read === true &&
                     eventsQuery.isSuccess && !eventId && events.length === 0 && (
                     <p role="status" className={`py-10 text-center text-sm ${text}`}>
-                      Google Calendar returned no events for this {view}.
+                      {allEvents.length === 0
+                        ? `Google Calendar returned no events for this ${view}.`
+                        : 'No events match the selected filters.'}
                     </p>
                   )}
                   {selectedConnection.capabilities?.calendar_events_read === true &&
@@ -894,9 +1378,16 @@ export default function Calendar() {
                       ? (
                         <div className="overflow-x-auto">
                           <div className="min-w-[700px]">
-                            <div className="grid grid-cols-7 border-l border-t border-slate-200 dark:border-slate-700">
+                            <div className={isDark
+                              ? `grid grid-cols-7 border-l border-t ${calendarGrid}`
+                              : 'grid grid-cols-7 gap-px overflow-hidden rounded-xl border border-[#E5EDE8] bg-[#E5EDE8]'
+                            }>
                               {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].map((day) => (
-                                <div key={day} className="border-b border-r border-slate-200 p-2 text-center text-xs text-slate-500 dark:border-slate-700">
+                                <div key={day} className={`p-2.5 text-center text-xs ${
+                                  isDark
+                                    ? 'border-b border-r border-slate-700 text-slate-500'
+                                    : 'bg-[#F6FAF8] font-semibold text-slate-600'
+                                }`}>
                                   {day}
                                 </div>
                               ))}
@@ -907,17 +1398,39 @@ export default function Calendar() {
                                 return (
                                   <div
                                     key={date}
-                                    className={`min-h-28 border-b border-r border-slate-200 p-1.5 dark:border-slate-700 ${
+                                    className={`${isDark
+                                      ? 'min-h-28 border-b border-r border-slate-700 p-1.5'
+                                      : 'min-h-36 bg-white p-2 transition-colors hover:bg-[#F4FAF6]'
+                                    } ${
                                       date.slice(0, 7) !== selectedDate.slice(0, 7)
-                                        ? 'bg-slate-50/60 dark:bg-slate-950/30'
-                                        : ''
+                                        ? isDark
+                                          ? 'bg-slate-950/30'
+                                          : 'bg-[#F7FAF8]'
+                                        : isDark
+                                          ? ''
+                                          : 'bg-white'
                                     }`}
                                   >
                                     <button
                                       type="button"
                                       onClick={() => { setSelectedDate(date); setView('day') }}
-                                      className={`mb-1 flex h-7 w-7 items-center justify-center rounded-full text-xs ${
-                                        date === today ? 'bg-violet-600 text-white' : text
+                                      className={`${isDark
+                                        ? 'mb-1 flex h-7 w-7'
+                                        : 'mb-1 flex h-8 w-8'
+                                      } items-center justify-center rounded-full text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 ${
+                                        isDark ? 'focus-visible:ring-indigo-500' : 'focus-visible:ring-teal-700'
+                                      } ${
+                                        isDark
+                                          ? date === today
+                                            ? 'bg-violet-600 text-white'
+                                            : text
+                                          : date === selectedDate
+                                            ? 'bg-[#DCEFE8] text-[#245C4B] ring-1 ring-[#B8D8CB]'
+                                            : date === today
+                                              ? 'text-teal-800 ring-1 ring-teal-300'
+                                              : date.slice(0, 7) !== selectedDate.slice(0, 7)
+                                                ? 'text-slate-500'
+                                                : 'text-slate-800 hover:bg-[#EAF5EF]'
                                       }`}
                                     >
                                       {Number(date.slice(-2))}
@@ -929,6 +1442,10 @@ export default function Calendar() {
                                           event={event}
                                           timeZone={timeZone}
                                           compact
+                                          showTime
+                                          isDark={isDark}
+                                          userEmail={userEmail}
+                                          userAvatar={userAvatar}
                                           onClick={() => selectEvent(event)}
                                         />
                                       ))}
@@ -936,7 +1453,11 @@ export default function Calendar() {
                                         <button
                                           type="button"
                                           onClick={() => { setSelectedDate(date); setView('day') }}
-                                          className="px-1 text-[10px] text-violet-400"
+                                          className={`rounded px-1 text-[10px] font-medium focus-visible:outline-none focus-visible:ring-2 ${
+                                            isDark
+                                              ? 'text-violet-400 hover:text-violet-300 focus-visible:ring-indigo-500'
+                                              : 'text-teal-800 hover:text-teal-950 focus-visible:ring-teal-700'
+                                          }`}
                                         >
                                           +{dayEvents.length - 3} more
                                         </button>
@@ -955,7 +1476,10 @@ export default function Calendar() {
                           events={events}
                           timeZone={timeZone}
                           onSelect={selectEvent}
+                          selectedDate={selectedDate}
                           isDark={isDark}
+                          userEmail={userEmail}
+                          userAvatar={userAvatar}
                         />
                       )
                   )}
@@ -965,9 +1489,9 @@ export default function Calendar() {
                       role="dialog"
                       aria-modal="true"
                       aria-labelledby="calendar-event-title"
-                      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+                      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 sm:items-center"
                     >
-                      <article className={`max-h-[85vh] w-full max-w-xl overflow-y-auto rounded-2xl border p-6 ${servicePanel}`}>
+                      <article className={`max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-x-hidden overflow-y-auto overscroll-contain rounded-2xl border p-6 ${servicePanel}`}>
                         <div className="flex items-start justify-between gap-4">
                           <h3 id="calendar-event-title" className="text-xl font-semibold">
                             {eventQuery.data?.summary?.trim() || 'Event details'}
@@ -993,8 +1517,10 @@ export default function Calendar() {
                             <p>Timezone: {eventQuery.data.start?.time_zone || eventQuery.data.end?.time_zone || timeZone}</p>
                             <p>Calendar: primary · {selectedConnection?.email || 'Selected Google account'}</p>
                             {eventQuery.data.location && <p>Location: {eventQuery.data.location}</p>}
-                            {eventQuery.data.description && (
-                              <p className="whitespace-pre-wrap">{eventQuery.data.description}</p>
+                            {eventDescription && (
+                              <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">
+                                {eventDescription}
+                              </p>
                             )}
                             {eventQuery.data.attendees?.length > 0 && (
                               <div>

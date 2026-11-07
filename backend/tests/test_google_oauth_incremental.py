@@ -191,6 +191,46 @@ def test_oauth_state_binds_incremental_calendar_consent_to_connection(
         )
 
 
+def test_oauth_state_is_consumed_once_and_replay_is_rejected(monkeypatch):
+    from app.services.oauth_state_service import OAuthStateService
+
+    user_id = uuid4()
+    state = "opaque-oauth-state"
+    stored_state = SimpleNamespace(
+        code_verifier_encrypted="encrypted-verifier",
+        user_id=user_id,
+        provider="google",
+        redirect_uri="https://example.test/callback",
+        consumed_at=datetime.now(timezone.utc),
+        state_hash="stored-hash",
+        service="calendar_write",
+        target_connection_id=uuid4(),
+    )
+    db = Mock()
+    service = OAuthStateService(db)
+    service.repository = Mock()
+    service.repository.consume_state.side_effect = [stored_state, None]
+    monkeypatch.setattr(
+        "app.services.oauth_state_service.decrypt_data",
+        lambda value: value.removeprefix("encrypted-"),
+    )
+
+    first_result = service.consume_state("google", state)
+    replay_result = service.consume_state("google", state)
+
+    assert first_result["user_id"] == user_id
+    assert first_result["code_verifier"] == "verifier"
+    assert first_result["target_connection_id"] == stored_state.target_connection_id
+    assert replay_result is None
+    assert service.repository.consume_state.call_args_list[0].kwargs[
+        "state_hash"
+    ] == service.repository.consume_state.call_args_list[1].kwargs[
+        "state_hash"
+    ]
+    db.commit.assert_called_once()
+    db.rollback.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("existing_scopes", "returned_scopes", "expected_scopes"),
     [
@@ -212,6 +252,23 @@ def test_oauth_state_binds_incremental_calendar_consent_to_connection(
                 "https://www.googleapis.com/auth/gmail.readonly",
                 GoogleOAuthClient.CALENDAR_EVENTS_READ_SCOPE,
                 GoogleOAuthClient.CALENDAR_FREEBUSY_SCOPE,
+            ],
+        ),
+        (
+            [
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/gmail.readonly",
+            ],
+            [
+                "openid",
+                "https://www.googleapis.com/auth/calendar.events",
+            ],
+            [
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/calendar.events",
             ],
         ),
         (

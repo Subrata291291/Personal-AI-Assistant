@@ -1,5 +1,6 @@
 
 import uuid
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -17,6 +18,45 @@ from app.repositories.memory_review_repository import (
 )
 from app.services.memory_service import MemoryService
 from app.db.models.memory_review import MemoryReview
+
+
+_MEMORY_OPT_OUT = re.compile(
+    r"\b(?:don't|do not|never)\s+(?:remember|store|save|retain)\b"
+    r"|\bforget\s+(?:this|that|it|the details|this information|that information)\b"
+    r"|\bdelete\s+(?:this|that|the)\s+(?:memory|information)\b",
+    re.IGNORECASE,
+)
+_SENSITIVE_CONTENT_PATTERNS = (
+    re.compile(
+        r"\b(?:password|passphrase|passcode|pin|api[\s_-]*key|"
+        r"access[\s_-]*token|refresh[\s_-]*token|oauth[\s_-]*token|"
+        r"client[\s_-]*secret|secret[\s_-]*key|private[\s_-]*key|credential)"
+        r"\b\s*(?:is|:|=)\s*['\"]?\S{3,}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}"
+        r"|\b(?:sk-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{25,}|"
+        r"gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{15,})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:credit|debit)\s*card(?:\s*(?:number|no\.?))?\s*"
+        r"(?:is|:|=)?\s*(?:\d[ -]?){13,19}\d?"
+        r"|\b(?:bank account|routing number|social security number|ssn)"
+        r"\s*(?:is|:|=)\s*[\w -]{4,}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:my\s+)?(?:diagnosis|medical condition|health condition)"
+        r"\s+(?:is|:)\s+\S+",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _contains_sensitive_content(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _SENSITIVE_CONTENT_PATTERNS)
 
 
 MemoryStatus = Literal[
@@ -122,6 +162,18 @@ class MemoryPipeline:
                 reason="Memory content cannot be empty.",
             )
 
+        if _MEMORY_OPT_OUT.search(content):
+            return MemoryPipelineResult(
+                status="rejected",
+                reason="The user asked not to store this information.",
+            )
+
+        if _contains_sensitive_content(content):
+            return MemoryPipelineResult(
+                status="rejected",
+                reason="Sensitive information is not stored automatically.",
+            )
+
         # Step 2: Extract memories.
         classification = self.classifier.classify(content)
 
@@ -139,6 +191,19 @@ class MemoryPipeline:
             memory_content = extracted_memory.content
 
             # Step 3A: Policy validation.
+            if _contains_sensitive_content(memory_content):
+                item_results.append(
+                    MemoryItemResult(
+                        status="rejected",
+                        reason="Sensitive information is not stored automatically.",
+                        memory_type=extracted_memory.memory_type,
+                        content=memory_content,
+                        importance=extracted_memory.importance,
+                        confidence=extracted_memory.confidence,
+                    )
+                )
+                continue
+
             policy_decision = self.policy.evaluate(
                 memory=extracted_memory,
             )

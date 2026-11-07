@@ -7,7 +7,7 @@ import {
   waitFor,
   within,
 } from '@testing-library/react'
-import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
+import { Link, MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const gmailUser = vi.hoisted(() => ({
@@ -116,7 +116,12 @@ function configureDraftApproval(executeOperation) {
 }
 
 function GmailLayout() {
-  return <Outlet context={{ isDark: false }} />
+  return (
+    <>
+      <Link to="/away">Away</Link>
+      <Outlet context={{ isDark: false }} />
+    </>
+  )
 }
 
 function renderGmail() {
@@ -133,6 +138,7 @@ function renderGmail() {
         <Routes>
           <Route element={<GmailLayout />}>
             <Route path="/gmail" element={<Gmail />} />
+            <Route path="/away" element={<Link to="/gmail">Back to Gmail</Link>} />
           </Route>
         </Routes>
       </MemoryRouter>
@@ -242,6 +248,70 @@ describe('Gmail archive flow', () => {
         folder: 'inbox',
       })
     })
+  })
+
+  it('reuses cached messages and account status after route navigation', async () => {
+    gmailService.getMessages.mockResolvedValue({
+      messages: [message],
+      next_page_token: null,
+    })
+    renderGmail()
+
+    expect(await screen.findByRole('button', {
+      name: /Open email: Quarterly update/,
+    })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('link', { name: 'Away' }))
+    fireEvent.click(await screen.findByRole('link', { name: 'Back to Gmail' }))
+
+    expect(await screen.findByRole('button', {
+      name: /Open email: Quarterly update/,
+    })).toBeInTheDocument()
+    expect(gmailService.getMessages).toHaveBeenCalledTimes(1)
+    expect(api.get).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText('Checking connected accounts...'))
+      .not.toBeInTheDocument()
+  })
+
+  it('restores folder, search, and loaded pages after route navigation', async () => {
+    gmailService.getMessages.mockImplementation(async ({ pageToken }) => ({
+      messages: [{
+        ...message,
+        id: pageToken ? 'sent-page-2' : 'sent-page-1',
+        subject: pageToken ? 'Second sent page' : 'First sent page',
+      }],
+      next_page_token: pageToken ? null : 'sent-page-2-token',
+    }))
+    renderGmail()
+
+    fireEvent.click(
+      within(await screen.findByRole('navigation', { name: 'Gmail folders' }))
+        .getByRole('button', { name: /Sent/ }),
+    )
+    fireEvent.change(await screen.findByPlaceholderText('Search in Sent...'), {
+      target: { value: 'from:sender@example.com' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    expect(await screen.findByRole('button', {
+      name: /Open email: First sent page/,
+    })).toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Load more emails',
+    }))
+    expect(await screen.findByRole('button', {
+      name: /Open email: Second sent page/,
+    })).toBeInTheDocument()
+    const requestCount = gmailService.getMessages.mock.calls.length
+
+    fireEvent.click(screen.getByRole('link', { name: 'Away' }))
+    fireEvent.click(await screen.findByRole('link', { name: 'Back to Gmail' }))
+
+    expect(screen.getByPlaceholderText('Search in Sent...'))
+      .toHaveValue('from:sender@example.com')
+    expect(screen.getByRole('button', { name: /Open email: First sent page/ }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Open email: Second sent page/ }))
+      .toBeInTheDocument()
+    expect(gmailService.getMessages).toHaveBeenCalledTimes(requestCount)
   })
 
   it('shows malformed message-list responses as errors, not empty inboxes', async () => {

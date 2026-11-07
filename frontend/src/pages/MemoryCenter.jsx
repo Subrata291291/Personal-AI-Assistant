@@ -181,9 +181,7 @@ function MemoryCenterContent({ userId }) {
     enabled: Boolean(userId),
   })
 
-  const memoryEnabled = Boolean(
-    settingsQuery.data?.memory_enabled
-  )
+  const memoryEnabled = settingsQuery.data?.memory_enabled ?? true
 
   // --------------------------------------------------
   // 3. Pending reviews query

@@ -748,6 +748,68 @@ def test_llm_calendar_plans_validate_as_strict_tool_intents():
     assert plan.calendar_arguments["period"] == "week"
 
 
+def test_contextual_calendar_followup_reaches_planner_with_bounded_history(
+    monkeypatch,
+):
+    response = LLMResponse(
+        content=(
+            '{"intent":"google_calendar","calendar_tool":"get_calendar_schedule",'
+            '"calendar_arguments":{"date":"2026-11-05","period":"week",'
+            '"time_zone":"UTC"}}'
+        ),
+        provider="test",
+        model="test-model",
+        latency_ms=0,
+        finish_reason="stop",
+    )
+    calls = []
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda request: calls.append(request) or response,
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Move it to 4 PM",
+            messages=[
+                {"role": "user", "content": "Schedule a meeting with Rahul tomorrow."},
+                {"role": "assistant", "content": "What time should I use?"},
+            ],
+        )
+    )
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "get_calendar_schedule"
+    assert len(calls) == 1
+    planner_input = calls[0].messages[-1].content
+    assert "Schedule a meeting with Rahul tomorrow." in planner_input
+    assert "Current user request to classify:\nMove it to 4 PM" in planner_input
+    assert "infer approval" in calls[0].messages[0].content
+
+
+def test_unrelated_short_followup_does_not_invoke_integration_planner(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda request: calls.append(request),
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Make it 4 PM",
+            messages=[
+                {"role": "user", "content": "I prefer a quiet workspace."},
+                {"role": "assistant", "content": "Understood."},
+            ],
+        )
+    )
+
+    assert routed["assistant_route"] == "general"
+    assert calls == []
+
+
 def test_calendar_changes_route_to_approval_proposals_never_read_operations():
     cases = (
         ("Move my meeting to tomorrow.", "update_calendar_event_proposal"),

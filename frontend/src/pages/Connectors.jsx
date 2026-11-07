@@ -16,8 +16,10 @@ import GoogleServiceIcon from '../components/GoogleServiceIcon'
 import { requireConnectionsResponse } from '../lib/responseValidation'
 import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
 import { isGoogleServiceEnabled } from '../lib/googleServiceCapabilities.js'
-
-const GC_TIME = 30 * 60 * 1000
+import {
+  GOOGLE_CONNECTIONS_STALE_TIME,
+  PRIVATE_DATA_GC_TIME,
+} from '../lib/queryClient.js'
 
 const CONNECTIONS_KEY = (userId) => [
   'oauth-connections',
@@ -37,13 +39,27 @@ function formatDate(value) {
 }
 
 function writeCapabilityStatus(capabilities, action) {
-  if (capabilities?.[`calendar_${action}_execution_available`]) {
-    return 'available'
+  const featureEnabled = capabilities?.[`calendar_${action}_feature_enabled`]
+  const executionAvailable =
+    capabilities?.[`calendar_${action}_execution_available`]
+  return {
+    feature: featureEnabled === true
+      ? 'Enabled'
+      : featureEnabled === false
+        ? 'Disabled'
+        : 'Not available',
+    execution: executionAvailable === true
+      ? 'Available'
+      : executionAvailable === false
+        ? 'Not available'
+        : 'Not available',
   }
-  if (capabilities?.[`calendar_${action}_feature_enabled`]) {
-    return 'permission missing'
-  }
-  return 'disabled'
+}
+
+function capabilityStatus(value, granted = 'Granted', notGranted = 'Not granted') {
+  if (value === true) return granted
+  if (value === false) return notGranted
+  return 'Not available'
 }
 
 function removeDisconnectedConnections(data, connectionIds) {
@@ -113,6 +129,27 @@ function removeDisconnectedConnections(data, connectionIds) {
   }
 }
 
+function getCalendarDescription(capabilities) {
+  const permission = capabilities.write_permission_granted
+  const permissionText = permission === true
+    ? 'Write permission is granted'
+    : permission === false
+      ? 'Write permission is not granted'
+      : 'Write permission status is unavailable'
+  const featureStates = [
+    capabilities.create_feature_enabled,
+    capabilities.update_feature_enabled,
+    capabilities.delete_feature_enabled,
+  ]
+  const executionText = featureStates.every((enabled) => enabled === false)
+    ? 'event creation, updates and deletion are currently disabled.'
+    : featureStates.every((enabled) => enabled === true)
+      ? 'event creation, updates and deletion are currently enabled.'
+      : `Create is ${capabilityStatus(featureStates[0], 'enabled', 'disabled').toLowerCase()}, update is ${capabilityStatus(featureStates[1], 'enabled', 'disabled').toLowerCase()}, and delete is ${capabilityStatus(featureStates[2], 'enabled', 'disabled').toLowerCase()}.`
+
+  return `Access calendar events and availability. ${permissionText}, but ${executionText}`
+}
+
 function Connectors() {
   const { user, updateUserMetadata } = useAuth()
   const { isDark } = useOutletContext()
@@ -153,11 +190,11 @@ function Connectors() {
 
     enabled: Boolean(userId),
 
-    staleTime: 0,
-    gcTime: GC_TIME,
+    staleTime: GOOGLE_CONNECTIONS_STALE_TIME,
+    gcTime: PRIVATE_DATA_GC_TIME,
 
-    refetchOnMount: 'always',
-    refetchOnWindowFocus: 'always',
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
     refetchOnReconnect: true,
   })
 
@@ -175,9 +212,50 @@ function Connectors() {
   )
   const calendarCapabilities =
     connectionsQuery.data?.calendar_capabilities || {}
-  const isCalendarEventReadAvailable = calendarCapabilities.events_read === true
+  const connectedCalendarCapabilities = connectedGoogleConnections.map(
+    (connection) => connection.capabilities || {},
+  )
+  const aggregateCalendarCapability = (aggregateKey, connectionKey) => {
+    if (typeof calendarCapabilities[aggregateKey] === 'boolean') {
+      return calendarCapabilities[aggregateKey]
+    }
+    const values = connectedCalendarCapabilities.map(
+      (capability) => capability[connectionKey],
+    )
+    if (values.some((value) => value === true)) return true
+    if (values.length > 0 && values.every((value) => value === false)) {
+      return false
+    }
+    return undefined
+  }
+  const calendarDescription = getCalendarDescription({
+    write_permission_granted: aggregateCalendarCapability(
+      'write_permission_granted',
+      'calendar_write_permission_granted',
+    ),
+    create_feature_enabled: aggregateCalendarCapability(
+      'create_feature_enabled',
+      'calendar_create_feature_enabled',
+    ),
+    update_feature_enabled: aggregateCalendarCapability(
+      'update_feature_enabled',
+      'calendar_update_feature_enabled',
+    ),
+    delete_feature_enabled: aggregateCalendarCapability(
+      'delete_feature_enabled',
+      'calendar_delete_feature_enabled',
+    ),
+  })
+  const isCalendarEventReadAvailable = aggregateCalendarCapability(
+    'events_read',
+    'calendar_events_read',
+  ) === true
+  const isCalendarConnected = aggregateCalendarCapability(
+    'connected',
+    'calendar',
+  )
   const calendarNeedsConsent =
-    calendarCapabilities.connected === true && !isCalendarEventReadAvailable
+    isCalendarConnected === true && !isCalendarEventReadAvailable
   const configuredDefaultConnectionId =
     user?.user_metadata?.default_calendar_connection_id
   const isGmailConnected = gmailConnections.length > 0
@@ -495,7 +573,7 @@ function Connectors() {
             {
               id: 'calendar',
               name: 'Google Calendar',
-              description: 'Use read-only Calendar event search, schedules, event details, and optional free/busy checks.',
+              description: calendarDescription,
               available: true,
               connected: isCalendarEventReadAvailable,
               partial: calendarNeedsConsent,
@@ -546,11 +624,11 @@ function Connectors() {
             return (
               <article
                 key={service.id}
-                className={`flex min-h-44 flex-col rounded-2xl border p-5 ${colors.service}`}
+                className={`rounded-2xl border p-5 transition-colors duration-200 hover:border-slate-400/60 dark:hover:border-slate-600 ${colors.service}`}
               >
                 <div className="flex items-start gap-3">
                   <div className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-xl ${
-                    isDark ? 'bg-[#1b1e2b]' : 'bg-slate-50'
+                    isDark ? 'border border-slate-700/70 bg-slate-800/70' : 'border border-slate-200 bg-slate-50'
                   }`}>
                     <GoogleServiceIcon service={service.id} />
                   </div>
@@ -563,10 +641,62 @@ function Connectors() {
                       {service.description}
                     </p>
                   </div>
-
+                  {service.available && (
+                    <div className="flex shrink-0 items-center gap-2">
+                      <span
+                        aria-live="polite"
+                        className={`text-xs font-bold tracking-wide ${
+                          serviceEnabled
+                            ? SEMANTIC_STATUS_STYLES.positive.text
+                            : isDark
+                              ? 'text-slate-400'
+                              : 'text-slate-500'
+                        }`}
+                      >
+                        {service.enabled ? 'ON' : 'OFF'}
+                      </span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-label={`Enable ${service.name}`}
+                        aria-checked={serviceEnabled}
+                        aria-busy={integrationPreferenceMutation.isPending}
+                        title={`${service.name} ${serviceEnabled ? 'ON' : 'OFF'}`}
+                        disabled={toggleDisabled}
+                        onClick={() => handleIntegrationToggle(
+                          service.id,
+                          !serviceEnabled,
+                        )}
+                        className={`group relative inline-flex h-7 w-[3.25rem] shrink-0 cursor-pointer items-center rounded-full p-1 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-60 ${
+                          isDark
+                            ? 'focus-visible:ring-offset-slate-900'
+                            : 'focus-visible:ring-offset-white'
+                        } ${
+                          serviceEnabled
+                            ? SEMANTIC_STATUS_STYLES.positive.toggle
+                            : isDark
+                              ? 'bg-slate-700 hover:bg-slate-600'
+                              : 'bg-slate-300 hover:bg-slate-400'
+                        }`}
+                      >
+                        <span
+                          aria-hidden="true"
+                          className={`h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                            integrationPreferenceMutation.isPending
+                              ? 'animate-pulse'
+                              : ''
+                          } ${
+                            serviceEnabled
+                              ? 'translate-x-5'
+                              : 'translate-x-0'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  )}
                 </div>
 
-                <div className="mt-auto pt-5">
+                <div className={`mt-4 border-t pt-4 ${colors.divider}`}>
                   {service.available ? (
                     <>
                       <p className={`text-xs font-medium ${serviceStatusColor}`}>
@@ -584,13 +714,66 @@ function Connectors() {
                       )}
 
                       {service.id === 'calendar'
-                        && calendarCapabilities.google_connection_available && (
-                        <p className={`mt-2 text-xs ${colors.muted}`}>
-                          Calendar event-read: {calendarCapabilities.events_read ? 'available' : 'not granted'} · FreeBusy: {calendarCapabilities.freebusy ? 'available' : 'not granted'} · Calendar chat: {calendarCapabilities.chat_available ? 'available' : 'not available'} · Calendar writes: not available.
-                        </p>
+                        && connectedGoogleConnections.length > 0 && (
+                        <div className={`mt-3 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-2 ${colors.muted}`}>
+                          <p>
+                            Assistant Calendar context:{' '}
+                            {capabilityStatus(aggregateCalendarCapability(
+                              'api_available',
+                              'calendar_api_available',
+                            ), 'Available', 'Not available')}
+                          </p>
+                          <p>
+                            Event-read:{' '}
+                            {capabilityStatus(aggregateCalendarCapability(
+                              'events_read',
+                              'calendar_events_read',
+                            ))}
+                          </p>
+                          <p>
+                            FreeBusy:{' '}
+                            {capabilityStatus(aggregateCalendarCapability(
+                              'freebusy',
+                              'calendar_freebusy',
+                            ))}
+                          </p>
+                          <p>
+                            Write permission:{' '}
+                            {capabilityStatus(aggregateCalendarCapability(
+                              'write_permission_granted',
+                              'calendar_write_permission_granted',
+                            ))}
+                          </p>
+                          {['create', 'update', 'delete'].map((action) => {
+                            const featureEnabled = aggregateCalendarCapability(
+                              `${action}_feature_enabled`,
+                              `calendar_${action}_feature_enabled`,
+                            )
+                            const executionAvailable = aggregateCalendarCapability(
+                              `${action}_execution_available`,
+                              `calendar_${action}_execution_available`,
+                            )
+                            return (
+                              <p key={action}>
+                                {action[0].toUpperCase() + action.slice(1)}:{' '}
+                                {capabilityStatus(
+                                  featureEnabled,
+                                  'Enabled',
+                                  'Disabled',
+                                )}
+                                {' · Execution '}
+                                {capabilityStatus(
+                                  executionAvailable,
+                                  'available',
+                                  'not available',
+                                )}
+                              </p>
+                            )
+                          })}
+                        </div>
                       )}
 
-                      <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                      <div className="mt-4 flex flex-wrap items-center gap-3">
                         {!isConnected && (
                           <button
                             type="button"
@@ -607,57 +790,6 @@ function Connectors() {
                               : `Connect ${service.name}`}
                           </button>
                         )}
-                        <div className="flex shrink-0 items-center gap-3">
-                          <span
-                            aria-live="polite"
-                            className={`min-w-8 text-right text-xs font-bold tracking-wide ${
-                              serviceEnabled
-                                ? SEMANTIC_STATUS_STYLES.positive.text
-                                : isDark
-                                  ? 'text-slate-400'
-                                  : 'text-slate-500'
-                            }`}
-                          >
-                            {service.enabled ? 'ON' : 'OFF'}
-                          </span>
-                          <button
-                            type="button"
-                            role="switch"
-                            aria-label={`Enable ${service.name}`}
-                            aria-checked={serviceEnabled}
-                            aria-busy={integrationPreferenceMutation.isPending}
-                            title={`${service.name} ${serviceEnabled ? 'ON' : 'OFF'}`}
-                            disabled={toggleDisabled}
-                            onClick={() => handleIntegrationToggle(
-                              service.id,
-                              !serviceEnabled,
-                            )}
-                            className={`group relative inline-flex h-7 w-[3.25rem] shrink-0 cursor-pointer items-center rounded-full p-1 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-60 ${
-                              isDark
-                                ? 'focus-visible:ring-offset-slate-900'
-                                : 'focus-visible:ring-offset-white'
-                            } ${
-                              serviceEnabled
-                                ? SEMANTIC_STATUS_STYLES.positive.toggle
-                                : isDark
-                                  ? 'bg-slate-700 hover:bg-slate-600'
-                                  : 'bg-slate-300 hover:bg-slate-400'
-                            }`}
-                          >
-                            <span
-                              aria-hidden="true"
-                              className={`h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                                integrationPreferenceMutation.isPending
-                                  ? 'animate-pulse'
-                                  : ''
-                              } ${
-                                serviceEnabled
-                                  ? 'translate-x-5'
-                                  : 'translate-x-0'
-                              }`}
-                            />
-                          </button>
-                        </div>
                       </div>
                     </>
                   ) : (
@@ -701,27 +833,47 @@ function Connectors() {
                     Google Calendar: {connection.capabilities?.calendar ? 'Connected' : 'Not connected'}
                   </p>
                   <p className={`mt-1 text-xs ${colors.muted}`}>
-                    Calendar API: Events {connection.capabilities?.calendar_events_read ? 'available' : 'not granted'}
+                    Assistant Calendar context: {capabilityStatus(
+                      connection.capabilities?.calendar_api_available,
+                      'Available',
+                      'Not available',
+                    )}
                     {' · '}
-                    FreeBusy {connection.capabilities?.calendar_freebusy ? 'available' : 'not granted'}
+                    Event-read: {capabilityStatus(
+                      connection.capabilities?.calendar_events_read,
+                      'Granted',
+                      'Not granted',
+                    )}
                     {' · '}
-                    Calendar chat: {connection.capabilities?.calendar_chat_available ? 'available' : 'not available'}
+                    FreeBusy: {capabilityStatus(
+                      connection.capabilities?.calendar_freebusy,
+                      'Granted',
+                      'Not granted',
+                    )}
                     {' · '}
-                    Calendar writes: {connection.capabilities?.calendar_write_permission_granted
-                      ? 'permission granted'
-                      : 'permission not granted'}
-                    {' · '}
-                    Create {writeCapabilityStatus(connection.capabilities, 'create')}
-                    {' · '}
-                    Update {writeCapabilityStatus(connection.capabilities, 'update')}
-                    {' · '}
-                    Delete {writeCapabilityStatus(connection.capabilities, 'delete')}
+                    Write permission: {capabilityStatus(
+                      connection.capabilities?.calendar_write_permission_granted,
+                    )}
+                    {['create', 'update', 'delete'].map((action) => {
+                      const status = writeCapabilityStatus(
+                        connection.capabilities,
+                        action,
+                      )
+                      return (
+                        <span key={action}>
+                          {' · '}
+                          {action[0].toUpperCase() + action.slice(1)}: {status.feature}
+                          {' · Execution '}
+                          {status.execution}
+                        </span>
+                      )
+                    })}
                   </p>
                   <p className={`mt-1 text-xs ${colors.muted}`}>
                     Connected {formatDate(connection.connected_at)}
                   </p>
                 </div>
-                {!connection.capabilities?.calendar_write_permission_granted && (
+                {connection.capabilities?.calendar_write_permission_granted === false && (
                   <button
                     type="button"
                     onClick={() => connectMutation.mutate({

@@ -39,7 +39,7 @@ class UserSettingsRepository:
             insert(UserSettings)
             .values(
                 user_id=user_id,
-                memory_enabled=False,
+                memory_enabled=True,
             )
             .on_conflict_do_nothing(
                 index_elements=["user_id"],

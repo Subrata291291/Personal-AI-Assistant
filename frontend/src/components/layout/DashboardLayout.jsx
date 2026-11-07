@@ -21,6 +21,10 @@ import {
   GOOGLE_WORKSPACE_SERVICES,
 } from '../../lib/googleServiceCapabilities.js'
 import { SEMANTIC_STATUS_STYLES } from '../../lib/semanticStatusStyles.js'
+import {
+  GOOGLE_CONNECTIONS_STALE_TIME,
+  PRIVATE_DATA_GC_TIME,
+} from '../../lib/queryClient.js'
 
 const integrationItems = [
   { name: 'Connectors', path: '/dashboard/connectors', icon: 'connectors' },
@@ -76,8 +80,8 @@ function DashboardLayout() {
         await api.get('/api/v1/oauth/connections'),
       ),
     enabled: Boolean(user?.id),
-    staleTime: 5 * 60 * 1000,
-    gcTime: 30 * 60 * 1000,
+    staleTime: GOOGLE_CONNECTIONS_STALE_TIME,
+    gcTime: PRIVATE_DATA_GC_TIME,
     refetchOnMount: true,
     refetchOnWindowFocus: true,
   })

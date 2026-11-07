@@ -5,7 +5,7 @@ import {
   screen,
   waitFor,
 } from '@testing-library/react'
-import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
+import { Link, MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockUser = vi.hoisted(() => ({
@@ -101,28 +101,38 @@ describe('Calendar local date-time conversion', () => {
   })
 })
 
-function CalendarLayout() {
-  return <Outlet context={{ isDark: true }} />
+function CalendarLayout({ isDark = true }) {
+  return (
+    <>
+      <Link to="/dashboard/away">Away</Link>
+      <Outlet context={{ isDark }} />
+    </>
+  )
 }
 
-function renderCalendar() {
+function renderCalendar(isDark = true) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false, gcTime: 0 },
       mutations: { retry: false },
     },
   })
-  return render(
+  const view = render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={['/dashboard/calendar']}>
         <Routes>
-          <Route element={<CalendarLayout />}>
+          <Route element={<CalendarLayout isDark={isDark} />}>
             <Route path="/dashboard/calendar" element={<Calendar />} />
+            <Route
+              path="/dashboard/away"
+              element={<Link to="/dashboard/calendar">Back to Calendar</Link>}
+            />
           </Route>
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
   )
+  return { ...view, queryClient }
 }
 
 const calendarOnlyConnection = {
@@ -156,6 +166,28 @@ const emptyEventList = {
   time_zone: 'Asia/Kolkata',
 }
 
+async function openEventDetailsWithDescription(description) {
+  const event = {
+    id: 'description-event',
+    summary: 'Description test',
+    start: { date: '2026-11-06', date_time: null, time_zone: null },
+    end: { date: '2026-11-07', date_time: null, time_zone: null },
+    attendees: [],
+  }
+  calendarService.listEvents.mockResolvedValue({
+    ...emptyEventList,
+    events: [event],
+  })
+  calendarService.getEvent.mockResolvedValue({ ...event, description })
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
+  renderCalendar()
+  fireEvent.click(await screen.findByRole('button', { name: /Description test/ }))
+  const dialog = await screen.findByRole('dialog')
+  await screen.findByText(/2026-11-06 · All day/)
+  return { dialog, description: dialog.querySelector('p.whitespace-pre-wrap') }
+}
+
 describe('Calendar workspace', () => {
   afterEach(() => {
     vi.useRealTimers()
@@ -163,6 +195,7 @@ describe('Calendar workspace', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    sessionStorage.clear()
     mockUser.current = {
       id: 'user-1',
       user_metadata: { timezone: 'Asia/Kolkata' },
@@ -172,20 +205,216 @@ describe('Calendar workspace', () => {
     calendarService.listEvents.mockResolvedValue(emptyEventList)
   })
 
-  it('loads a verified empty month result with Calendar event-read capability only', async () => {
+  it('opens the weekly timeline for a verified Calendar connection', async () => {
     renderCalendar()
 
     expect(await screen.findByRole('heading', { name: 'Google Calendar' }))
       .toBeInTheDocument()
     await waitFor(() => expect(calendarService.listEvents).toHaveBeenCalled())
-    expect(await screen.findByText('Google Calendar returned no events for this month.'))
+    expect(await screen.findByText('Google Calendar returned no events for this week.'))
       .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'week' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    expect(screen.getByRole('heading', { name: 'Meeting reminder' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Filters' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Other calendars' })).toBeInTheDocument()
     expect(calendarService.listEvents).toHaveBeenCalledWith(expect.objectContaining({
       connectionId: 'calendar-account',
       timeZone: 'Asia/Kolkata',
     }))
     expect(screen.queryByText(/Free\/Busy/)).not.toBeInTheDocument()
     expect(screen.getByText('My calendars')).toBeInTheDocument()
+  })
+
+  it('reuses Calendar events and connection status after route navigation', async () => {
+    const event = {
+      id: 'cached-calendar-event',
+      summary: 'Cached event',
+      start: { date_time: '2026-11-06T04:30:00Z', time_zone: 'UTC' },
+      end: { date_time: '2026-11-06T05:00:00Z', time_zone: 'UTC' },
+      attendees: [],
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [event],
+    })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T00:00:00.000Z'))
+    renderCalendar(false)
+
+    expect(await screen.findByRole('button', { name: /Cached event/ }))
+      .toBeInTheDocument()
+    fireEvent.click(screen.getByRole('link', { name: 'Away' }))
+    fireEvent.click(await screen.findByRole('link', { name: 'Back to Calendar' }))
+
+    expect(await screen.findByRole('button', { name: /Cached event/ }))
+      .toBeInTheDocument()
+    expect(calendarService.listEvents).toHaveBeenCalledTimes(1)
+    expect(api.get).toHaveBeenCalledTimes(1)
+  })
+
+  it('restores the selected date and view and reuses their cached events', async () => {
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [],
+    })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T00:00:00.000Z'))
+    renderCalendar(false)
+
+    await screen.findByRole('heading', { name: 'Google Calendar' })
+    await waitFor(() => expect(calendarService.listEvents).toHaveBeenCalledTimes(1))
+    fireEvent.change(screen.getByLabelText('Calendar date'), {
+      target: { value: '2026-11-07' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'day' }))
+    await waitFor(() => expect(calendarService.listEvents).toHaveBeenCalledTimes(2))
+
+    fireEvent.click(screen.getByRole('link', { name: 'Away' }))
+    fireEvent.click(await screen.findByRole('link', { name: 'Back to Calendar' }))
+
+    expect(screen.getByLabelText('Calendar date')).toHaveValue('2026-11-07')
+    expect(screen.getByRole('button', { name: 'day' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    expect(calendarService.listEvents).toHaveBeenCalledTimes(2)
+    expect(api.get).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows the upcoming meeting date in the reminder card', async () => {
+    const event = {
+      id: 'reminder-date',
+      summary: 'Planning meeting',
+      start: { date_time: '2026-11-08T04:30:00Z', time_zone: 'UTC' },
+      end: { date_time: '2026-11-08T05:00:00Z', time_zone: 'UTC' },
+      attendees: [],
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [event],
+    })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-07T00:00:00.000Z'))
+    renderCalendar(false)
+
+    const reminderHeading = await screen.findByRole('heading', {
+      name: 'Meeting reminder',
+    })
+    const dateLabel = new Intl.DateTimeFormat(undefined, {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      timeZone: 'UTC',
+    }).format(new Date('2026-11-08T12:00:00.000Z'))
+    const reminder = reminderHeading.parentElement
+    await waitFor(() => {
+      expect(reminder).toHaveTextContent('Planning meeting')
+      expect(reminder).toHaveTextContent(dateLabel)
+      expect(reminder).toHaveTextContent('AM')
+    })
+  })
+
+  it('renders weekly event times and attendee initials with an overflow count', async () => {
+    const event = {
+      id: 'weekly-attendees',
+      summary: 'UX Weekly',
+      start: { date_time: '2026-11-06T04:30:00Z', time_zone: 'UTC' },
+      end: { date_time: '2026-11-06T05:00:00Z', time_zone: 'UTC' },
+      attendees: [
+        { display_name: 'Ada Lovelace', email: 'ada@example.com' },
+        { display_name: 'Bob Stone', email: 'bob@example.com' },
+        { display_name: 'Chloe Green', email: 'chloe@example.com' },
+        { display_name: 'Dev Shah', email: 'dev@example.com' },
+        { display_name: 'Eve Black', email: 'eve@example.com' },
+        { display_name: 'Farah Wells', email: 'farah@example.com' },
+      ],
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [event],
+    })
+    calendarService.getEvent.mockResolvedValue(event)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T00:00:00.000Z'))
+    renderCalendar(false)
+
+    const eventCard = await screen.findByRole('button', { name: /UX Weekly/ })
+    const formatter = new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'Asia/Kolkata',
+    })
+    expect(eventCard).toHaveTextContent(
+      `${formatter.format(new Date(event.start.date_time))} – ${formatter.format(new Date(event.end.date_time))}`,
+    )
+    const attendeeGroup = eventCard.querySelector('[aria-label="Attendees"]')
+    expect(attendeeGroup.querySelectorAll('[role="img"]')).toHaveLength(4)
+    expect(attendeeGroup.querySelector('[aria-label="Ada Lovelace avatar"]'))
+      .toHaveTextContent('AL')
+    expect(attendeeGroup).toHaveTextContent('+2')
+
+    fireEvent.click(eventCard)
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+  })
+
+  it('filters only supported timed and all-day event types', async () => {
+    const timedEvent = {
+      id: 'timed-filter',
+      summary: 'Timed filter event',
+      start: { date_time: '2026-11-06T04:30:00Z', time_zone: 'UTC' },
+      end: { date_time: '2026-11-06T05:00:00Z', time_zone: 'UTC' },
+    }
+    const allDayEvent = {
+      id: 'all-day-filter',
+      summary: 'All-day filter event',
+      start: { date: '2026-11-06' },
+      end: { date: '2026-11-07' },
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [timedEvent, allDayEvent],
+    })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T00:00:00.000Z'))
+    renderCalendar(false)
+
+    expect(await screen.findByRole('button', { name: /Timed filter event/ }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /All-day filter event/ }))
+      .toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Timed events'))
+    expect(screen.queryByRole('button', { name: /Timed filter event/ }))
+      .not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /All-day filter event/ }))
+      .toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('All-day events'))
+    expect(await screen.findByText('No events match the selected filters.'))
+      .toBeInTheDocument()
+  })
+
+  it('renders events without attendee data safely', async () => {
+    const event = {
+      id: 'no-attendees',
+      summary: 'No attendee details',
+      start: { date_time: '2026-11-06T04:30:00Z' },
+      end: { date_time: '2026-11-06T05:00:00Z' },
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [event],
+    })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T00:00:00.000Z'))
+    renderCalendar(false)
+
+    const eventCard = await screen.findByRole('button', { name: /No attendee details/ })
+    expect(eventCard.querySelector('[aria-label="Attendees"]')).toBeNull()
   })
 
   it('queries the full date when local midnight is skipped', async () => {
@@ -239,6 +468,7 @@ describe('Calendar workspace', () => {
     renderCalendar()
 
     await screen.findByRole('heading', { name: 'Google Calendar' })
+    fireEvent.click(screen.getByRole('button', { name: 'month' }))
     await screen.findByText('Google Calendar returned no events for this month.')
     expect(screen.getByText('Monday')).toBeInTheDocument()
     expect(screen.getByText('Sunday')).toBeInTheDocument()
@@ -307,6 +537,222 @@ describe('Calendar workspace', () => {
     expect(await screen.findByText(/2026-11-06 · All day/)).toBeInTheDocument()
     expect(screen.getByText('Location: Room 2')).toBeInTheDocument()
     expect(screen.getByText('Review the launch plan')).toBeInTheDocument()
+  })
+
+  it('uses the premium light palette for selected dates and event chips', async () => {
+    const event = {
+      id: 'light-mode-event',
+      summary: 'Light mode event',
+      start: { date: '2026-11-06', date_time: null, time_zone: null },
+      end: { date: '2026-11-07', date_time: null, time_zone: null },
+      attendees: [],
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [event],
+    })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
+    renderCalendar(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'month' }))
+    const selectedMiniDate = await screen.findByRole('button', {
+      name: '2026-11-06',
+    })
+    expect(selectedMiniDate).toHaveClass('bg-[#DCEFE8]', 'text-[#245C4B]')
+    const eventChip = await screen.findByRole('button', {
+      name: /Light mode event/,
+    })
+    expect(eventChip).toHaveClass('border-l-[3px]', 'text-slate-900')
+    expect(eventChip.className).toMatch(
+      /bg-\[#(?:D5F1F6|F9E3C9|F4D7EE|DDD8F8|DCEFE8)\]/,
+    )
+    const assignedColor = eventChip.className.match(/bg-\[#(?:D5F1F6|F9E3C9|F4D7EE|DDD8F8|DCEFE8)\]/)[0]
+    fireEvent.click(screen.getByRole('button', { name: 'week' }))
+    const weeklyEventChip = await screen.findByRole('button', {
+      name: /Light mode event/,
+    })
+    expect(weeklyEventChip).toHaveClass(assignedColor)
+    expect(screen.getByRole('heading', { name: 'Google Calendar' })
+      .closest('header').parentElement)
+      .toHaveClass('bg-[#EFF7F2]')
+  })
+
+  it('preserves dark mode date and event colors', async () => {
+    const event = {
+      id: 'dark-mode-event',
+      summary: 'Dark mode event',
+      start: { date: '2026-11-06', date_time: null, time_zone: null },
+      end: { date: '2026-11-07', date_time: null, time_zone: null },
+      attendees: [],
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [event],
+    })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
+    renderCalendar(true)
+
+    expect(await screen.findByRole('button', {
+      name: '2026-11-06',
+    })).toHaveClass('bg-violet-600', 'text-white')
+    expect(await screen.findByRole('button', {
+      name: /Dark mode event/,
+    })).toHaveClass('bg-violet-500/15', 'text-violet-200')
+  })
+
+  it('shows Month View event titles and timezone-formatted start and end times', async () => {
+    const event = {
+      id: 'timed-month-event',
+      summary: 'UX Huddle Call',
+      start: {
+        date_time: '2026-11-06T03:30:00Z',
+        time_zone: 'UTC',
+      },
+      end: {
+        date_time: '2026-11-06T04:00:00Z',
+        time_zone: 'UTC',
+      },
+      attendees: [],
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [event],
+    })
+    calendarService.getEvent.mockResolvedValue(event)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
+    renderCalendar(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'month' }))
+    const eventCard = await screen.findByRole('button', {
+      name: /UX Huddle Call/,
+    })
+    const timeLabel = new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'Asia/Kolkata',
+    })
+    expect(eventCard).toHaveTextContent(
+      `${timeLabel.format(new Date(event.start.date_time))} – ${timeLabel.format(new Date(event.end.date_time))}`,
+    )
+
+    fireEvent.click(eventCard)
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    expect(calendarService.getEvent).toHaveBeenCalledWith({
+      connectionId: 'calendar-account',
+      eventId: event.id,
+    })
+  })
+
+  it('labels Month View all-day events and handles absent time values', async () => {
+    const event = {
+      id: 'all-day-month-event',
+      summary: 'All-day planning',
+      start: { date: '2026-11-06' },
+      attendees: [],
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [event],
+    })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
+    renderCalendar(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'month' }))
+    const eventCard = await screen.findByRole('button', {
+      name: /All-day planning/,
+    })
+    expect(eventCard).toHaveTextContent('All day')
+  })
+
+  it('renders Month View safely when event times are invalid', async () => {
+    const event = {
+      id: 'invalid-time-month-event',
+      summary: 'Invalid time event',
+      start: { date: '2026-11-06' },
+      end: { date_time: 'invalid-date' },
+      attendees: [],
+    }
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [event],
+    })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
+    renderCalendar(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'month' }))
+    expect(await screen.findByRole('button', {
+      name: /Invalid time event/,
+    })).toHaveTextContent('All day')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('formats HTML paragraphs as readable separated text', async () => {
+    const result = await openEventDetailsWithDescription(
+      '<p>First paragraph.</p><p>Second paragraph.</p>',
+    )
+
+    expect(result.description.textContent).toBe(
+      'First paragraph.\n\nSecond paragraph.',
+    )
+  })
+
+  it('preserves linked URLs as readable text without rendering provider HTML', async () => {
+    const result = await openEventDetailsWithDescription(
+      '<p>Join using <a href="https://example.com/meeting">the meeting link</a>.</p>',
+    )
+
+    expect(result.description.textContent).toBe(
+      'Join using the meeting link (https://example.com/meeting).',
+    )
+    expect(result.description.querySelector('a')).toBeNull()
+  })
+
+  it('decodes HTML entities in event descriptions', async () => {
+    const result = await openEventDetailsWithDescription(
+      '<p>Tom &amp; Jerry &lt;3 &quot;Review&quot;</p>',
+    )
+
+    expect(result.description.textContent).toBe('Tom & Jerry <3 "Review"')
+  })
+
+  it('leaves plain-text descriptions unchanged', async () => {
+    const plainText = 'Line one.\n  Line two.\nhttps://example.com/agenda'
+    const result = await openEventDetailsWithDescription(plainText)
+
+    expect(result.description.textContent).toBe(plainText)
+  })
+
+  it('omits empty event descriptions', async () => {
+    const result = await openEventDetailsWithDescription('')
+
+    expect(result.description).toBeNull()
+  })
+
+  it('omits missing event descriptions', async () => {
+    const result = await openEventDetailsWithDescription(undefined)
+
+    expect(result.description).toBeNull()
+  })
+
+  it('keeps HTML list items on separate readable lines', async () => {
+    const result = await openEventDetailsWithDescription(
+      '<ul><li>First item</li><li>Second item</li></ul>',
+    )
+
+    expect(result.description.textContent).toBe('• First item\n• Second item')
+  })
+
+  it('wraps long URLs to prevent horizontal overflow', async () => {
+    const longUrl = `https://example.com/${'a'.repeat(300)}`
+    const result = await openEventDetailsWithDescription(longUrl)
+
+    expect(result.description.textContent).toBe(longUrl)
+    expect(result.description).toHaveClass('[overflow-wrap:anywhere]')
   })
 
   it('does not fetch events when the Calendar application preference is disabled', async () => {
