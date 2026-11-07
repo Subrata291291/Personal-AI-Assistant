@@ -59,6 +59,90 @@ describe('calendarService', () => {
     expect(api.get.mock.calls[0][0]).toContain('query=planning')
   })
 
+  it('sends event page tokens without dropping calendar or range filters', async () => {
+    api.get.mockResolvedValue({
+      calendar_id: 'team@example.com',
+      events: [],
+      next_page_token: null,
+      time_zone: 'Asia/Kolkata',
+    })
+    await calendarService.listEvents({
+      connectionId: 'connection-1',
+      calendarId: 'team@example.com',
+      timeMin: '2026-11-01T18:30:00.000Z',
+      timeMax: '2026-11-30T18:30:00.000Z',
+      query: 'planning',
+      timeZone: 'Asia/Kolkata',
+      pageToken: 'next/page+token',
+    })
+    const requestUrl = new URL(api.get.mock.calls[0][0], 'http://localhost')
+    expect(Object.fromEntries(requestUrl.searchParams)).toEqual({
+      connection_id: 'connection-1',
+      calendar_id: 'team@example.com',
+      max_results: '100',
+      time_min: '2026-11-01T18:30:00.000Z',
+      time_max: '2026-11-30T18:30:00.000Z',
+      query: 'planning',
+      time_zone: 'Asia/Kolkata',
+      page_token: 'next/page+token',
+    })
+  })
+
+  it('requests calendar-list continuation pages and validates the response', async () => {
+    const response = {
+      calendars: [{
+        id: 'team@example.com',
+        summary: 'Team',
+        primary: false,
+        access_role: 'reader',
+        time_zone: 'Asia/Kolkata',
+      }],
+      next_page_token: null,
+    }
+    api.get.mockResolvedValue(response)
+    await expect(calendarService.listCalendars({
+      connectionId: 'connection-1',
+      maxResults: 25,
+      pageToken: 'calendar-page-2',
+    })).resolves.toEqual(response)
+    expect(api.get).toHaveBeenCalledWith(
+      '/api/v1/calendar/calendars?connection_id=connection-1&max_results=25&page_token=calendar-page-2',
+    )
+  })
+
+  it('accepts a monthly schedule response', async () => {
+    api.get.mockResolvedValue({ ...emptySchedule, period: 'month' })
+    await expect(calendarService.getSchedule({
+      connectionId: 'connection-1',
+      date: '2026-11-07',
+      period: 'month',
+      timeZone: 'Asia/Kolkata',
+      calendarId: 'primary',
+    })).resolves.toMatchObject({ period: 'month' })
+    expect(api.get.mock.calls[0][0]).toContain('period=month')
+  })
+
+  it('preserves schedule filters when requesting a continuation page', async () => {
+    api.get.mockResolvedValue({ ...emptySchedule, next_page_token: null })
+    await calendarService.getSchedule({
+      connectionId: 'connection-1',
+      date: '2026-11-07',
+      period: 'month',
+      timeZone: 'Asia/Kolkata',
+      calendarId: 'team@example.com',
+      pageToken: 'schedule-page-2',
+    })
+    const requestUrl = new URL(api.get.mock.calls[0][0], 'http://localhost')
+    expect(Object.fromEntries(requestUrl.searchParams)).toMatchObject({
+      connection_id: 'connection-1',
+      date: '2026-11-07',
+      period: 'month',
+      time_zone: 'Asia/Kolkata',
+      calendar_id: 'team@example.com',
+      page_token: 'schedule-page-2',
+    })
+  })
+
   it('rejects malformed responses and missing account IDs', async () => {
     api.get.mockResolvedValue({
       ...emptySchedule,

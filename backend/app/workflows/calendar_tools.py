@@ -66,6 +66,11 @@ class GetCalendarEventInput(_CalendarToolInput):
     calendar_id: str = Field(default="primary", min_length=1, max_length=1024)
 
 
+class ListCalendarsInput(_CalendarToolInput):
+    max_results: int = Field(default=100, ge=1, le=250)
+    page_token: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
 class GetTodayScheduleInput(_CalendarToolInput):
     time_zone: str = Field(min_length=1, max_length=100)
     calendar_id: str = Field(default="primary", min_length=1, max_length=1024)
@@ -73,7 +78,7 @@ class GetTodayScheduleInput(_CalendarToolInput):
 
 class GetCalendarScheduleInput(_CalendarToolInput):
     schedule_date: CalendarDate = Field(alias="date")
-    period: Literal["day", "week"]
+    period: Literal["day", "week", "month"]
     time_zone: str = Field(min_length=1, max_length=100)
     calendar_id: str = Field(default="primary", min_length=1, max_length=1024)
 
@@ -224,12 +229,30 @@ def create_calendar_tools(
                     **arguments,
                 )
             envelope = {"ok": True, "data": jsonable_encoder(result)}
-        except (ValueError, PermissionError, GoogleAPIError) as exc:
+        except PermissionError as exc:
+            if method_name == "list_calendars":
+                envelope = {
+                    "ok": False,
+                    "error": {
+                        "code": "calendar_list_permission_missing",
+                        "message": (
+                            "Calendar List access is required to discover "
+                            "calendar names. Grant Calendar List Access for "
+                            "this account in Connected Apps, then try again."
+                        ),
+                    },
+                }
+            else:
+                envelope = {"ok": False, "error": _tool_error(exc)}
+        except (ValueError, GoogleAPIError) as exc:
             envelope = {"ok": False, "error": _tool_error(exc)}
         return json.dumps(envelope, ensure_ascii=False, sort_keys=True)
 
     async def list_calendar_events(**arguments: Any) -> str:
         return await execute("list_events", arguments)
+
+    async def list_calendars(**arguments: Any) -> str:
+        return await execute("list_calendars", arguments)
 
     async def get_calendar_event(**arguments: Any) -> str:
         return await execute("get_event", arguments)
@@ -254,6 +277,16 @@ def create_calendar_tools(
     tools = []
     if include_event_tools:
         tools.extend([
+            StructuredTool.from_function(
+                coroutine=list_calendars,
+                name="list_calendars",
+                description=(
+                    "List calendars accessible to the selected connected "
+                    "Google account, including their names, IDs, primary "
+                    "status, access roles, and timezones."
+                ),
+                args_schema=ListCalendarsInput,
+            ),
             StructuredTool.from_function(
                 coroutine=list_calendar_events,
                 name="list_calendar_events",
@@ -285,9 +318,9 @@ def create_calendar_tools(
                 coroutine=get_calendar_schedule,
                 name="get_calendar_schedule",
                 description=(
-                    "Retrieve a daily or Monday-based weekly Google "
-                    "Calendar schedule, including existing conflict "
-                    "information."
+                    "Retrieve a daily, Monday-based weekly, or calendar "
+                    "monthly Google Calendar schedule, including existing "
+                    "conflict information."
                 ),
                 args_schema=GetCalendarScheduleInput,
             ),

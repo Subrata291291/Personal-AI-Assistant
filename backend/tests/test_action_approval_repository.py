@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -223,6 +224,7 @@ def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically():
     class ReplacementConnection:
         def __init__(self):
             self.statements = []
+            self.transition_parameters = None
 
         def execute(self, statement, parameters):
             self.statements.append(statement)
@@ -237,6 +239,7 @@ def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically():
                     "account_email": "user@example.com",
                 })
             if statement is _TRANSITION:
+                self.transition_parameters = parameters
                 return Result({"proposal": old_proposal})
             if statement is _SYNC_CALENDAR_APPROVAL_STATE:
                 return Result(rowcount=1)
@@ -297,6 +300,10 @@ def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically():
         connection.statements.index(_INSERT_PROPOSAL)
     )
     assert _SYNC_CALENDAR_APPROVAL_STATE in connection.statements
+    assert json.loads(connection.transition_parameters["patch"]) == {
+        "result": {"outcome": "superseded"},
+        "status": "rejected",
+    }
 
 
 class TransitionConnection:

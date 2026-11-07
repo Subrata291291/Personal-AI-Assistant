@@ -20,6 +20,8 @@ from app.workflows.calendar_agent_node import calendar_agent_node
 from app.workflows.memory_retrieval_node import (
     memory_retrieval_node,
 )
+from app.workflows.memory_update_node import memory_update_node
+from app.workflows.autonomous_memory_node import autonomous_memory_node
 from app.core.request_metrics import record_timing, request_id
 
 
@@ -28,6 +30,7 @@ logger = logging.getLogger(__name__)
 ASSISTANT_ROUTE_NODES = {
     "general": "memory_retrieval",
     "daily_planning": "memory_retrieval",
+    "memory_update": "memory_update",
     "capabilities": "capabilities",
     "gmail": "gmail_agent",
     "google_drive": "integration_unavailable",
@@ -74,6 +77,14 @@ def build_chat_graph():
         "memory_retrieval",
         _timed_node("memory_retrieval", memory_retrieval_node),
     )
+    builder.add_node(
+        "autonomous_memory",
+        _timed_node("autonomous_memory", autonomous_memory_node),
+    )
+    builder.add_node(
+        "memory_update",
+        _timed_node("memory_update", memory_update_node),
+    )
 
     builder.add_node(
         "intent_router",
@@ -109,7 +120,20 @@ def build_chat_graph():
     )
 
     # Define execution flow
-    builder.add_edge(START, "intent_router")
+    builder.add_edge(START, "autonomous_memory")
+
+    builder.add_conditional_edges(
+        "autonomous_memory",
+        lambda state: (
+            "memory_update"
+            if state.get("assistant_route") == "memory_update"
+            else "intent_router"
+        ),
+        {
+            "memory_update": "memory_update",
+            "intent_router": "intent_router",
+        },
+    )
 
     builder.add_conditional_edges(
         "intent_router",
@@ -124,6 +148,11 @@ def build_chat_graph():
 
     builder.add_edge(
         "llm",
+        END,
+    )
+
+    builder.add_edge(
+        "memory_update",
         END,
     )
 

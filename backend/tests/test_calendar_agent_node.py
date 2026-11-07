@@ -106,6 +106,225 @@ def test_event_tool_uses_server_selected_identity_and_renders_grounded_result(
     assert "access token" not in result["assistant_response"].casefold()
 
 
+def test_named_calendar_is_resolved_from_provider_summary_before_event_read(
+    monkeypatch,
+):
+    list_tool = FakeTool("list_calendars", {
+        "ok": True,
+        "data": {
+            "calendars": [
+                {
+                    "id": "work-calendar-id",
+                    "summary": "Work",
+                    "primary": False,
+                },
+                {
+                    "id": "primary-id",
+                    "summary": "Personal",
+                    "primary": True,
+                },
+            ],
+        },
+    })
+    event_tool = FakeTool("list_calendar_events", {
+        "ok": True,
+        "data": {
+            "events": [
+                _event(
+                    "work-event",
+                    "Work planning",
+                    "2026-11-06T09:00:00+00:00",
+                    "2026-11-06T10:00:00+00:00",
+                ),
+            ],
+        },
+    })
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "create_calendar_tools",
+        Mock(return_value=[list_tool, event_tool]),
+    )
+    state = _state("list_calendar_events", {
+        "time_min": "2026-11-06T00:00:00Z",
+        "max_results": 100,
+    })
+    state["user_message"] = "Show my work calendar."
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+
+    assert "Work planning" in result["assistant_response"]
+    assert list_tool.arguments == {}
+    assert event_tool.arguments["calendar_id"] == "work-calendar-id"
+
+
+def test_ambiguous_named_calendar_requests_clarification_without_event_read(
+    monkeypatch,
+):
+    list_tool = FakeTool("list_calendars", {
+        "ok": True,
+        "data": {
+            "calendars": [
+                {"id": "work-one", "summary": "Work North"},
+                {"id": "work-two", "summary": "Work South"},
+            ],
+        },
+    })
+    event_tool = FakeTool("list_calendar_events", {
+        "ok": True,
+        "data": {"events": []},
+    })
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "create_calendar_tools",
+        Mock(return_value=[list_tool, event_tool]),
+    )
+    state = _state("list_calendar_events", {})
+    state["user_message"] = "Show my work calendar."
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+
+    assert "Which one do you mean?" in result["assistant_response"]
+    assert event_tool.arguments is None
+
+
+def test_missing_calendar_list_scope_explains_the_connected_apps_grant(
+    monkeypatch,
+):
+    list_tool = FakeTool("list_calendars", {
+        "ok": False,
+        "error": {
+            "code": "calendar_list_permission_missing",
+            "message": (
+                "Calendar List access is required to discover calendar "
+                "names. Grant Calendar List Access for this account in "
+                "Connected Apps, then try again."
+            ),
+        },
+    })
+    event_tool = FakeTool("list_calendar_events", {
+        "ok": True,
+        "data": {"events": []},
+    })
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "create_calendar_tools",
+        Mock(return_value=[list_tool, event_tool]),
+    )
+    state = _state("list_calendar_events", {})
+    state["user_message"] = "Show my work calendar."
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+
+    assert "Grant Calendar List Access" in result["assistant_response"]
+    assert event_tool.arguments is None
+
+
+def test_listing_calendars_renders_provider_summaries_without_ids():
+    response = calendar_agent_node._render_result(
+        "list_calendars",
+        {
+            "calendars": [
+                {
+                    "id": "personal-id",
+                    "summary": "Personal",
+                    "primary": True,
+                    "access_role": "owner",
+                    "time_zone": "Asia/Kolkata",
+                },
+            ],
+        },
+        "Asia/Kolkata",
+    )
+
+    assert "Personal" in response
+    assert "primary" in response
+    assert "Asia/Kolkata" in response
+    assert "personal-id" not in response
+
+
+def test_list_calendars_consumes_all_continuation_pages(monkeypatch):
+    class PaginatedTool:
+        name = "list_calendars"
+
+        def __init__(self):
+            self.arguments = []
+
+        async def ainvoke(self, arguments):
+            self.arguments.append(arguments)
+            if len(self.arguments) == 1:
+                return json.dumps({
+                    "ok": True,
+                    "data": {
+                        "calendars": [
+                            {
+                                "id": "primary-id",
+                                "summary": "Personal",
+                                "primary": True,
+                            },
+                        ],
+                        "next_page_token": "next-page",
+                    },
+                })
+            return json.dumps({
+                "ok": True,
+                "data": {
+                    "calendars": [
+                        {
+                            "id": "work-id",
+                            "summary": "Work",
+                            "primary": False,
+                        },
+                    ],
+                    "next_page_token": None,
+                },
+            })
+
+    tool = PaginatedTool()
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "create_calendar_tools",
+        Mock(return_value=[tool]),
+    )
+
+    result = run_node(
+        _state("list_calendars", {}),
+        _runtime(
+            user_id=USER_ID,
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+
+    assert "Personal" in result["assistant_response"]
+    assert "Work" in result["assistant_response"]
+    assert tool.arguments == [{}, {"page_token": "next-page"}]
+
+
 def test_next_meeting_selects_earliest_upcoming_event_across_timezone_fold(
     monkeypatch,
 ):

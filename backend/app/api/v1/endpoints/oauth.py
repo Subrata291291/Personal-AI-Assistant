@@ -58,7 +58,12 @@ def _frontend_connector_url(status_value: str) -> str:
 def connect_google(
     current_user: CurrentUser,
     db: Session = Depends(get_db),
-    service: Literal["gmail", "calendar", "calendar_write"] = "gmail",
+    service: Literal[
+        "gmail",
+        "calendar",
+        "calendar_write",
+        "calendar_list_read",
+    ] = "gmail",
     connection_id: UUID | None = None,
 ):
     """
@@ -80,7 +85,7 @@ def connect_google(
     try:
         user_id = UUID(str(current_user["id"]))
 
-        if service == "calendar_write":
+        if service in {"calendar_write", "calendar_list_read"}:
             if connection_id is None:
                 raise ValueError(
                     "Choose the connected Google account to authorize."
@@ -99,7 +104,7 @@ def connect_google(
                 )
         elif connection_id is not None:
             raise ValueError(
-                "A target account is supported only for Calendar write consent."
+                "A target account is supported only for incremental Calendar consent."
             )
 
         state_service = OAuthStateService(db)

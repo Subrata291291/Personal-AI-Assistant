@@ -22,6 +22,7 @@ vi.mock('../lib/api.js', () => ({
 
 vi.mock('../services/calendarService.js', () => ({
   calendarService: {
+    listCalendars: vi.fn(),
     getToday: vi.fn(),
     getSchedule: vi.fn(),
     listEvents: vi.fn(),
@@ -144,6 +145,7 @@ const calendarOnlyConnection = {
     gmail: false,
     calendar: true,
     calendar_events_read: true,
+    calendar_list_read: true,
     calendar_freebusy: false,
   },
 }
@@ -201,6 +203,16 @@ describe('Calendar workspace', () => {
       user_metadata: { timezone: 'Asia/Kolkata' },
     }
     api.get.mockResolvedValue({ connections: [calendarOnlyConnection] })
+    calendarService.listCalendars.mockResolvedValue({
+      calendars: [{
+        id: 'primary',
+        summary: 'Primary calendar',
+        primary: true,
+        access_role: 'owner',
+        time_zone: 'Asia/Kolkata',
+      }],
+      next_page_token: null,
+    })
     calendarService.getToday.mockResolvedValue(emptySchedule)
     calendarService.listEvents.mockResolvedValue(emptyEventList)
   })
@@ -226,6 +238,203 @@ describe('Calendar workspace', () => {
     }))
     expect(screen.queryByText(/Free\/Busy/)).not.toBeInTheDocument()
     expect(screen.getByText('My calendars')).toBeInTheDocument()
+    expect(await screen.findByRole('combobox', {
+      name: 'Google Calendar',
+    })).toHaveValue('primary')
+    expect(calendarService.listCalendars).toHaveBeenCalledWith({
+      connectionId: 'calendar-account',
+      pageToken: undefined,
+    })
+  })
+
+  it('loads additional event pages, preserves events, and removes overlapping duplicates', async () => {
+    const first = {
+      id: 'event-page-1',
+      summary: 'First page event',
+      start: { date_time: '2026-11-06T04:30:00Z', time_zone: 'UTC' },
+      end: { date_time: '2026-11-06T05:00:00Z', time_zone: 'UTC' },
+      attendees: [],
+    }
+    const overlap = {
+      id: 'event-overlap',
+      summary: 'Overlapping event',
+      start: { date_time: '2026-11-06T06:30:00Z', time_zone: 'UTC' },
+      end: { date_time: '2026-11-06T07:00:00Z', time_zone: 'UTC' },
+      attendees: [],
+    }
+    const duplicate = { ...overlap, summary: 'Duplicate page event' }
+    const second = {
+      id: 'event-page-2',
+      summary: 'Second page event',
+      start: { date_time: '2026-11-06T08:30:00Z', time_zone: 'UTC' },
+      end: { date_time: '2026-11-06T09:00:00Z', time_zone: 'UTC' },
+      attendees: [],
+    }
+    calendarService.listEvents.mockImplementation(({ pageToken }) => (
+      pageToken
+        ? Promise.resolve({
+          ...emptyEventList,
+          events: [duplicate, second],
+          next_page_token: null,
+        })
+        : Promise.resolve({
+          ...emptyEventList,
+          events: [first, overlap],
+          next_page_token: 'events-page-2',
+        })
+    ))
+    renderCalendar()
+
+    expect(await screen.findByRole('button', { name: /First page event/ }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Overlapping event/ }))
+      .toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Load more events' }))
+
+    expect(await screen.findByRole('button', { name: /Second page event/ }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /First page event/ }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Overlapping event/ }))
+      .toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Duplicate page event/ }))
+      .not.toBeInTheDocument()
+    expect(calendarService.listEvents).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        connectionId: 'calendar-account',
+        calendarId: 'primary',
+        timeMin: expect.any(String),
+        timeMax: expect.any(String),
+        timeZone: 'Asia/Kolkata',
+        pageToken: 'events-page-2',
+      }),
+    )
+    expect(screen.getByText('All matching events are loaded.'))
+      .toBeInTheDocument()
+  })
+
+  it('discovers and paginates accessible calendars', async () => {
+    calendarService.listCalendars
+      .mockResolvedValueOnce({
+        calendars: [{
+          id: 'primary',
+          summary: 'Primary calendar',
+          primary: true,
+          access_role: 'owner',
+          time_zone: 'Asia/Kolkata',
+        }],
+        next_page_token: 'calendar-page-2',
+      })
+      .mockResolvedValueOnce({
+        calendars: [{
+          id: 'team@example.com',
+          summary: 'Team calendar',
+          primary: false,
+          access_role: 'reader',
+          time_zone: 'Asia/Kolkata',
+        }],
+        next_page_token: null,
+      })
+    renderCalendar()
+
+    expect(await screen.findByRole('option', {
+      name: 'Primary calendar (primary)',
+    })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Load more calendars' }))
+
+    expect(await screen.findByRole('option', {
+      name: 'Team calendar',
+    })).toBeInTheDocument()
+    expect(calendarService.listCalendars).toHaveBeenLastCalledWith({
+      connectionId: 'calendar-account',
+      pageToken: 'calendar-page-2',
+    })
+    fireEvent.change(screen.getByRole('combobox', {
+      name: 'Google Calendar',
+    }), { target: { value: 'team@example.com' } })
+    await waitFor(() => {
+      expect(calendarService.listEvents).toHaveBeenLastCalledWith(
+        expect.objectContaining({ calendarId: 'team@example.com' }),
+      )
+    })
+  })
+
+  it('retries a failed Calendar list request', async () => {
+    calendarService.listCalendars
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValueOnce({
+        calendars: [{
+          id: 'primary',
+          summary: 'Primary calendar',
+          primary: true,
+          access_role: 'owner',
+          time_zone: 'Asia/Kolkata',
+        }],
+        next_page_token: null,
+      })
+    renderCalendar()
+
+    expect(await screen.findByText(/Calendar list is unavailable/))
+      .toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry calendar list' }))
+
+    expect(await screen.findByRole('option', {
+      name: 'Primary calendar (primary)',
+    })).toBeInTheDocument()
+  })
+
+  it('keeps already-loaded events when retrying a failed next page', async () => {
+    const firstPageEvent = {
+      id: 'available-page-one',
+      summary: 'Available event',
+      start: { date_time: '2026-11-06T04:30:00Z', time_zone: 'UTC' },
+      end: { date_time: '2026-11-06T05:00:00Z', time_zone: 'UTC' },
+      attendees: [],
+    }
+    const secondPageEvent = {
+      id: 'available-page-two',
+      summary: 'Recovered event',
+      start: { date_time: '2026-11-06T06:30:00Z', time_zone: 'UTC' },
+      end: { date_time: '2026-11-06T07:00:00Z', time_zone: 'UTC' },
+      attendees: [],
+    }
+    let attempts = 0
+    calendarService.listEvents.mockImplementation(({ pageToken }) => {
+      if (!pageToken) {
+        return Promise.resolve({
+          ...emptyEventList,
+          events: [firstPageEvent],
+          next_page_token: 'events-page-2',
+        })
+      }
+      attempts += 1
+      return attempts === 1
+        ? Promise.reject(new Error('temporary failure'))
+        : Promise.resolve({
+          ...emptyEventList,
+          events: [secondPageEvent],
+          next_page_token: null,
+        })
+    })
+    renderCalendar()
+
+    expect(await screen.findByRole('button', { name: /Available event/ }))
+      .toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Load more events' }))
+    expect(await screen.findByText('More events could not be loaded.'))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Available event/ }))
+      .toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Retry loading more events',
+    }))
+
+    expect(await screen.findByRole('button', { name: /Recovered event/ }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Available event/ }))
+      .toBeInTheDocument()
+    expect(screen.getByText('All matching events are loaded.'))
+      .toBeInTheDocument()
   })
 
   it('reuses Calendar events and connection status after route navigation', async () => {
@@ -643,6 +852,7 @@ describe('Calendar workspace', () => {
     expect(calendarService.getEvent).toHaveBeenCalledWith({
       connectionId: 'calendar-account',
       eventId: event.id,
+      calendarId: 'primary',
     })
   })
 

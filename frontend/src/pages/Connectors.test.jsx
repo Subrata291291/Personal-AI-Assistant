@@ -232,6 +232,40 @@ describe('Connected Apps', () => {
     })
   })
 
+  it('requests Calendar List access for the exact connected Google account', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        ...googleConnection.capabilities,
+        calendar: true,
+        calendar_events_read: true,
+        calendar_list_read: false,
+      },
+    }], {
+      ...noCalendarCapabilities,
+      connected: true,
+      events_read: true,
+      api_available: true,
+      google_connection_available: true,
+    }))
+    api.post.mockResolvedValue({
+      authorization_url: 'https://accounts.google.test/authorize',
+    })
+    renderConnectors()
+
+    expect(await screen.findByText(/Calendar list permission is required/))
+      .toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Grant Calendar List Access',
+    }))
+
+    await waitFor(() => {
+      expect(api.post).toHaveBeenCalledWith(
+        `/api/v1/oauth/google/connect?service=calendar_list_read&connection_id=${googleConnection.id}`,
+      )
+    })
+  })
+
   it('reports Calendar unconnected when its actual scope is absent', async () => {
     api.get.mockResolvedValue(connectedResponse(
       [googleConnection],

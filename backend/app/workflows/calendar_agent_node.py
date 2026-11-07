@@ -21,6 +21,65 @@ from app.workflows.calendar_tools import create_calendar_tools
 from app.workflows.chat_state import ChatContext, ChatState
 
 logger = logging.getLogger(__name__)
+CALENDAR_LIST_MAX_PAGES = 100
+
+
+async def _list_all_calendars(tool: Any) -> str:
+    calendars: list[Any] = []
+    page_token: str | None = None
+    seen_page_tokens: set[str] = set()
+    for _ in range(CALENDAR_LIST_MAX_PAGES):
+        arguments = {"page_token": page_token} if page_token else {}
+        output = json.loads(await tool.ainvoke(arguments))
+        if not isinstance(output, dict):
+            return json.dumps({
+                "ok": False,
+                "error": {
+                    "message": "Google Calendar returned an invalid calendar list.",
+                },
+            })
+        if output.get("ok") is not True:
+            return json.dumps(output)
+        data = output.get("data")
+        page_calendars = (
+            data.get("calendars") if isinstance(data, dict) else None
+        )
+        if not isinstance(page_calendars, list):
+            return json.dumps({
+                "ok": False,
+                "error": {
+                    "message": "Google Calendar returned an incomplete calendar list.",
+                },
+            })
+        calendars.extend(page_calendars)
+        next_page_token = data.get("next_page_token")
+        if next_page_token is None:
+            return json.dumps({
+                "ok": True,
+                "data": {"calendars": calendars},
+            })
+        if (
+            not isinstance(next_page_token, str)
+            or not next_page_token
+            or next_page_token in seen_page_tokens
+        ):
+            return json.dumps({
+                "ok": False,
+                "error": {
+                    "message": "Google Calendar returned invalid calendar pagination.",
+                },
+            })
+        seen_page_tokens.add(next_page_token)
+        page_token = next_page_token
+    return json.dumps({
+        "ok": False,
+        "error": {
+            "message": (
+                "Google Calendar returned too many calendar pages to "
+                "complete this request safely."
+            ),
+        },
+    })
 
 
 def _is_next_event_details_request(message: str) -> bool:
@@ -30,6 +89,56 @@ def _is_next_event_details_request(message: str) -> bool:
         r"\bdetails?\b.{0,40}\b(?:next|upcoming)\s+(?:meeting|event)\b",
         message.casefold(),
     ))
+
+
+def _requested_calendar_name(message: str) -> str | None:
+    match = re.search(
+        r"\b(?:my|the)\s+([a-z0-9][\w &'’-]{0,39}?)\s+calendar\b",
+        message,
+        re.IGNORECASE,
+    )
+    if match is None:
+        match = re.search(
+            r"\b(?:show|list|view|open)\s+"
+            r"([a-z0-9][\w &'’-]{0,39}?)\s+calendar\b",
+            message,
+            re.IGNORECASE,
+        )
+    if match is None:
+        return None
+    name = match.group(1).strip(" .,'\"")
+    if not name or name.casefold() in {"google", "primary", "my", "the"}:
+        return None
+    return name
+
+
+def _matching_calendars(
+    calendars: list[Any],
+    requested_name: str,
+) -> list[dict[str, Any]]:
+    valid_calendars = [
+        calendar
+        for calendar in calendars
+        if isinstance(calendar, dict)
+        and isinstance(calendar.get("id"), str)
+        and calendar["id"].strip()
+        and isinstance(calendar.get("summary"), str)
+        and calendar["summary"].strip()
+    ]
+    exact_matches = [
+        calendar
+        for calendar in valid_calendars
+        if calendar["summary"].strip().casefold()
+        == requested_name.casefold()
+    ]
+    if exact_matches:
+        return exact_matches
+    return [
+        calendar
+        for calendar in valid_calendars
+        if requested_name.casefold()
+        in calendar["summary"].strip().casefold()
+    ]
 
 
 def _parse_request_time(value: object) -> datetime:
@@ -190,6 +299,36 @@ def _render_result(
     timezone: str,
     requested_calendar_ids: list[str] | None = None,
 ) -> str:
+    if tool_name == "list_calendars":
+        calendars = data.get("calendars")
+        if not isinstance(calendars, list) or any(
+            not isinstance(calendar, dict)
+            or not isinstance(calendar.get("id"), str)
+            or not isinstance(calendar.get("summary"), str)
+            for calendar in calendars
+        ):
+            return (
+                "Google Calendar returned malformed calendar data, so I "
+                "couldn’t provide a reliable list."
+            )
+        if not calendars:
+            return "No calendars are accessible to the selected Google account."
+        lines = []
+        for calendar in calendars:
+            summary = calendar["summary"].strip() or "Untitled calendar"
+            details = []
+            if calendar.get("primary") is True:
+                details.append("primary")
+            role = calendar.get("access_role")
+            if isinstance(role, str) and role.strip():
+                details.append(f"access: {role.strip()}")
+            timezone_name = calendar.get("time_zone")
+            if isinstance(timezone_name, str) and timezone_name.strip():
+                details.append(f"timezone: {timezone_name.strip()}")
+            suffix = f" ({', '.join(details)})" if details else ""
+            lines.append(f"- **{summary}**{suffix}")
+        return "Accessible Google Calendars:\n\n" + "\n".join(lines)
+
     if tool_name == "check_calendar_availability":
         calendars = data.get("calendars")
         if not isinstance(calendars, dict) or not calendars:
@@ -1213,19 +1352,85 @@ def calendar_agent_node(
             (tool for tool in tools if tool.name == tool_name),
             None,
         )
-        if selected_tool is None:
-            response = (
-                "Free/Busy is unavailable because the selected Google "
-                "account has not granted the optional Calendar free/busy "
-                "permission."
-                if is_freebusy
-                else (
-                    "That Calendar operation is not available with the "
-                    "permissions currently granted to your account."
-                )
+        arguments = dict(arguments) if isinstance(arguments, dict) else {}
+        response: str | None = None
+        requested_calendar = _requested_calendar_name(state["user_message"])
+        if selected_tool is not None and requested_calendar is not None:
+            calendar_list_tool = next(
+                (tool for tool in tools if tool.name == "list_calendars"),
+                None,
             )
+            if calendar_list_tool is None:
+                response = (
+                    "Calendar List access is required to find the requested "
+                    "calendar. Grant Calendar List Access in Connected Apps."
+                )
+                selected_tool = None
+            else:
+                calendar_list_output = asyncio.run(
+                    _list_all_calendars(calendar_list_tool)
+                )
+                calendar_list_envelope = json.loads(calendar_list_output)
+                if not calendar_list_envelope.get("ok"):
+                    error = calendar_list_envelope.get("error")
+                    response = (
+                        error.get("message")
+                        if isinstance(error, dict)
+                        and isinstance(error.get("message"), str)
+                        else "Google Calendar could not list accessible calendars."
+                    )
+                    selected_tool = None
+                else:
+                    calendar_list_data = calendar_list_envelope.get("data")
+                    calendars = (
+                        calendar_list_data.get("calendars")
+                        if isinstance(calendar_list_data, dict)
+                        else None
+                    )
+                    matches = (
+                        _matching_calendars(calendars, requested_calendar)
+                        if isinstance(calendars, list)
+                        else []
+                    )
+                    if len(matches) != 1:
+                        names = [
+                            calendar["summary"].strip()
+                            for calendar in matches
+                        ]
+                        if names:
+                            response = (
+                                f"More than one calendar matches "
+                                f"“{requested_calendar}”: "
+                                f"{', '.join(names)}. Which one do you mean?"
+                            )
+                        else:
+                            response = (
+                                f"I couldn’t find an accessible calendar "
+                                f"named “{requested_calendar}”. Please choose "
+                                "one from the calendars available to your "
+                                "connected Google account."
+                            )
+                        selected_tool = None
+                    else:
+                        arguments["calendar_id"] = matches[0]["id"]
+        if selected_tool is None:
+            if response is None:
+                response = (
+                    "Free/Busy is unavailable because the selected Google "
+                    "account has not granted the optional Calendar free/busy "
+                    "permission."
+                    if is_freebusy
+                    else (
+                        "That Calendar operation is not available with the "
+                        "permissions currently granted to your account."
+                    )
+                )
         else:
-            tool_output = asyncio.run(selected_tool.ainvoke(arguments))
+            tool_output = asyncio.run(
+                _list_all_calendars(selected_tool)
+                if tool_name == "list_calendars"
+                else selected_tool.ainvoke(arguments)
+            )
             envelope = json.loads(tool_output)
             if not envelope.get("ok"):
                 error = envelope.get("error")

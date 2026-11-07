@@ -53,6 +53,7 @@ def _call_calendar_write_initiation(
     initiating_user_id,
     connection,
     connection_id,
+    service="calendar_write",
 ):
     db = FakeDatabase(connection)
     db.initiating_user_id = initiating_user_id
@@ -90,7 +91,7 @@ def _call_calendar_write_initiation(
     response = oauth.connect_google(
         current_user={"id": str(initiating_user_id)},
         db=db,
-        service="calendar_write",
+        service=service,
         connection_id=connection_id,
     )
     return response, db, state_service, oauth_client, initiating_user_id
@@ -233,6 +234,48 @@ def test_active_owned_connection_can_start_incremental_calendar_consent(
         state="opaque-state",
         code_challenge="pkce-challenge",
         service="calendar_write",
+    )
+    assert actual_user_id in db.lookup_parameters.values()
+    assert connection_id in db.lookup_parameters.values()
+    db.rollback.assert_not_called()
+
+
+def test_calendar_list_consent_targets_the_exact_owned_connection(
+    monkeypatch,
+):
+    user_id = uuid4()
+    connection_id = uuid4()
+    connection = SimpleNamespace(
+        id=connection_id,
+        user_id=user_id,
+        provider="google",
+        status="connected",
+    )
+
+    response, db, state_service, oauth_client, actual_user_id = (
+        _call_calendar_write_initiation(
+            monkeypatch,
+            initiating_user_id=user_id,
+            connection=connection,
+            connection_id=connection_id,
+            service="calendar_list_read",
+        )
+    )
+
+    assert response["provider"] == "google"
+    state_service.create_state.assert_called_once_with(
+        user_id=actual_user_id,
+        provider="google",
+        redirect_uri=(
+            "https://backend.example.test/api/v1/oauth/google/callback"
+        ),
+        service="calendar_list_read",
+        target_connection_id=connection_id,
+    )
+    oauth_client.build_authorization_url.assert_called_once_with(
+        state="opaque-state",
+        code_challenge="pkce-challenge",
+        service="calendar_list_read",
     )
     assert actual_user_id in db.lookup_parameters.values()
     assert connection_id in db.lookup_parameters.values()

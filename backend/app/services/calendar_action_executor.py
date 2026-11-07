@@ -259,9 +259,17 @@ class CalendarActionExecutor:
                 return await self._reconcile_mutation(
                     user_id=user_id,
                     proposal=proposal,
-                    identity=identity,
                     parameters=parameters,
-                    request_accepted=False,
+                    cause=exc,
+                )
+            if (
+                isinstance(parameters, CalendarDeleteEventParameters)
+                and exc.status_code == 404
+            ):
+                return await self._reconcile_mutation(
+                    user_id=user_id,
+                    proposal=proposal,
+                    parameters=parameters,
                     cause=exc,
                 )
             return self._finish(
@@ -307,9 +315,7 @@ class CalendarActionExecutor:
             return await self._reconcile_mutation(
                 user_id=user_id,
                 proposal=proposal,
-                identity=identity,
                 parameters=parameters,
-                request_accepted=False,
                 cause=exc,
             )
         finally:
@@ -318,9 +324,7 @@ class CalendarActionExecutor:
         return await self._reconcile_mutation(
             user_id=user_id,
             proposal=proposal,
-            identity=identity,
             parameters=parameters,
-            request_accepted=True,
         )
 
     @staticmethod
@@ -375,9 +379,7 @@ class CalendarActionExecutor:
         *,
         user_id: UUID,
         proposal: ActionApprovalProposal,
-        identity: CalendarOperationIdentity,
         parameters: CalendarUpdateEventParameters | CalendarDeleteEventParameters,
-        request_accepted: bool,
         cause: Exception | None = None,
     ) -> ActionApprovalProposal:
         try:
@@ -400,7 +402,7 @@ class CalendarActionExecutor:
             read_failed = False
 
         if isinstance(parameters, CalendarDeleteEventParameters):
-            if event is None and request_accepted and not read_failed:
+            if event is None and not read_failed:
                 return self._finish(
                     user_id=user_id,
                     proposal_id=proposal.proposal_id,
@@ -413,16 +415,14 @@ class CalendarActionExecutor:
                         "google_event_id": parameters.event_id,
                     },
                 )
-            if event is None and not request_accepted and not read_failed:
-                reason = "delete_outcome_unconfirmed"
-            else:
-                reason = "event_still_exists" if event is not None else "read_failed"
+            reason = "event_still_exists" if event is not None else "read_failed"
         else:
             matched = (
                 event is not None
                 and self._event_matches_update(
                     event,
                     parameters.changes,
+                    parameters.current_event,
                 )
             )
             if matched:
@@ -472,46 +472,48 @@ class CalendarActionExecutor:
         cls,
         event: dict[str, Any],
         changes: dict[str, Any],
+        current_event: dict[str, Any],
     ) -> bool:
         for key in ("summary", "description", "location"):
-            if key in changes and event.get(key) != changes[key]:
+            expected = changes.get(key, current_event.get(key))
+            if event.get(key) != expected:
                 return False
-        if "attendees" in changes:
-            actual = {
-                attendee.get("email", "").casefold()
-                for attendee in event.get("attendees", [])
-                if isinstance(attendee, dict)
-                and isinstance(attendee.get("email"), str)
-            }
-            expected = {
-                address.casefold() for address in changes["attendees"]
-            }
-            if actual != expected:
+        actual_attendees = {
+            attendee.get("email", "").casefold()
+            for attendee in event.get("attendees", [])
+            if isinstance(attendee, dict)
+            and isinstance(attendee.get("email"), str)
+        }
+        expected_attendees = {
+            address.casefold()
+            for address in changes.get(
+                "attendees",
+                current_event.get("attendees", []),
+            )
+        }
+        if actual_attendees != expected_attendees:
+            return False
+        for key in ("start", "end"):
+            requested = changes.get(key, current_event.get(key))
+            actual = event.get(key)
+            if not isinstance(requested, dict) or not isinstance(actual, dict):
                 return False
-        if "start" in changes:
-            for key, actual in (
-                ("start", event.get("start")),
-                ("end", event.get("end")),
-            ):
-                requested = changes[key]
-                if not isinstance(requested, dict) or not isinstance(actual, dict):
-                    return False
-                if "date" in requested:
-                    if (
-                        not isinstance(actual.get("date"), date)
-                        or actual["date"].isoformat() != requested["date"]
-                    ):
-                        return False
-                elif (
-                    not isinstance(actual.get("date_time"), datetime)
-                    or cls._utc_datetime(requested.get("dateTime"))
-                    != actual["date_time"].astimezone(timezone.utc)
-                    or (
-                        requested.get("timeZone") is not None
-                        and requested.get("timeZone") != actual.get("time_zone")
-                    )
+            if "date" in requested:
+                if (
+                    not isinstance(actual.get("date"), date)
+                    or actual["date"].isoformat() != requested["date"]
                 ):
                     return False
+            elif (
+                not isinstance(actual.get("date_time"), datetime)
+                or cls._utc_datetime(requested.get("dateTime"))
+                != actual["date_time"].astimezone(timezone.utc)
+                or (
+                    requested.get("timeZone") is not None
+                    and requested.get("timeZone") != actual.get("time_zone")
+                )
+            ):
+                return False
         return True
 
     async def _insert_and_reconcile(
@@ -883,12 +885,24 @@ class CalendarActionExecutor:
             )
 
         if isinstance(parameters, CalendarDeleteEventParameters):
-            reconciliation_status = (
-                "manual_review" if event is None else "pending"
-            )
+            if event is None:
+                return self._finish(
+                    user_id=user_id,
+                    proposal_id=proposal.proposal_id,
+                    expected_state="execution_uncertain",
+                    state="completed",
+                    classification="confirmed",
+                    reconciliation="confirmed",
+                    result={
+                        "outcome": "deleted",
+                        "google_event_id": parameters.event_id,
+                    },
+                )
+            reconciliation_status = "pending"
         elif event is not None and self._event_matches_update(
             event,
             parameters.changes,
+            parameters.current_event,
         ):
             return self._finish(
                 user_id=user_id,

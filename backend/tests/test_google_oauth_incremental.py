@@ -90,6 +90,7 @@ def test_refresh_token_errors_are_classified_without_exposing_provider_data(
             "calendar",
             [
                 GoogleOAuthClient.CALENDAR_EVENTS_READ_SCOPE,
+                GoogleOAuthClient.CALENDAR_LIST_READ_SCOPE,
                 GoogleOAuthClient.CALENDAR_FREEBUSY_SCOPE,
             ],
             [
@@ -456,7 +457,22 @@ def test_disconnect_cancels_an_in_flight_oauth_callback():
     service.credential_service.save_credentials.assert_not_called()
 
 
-def test_calendar_write_callback_is_bound_to_the_selected_google_account(
+@pytest.mark.parametrize(
+    ("service_name", "scope"),
+    [
+        (
+            "calendar_write",
+            GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE,
+        ),
+        (
+            "calendar_list_read",
+            GoogleOAuthClient.CALENDAR_LIST_READ_SCOPE,
+        ),
+    ],
+)
+def test_incremental_calendar_callback_is_bound_to_the_selected_google_account(
+    service_name,
+    scope,
     monkeypatch,
 ):
     user_id = uuid4()
@@ -467,7 +483,7 @@ def test_calendar_write_callback_is_bound_to_the_selected_google_account(
         "user_id": user_id,
         "code_verifier": "verifier",
         "redirect_uri": "https://example.test/callback",
-        "service": "calendar_write",
+        "service": service_name,
         "target_connection_id": connection_id,
     }
     service.state_service.lock_consumed_state_for_callback.return_value = True
@@ -477,7 +493,7 @@ def test_calendar_write_callback_is_bound_to_the_selected_google_account(
             "access_token": "new-access",
             "refresh_token": "new-refresh",
             "expires_in": 3600,
-            "scope": "https://www.googleapis.com/auth/calendar.events",
+            "scope": scope,
         }
     )
     service.oauth_client.get_user_info = AsyncMock(

@@ -890,6 +890,30 @@ function Connectors() {
                     Grant Calendar write access
                   </button>
                 )}
+                {connection.capabilities?.calendar_events_read === true &&
+                  connection.capabilities?.calendar_list_read === false && (
+                  <div className="flex flex-col items-start gap-1">
+                    <p className={`max-w-56 text-xs ${colors.muted}`}>
+                      Calendar list permission is required to discover and
+                      select secondary calendars.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => connectMutation.mutate({
+                        service: 'calendar_list_read',
+                        connectionId: connection.id,
+                      })}
+                      disabled={connectMutation.isPending}
+                      className={`shrink-0 rounded-lg border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                        isDark
+                          ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                          : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                      }`}
+                    >
+                      Grant Calendar List Access
+                    </button>
+                  </div>
+                )}
                 <button
                   type="button"
                   onClick={() => handleDisconnect(connection.id)}

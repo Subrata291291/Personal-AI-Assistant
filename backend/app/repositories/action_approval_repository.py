@@ -797,7 +797,10 @@ class ActionApprovalRepository:
                             "expiry_mode": "valid",
                             "timestamp_field": "completed_at",
                             "patch": json.dumps(
-                                {"status": "rejected"},
+                                {
+                                    "status": "rejected",
+                                    "result": {"outcome": "superseded"},
+                                },
                                 sort_keys=True,
                                 separators=(",", ":"),
                             ),

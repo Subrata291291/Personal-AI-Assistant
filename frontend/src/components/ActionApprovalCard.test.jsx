@@ -78,7 +78,7 @@ function createCalendarMutationProposal(actionType, status = 'pending') {
         summary: 'Design review',
         start: { dateTime: '2026-06-10T10:00:00+00:00', timeZone: 'UTC' },
         end: { dateTime: '2026-06-10T11:00:00+00:00', timeZone: 'UTC' },
-        attendees: [],
+        attendees: [{ email: 'attendee@example.com' }],
         etag: '"etag-1"',
       },
       ...(isUpdate ? { changes: { summary: 'Updated design review' } } : {}),
@@ -145,6 +145,34 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
       .toBeInTheDocument()
   })
 
+  it('displays the changed Calendar time range in the event timezone', () => {
+    const proposal = createCalendarMutationProposal('calendar.update_event')
+    proposal.parameters.time_zone = 'Asia/Kolkata'
+    proposal.parameters.changes = {
+      start: {
+        dateTime: '2026-06-10T17:00:00+05:30',
+        timeZone: 'Asia/Kolkata',
+      },
+      end: {
+        dateTime: '2026-06-10T18:00:00+05:30',
+        timeZone: 'Asia/Kolkata',
+      },
+    }
+
+    renderProposalCard(proposal)
+
+    expect(screen.getByRole('region', { name: 'Original event' }))
+      .toHaveTextContent('10:00 AM')
+    expect(screen.getByRole('region', { name: 'Proposed event' }))
+      .toHaveTextContent('5:00 PM')
+    expect(screen.getByRole('region', { name: 'Proposed event' }))
+      .toHaveTextContent('6:00 PM')
+    expect(screen.getByRole('region', { name: 'Proposed changes' }))
+      .toHaveTextContent('Original: June 10, 2026 10:00 AM')
+    expect(screen.getByRole('region', { name: 'Proposed changes' }))
+      .toHaveTextContent('Proposed: June 10, 2026 5:00 PM')
+  })
+
   it('reconciles an uncertain send and never offers a blind retry', async () => {
     actionApprovalService.execute.mockRejectedValue(
       new Error('The request outcome is uncertain.'),
@@ -168,6 +196,18 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
     expect(screen.queryByRole('button', { name: 'Execute Gmail send' }))
       .not.toBeInTheDocument()
     expect(actionApprovalService.execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a superseded Calendar proposal without actionable controls', () => {
+    const proposal = createCalendarProposal('rejected')
+    proposal.result = { outcome: 'superseded' }
+    renderProposalCard(proposal)
+
+    expect(screen.getByText('Approval: Superseded')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Approve' }))
+      .not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Create Calendar event' }))
+      .not.toBeInTheDocument()
   })
 
   it('requires a separate execute action for an approved Calendar event', async () => {
@@ -244,6 +284,14 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
     renderProposalCard(proposal)
 
     expect(screen.getAllByText(/Updated design review/).length).toBeGreaterThan(0)
+    expect(screen.getByRole('region', { name: 'Original event' }))
+      .toHaveTextContent('Design review')
+    expect(screen.getByRole('region', { name: 'Proposed event' }))
+      .toHaveTextContent('Updated design review')
+    expect(screen.getByRole('region', { name: 'Proposed changes' }))
+      .toHaveTextContent('Original: Design review')
+    expect(screen.getByRole('region', { name: 'Original event' }))
+      .toHaveTextContent('10:00 AM')
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
     await waitFor(() => {
       expect(actionApprovalService.approve).toHaveBeenCalledWith(
@@ -279,6 +327,13 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
       },
     })
     renderProposalCard(proposal)
+
+    expect(screen.getByRole('region', { name: 'Event to delete' }))
+      .toHaveTextContent('Design review')
+    expect(screen.getByRole('region', { name: 'Event to delete' }))
+      .toHaveTextContent('10:00 AM')
+    expect(screen.getByRole('region', { name: 'Event to delete' }))
+      .toHaveTextContent('attendee@example.com')
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
     await waitFor(() => {
@@ -407,7 +462,13 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
     })).not.toBeInTheDocument()
   })
 
-  it('invalidates Calendar event queries only after confirmed creation', async () => {
+  it.each([
+    ['calendar.create_event', 'created', 'Create Calendar event'],
+    ['calendar.update_event', 'updated', 'Update Calendar event'],
+    ['calendar.delete_event', 'deleted', 'Delete Calendar event'],
+  ])(
+    'invalidates Calendar event queries only after verified %s',
+    async (actionType, outcome, actionLabel) => {
     const queryClient = new QueryClient({
       defaultOptions: {
         queries: { retry: false },
@@ -418,18 +479,24 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
       .mockResolvedValue()
     actionApprovalService.execute.mockResolvedValue({
       proposal: {
-        ...createCalendarProposal('completed'),
-        result: { outcome: 'created', google_event_id: 'event-1' },
+        ...(actionType === 'calendar.create_event'
+          ? createCalendarProposal('completed')
+          : createCalendarMutationProposal(actionType, 'completed')),
+        result: { outcome, google_event_id: 'event-1' },
       },
     })
-    renderProposalCard(createCalendarProposal('approved'), queryClient)
+    renderProposalCard(
+      actionType === 'calendar.create_event'
+        ? createCalendarProposal('approved')
+        : createCalendarMutationProposal(actionType, 'approved'),
+      queryClient,
+    )
 
-    fireEvent.click(screen.getByRole('button', {
-      name: 'Create Calendar event',
-    }))
+    fireEvent.click(screen.getByRole('button', { name: actionLabel }))
 
-    expect(await screen.findByText(/Google Calendar confirmed the event/))
-      .toBeInTheDocument()
+    expect(await screen.findByText(
+      new RegExp(`Google Calendar confirmed the event was ${outcome}`),
+    )).toBeInTheDocument()
     await waitFor(() => {
       expect(invalidateQueries).toHaveBeenCalledWith({
         queryKey: ['calendar-events'],
@@ -440,7 +507,8 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
         refetchType: 'all',
       })
     })
-  })
+    },
+  )
 
   it('shows a rejected approval without offering execution', async () => {
     actionApprovalService.reject.mockResolvedValue({

@@ -53,6 +53,23 @@ class CalendarEventListResponse(BaseModel):
     time_zone: str | None = None
 
 
+class CalendarListEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    summary: str
+    primary: bool | None = None
+    access_role: str | None = None
+    time_zone: str | None = None
+
+
+class CalendarListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    calendars: list[CalendarListEntry]
+    next_page_token: str | None = None
+
+
 class CalendarScheduleResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

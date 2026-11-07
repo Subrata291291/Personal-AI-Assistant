@@ -18,6 +18,7 @@ from app.repositories.memory_review_repository import (
 )
 from app.services.memory_service import MemoryService
 from app.db.models.memory_review import MemoryReview
+from app.memory.memory_decision import MemoryDecision, MemoryDecisionEngine
 
 
 _MEMORY_OPT_OUT = re.compile(
@@ -77,6 +78,7 @@ class MemoryItemResult(BaseModel):
     content: str | None = None
     importance: int | None = None
     confidence: float | None = None
+    decision: MemoryDecision | None = None
 
 
 class MemoryPipelineResult(BaseModel):
@@ -105,6 +107,7 @@ class MemoryPipeline:
         self.classifier = MemoryClassifier()
         self.policy = MemoryPolicy()
         self.conflict_resolver = MemoryConflictResolver()
+        self.decision_engine = MemoryDecisionEngine()
 
         self.session = session
 
@@ -200,6 +203,15 @@ class MemoryPipeline:
                         content=memory_content,
                         importance=extracted_memory.importance,
                         confidence=extracted_memory.confidence,
+                        decision=self.decision_engine.create(
+                            action="IGNORE",
+                            memory_type=extracted_memory.memory_type or "long_term",
+                            target_memory_id=None,
+                            proposed_content=memory_content,
+                            confidence=extracted_memory.confidence,
+                            importance=extracted_memory.importance,
+                            reason="Exact duplicate memory detected.",
+                        ),
                     )
                 )
                 continue
@@ -260,6 +272,14 @@ class MemoryPipeline:
                         content=memory.content,
                         importance=memory.importance,
                         confidence=memory.confidence,
+                        decision=self.decision_engine.create(
+                            action="CREATE",
+                            memory_type=memory_type,
+                            proposed_content=memory.content,
+                            confidence=memory.confidence,
+                            importance=memory.importance,
+                            reason="New memory successfully stored.",
+                        ),
                     )
                 )
                 continue
@@ -309,6 +329,15 @@ class MemoryPipeline:
                         content=candidate.content,
                         importance=extracted_memory.importance,
                         confidence=decision.confidence,
+                        decision=self.decision_engine.create(
+                            action="IGNORE",
+                            memory_type=memory_type,
+                            target_memory_id=candidate.memory_id,
+                            proposed_content=candidate.content,
+                            confidence=decision.confidence,
+                            importance=extracted_memory.importance,
+                            reason=decision.reason,
+                        ),
                     )
                 )
                 continue
@@ -336,6 +365,15 @@ class MemoryPipeline:
                         content=memory_content,
                         importance=extracted_memory.importance,
                         confidence=decision.confidence,
+                        decision=self.decision_engine.create(
+                            action="REVIEW",
+                            memory_type=memory_type,
+                            target_memory_id=candidate.memory_id,
+                            proposed_content=memory_content,
+                            confidence=decision.confidence,
+                            importance=extracted_memory.importance,
+                            reason=decision.reason,
+                        ),
                     )
                 )
                 continue
@@ -399,6 +437,15 @@ class MemoryPipeline:
                         content=updated_memory.content,
                         importance=updated_memory.importance,
                         confidence=updated_memory.confidence,
+                        decision=self.decision_engine.create(
+                            action="UPDATE",
+                            memory_type=updated_memory.memory_type,
+                            target_memory_id=updated_memory.id,
+                            proposed_content=updated_memory.content,
+                            confidence=updated_memory.confidence,
+                            importance=updated_memory.importance,
+                            reason=decision.reason,
+                        ),
                     )
                 )
                 continue
@@ -424,6 +471,15 @@ class MemoryPipeline:
                         content=memory.content,
                         importance=memory.importance,
                         confidence=memory.confidence,
+                        decision=self.decision_engine.create(
+                            action="CREATE",
+                            memory_type=memory_type,
+                            target_memory_id=memory.id,
+                            proposed_content=memory.content,
+                            confidence=memory.confidence,
+                            importance=memory.importance,
+                            reason=decision.reason,
+                        ),
                     )
                 )
 

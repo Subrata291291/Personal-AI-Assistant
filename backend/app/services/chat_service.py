@@ -769,6 +769,7 @@ class ChatService:
                 "user_timezone": user_timezone,
                 "request_time": request_time.isoformat(),
                 "assistant_capabilities": assistant_capabilities,
+                "memory_enabled": memory_enabled,
             }
             pending_calendar_create = self._pending_calendar_create_proposal(
                 history=history,
@@ -894,18 +895,28 @@ class ChatService:
             # automatic memory storage is disabled.
 
             try:
-                memory_result = self.memory_pipeline.process(
-                    user_id=user_id,
-                    content=normalized_content,
-                    memory_enabled=memory_enabled,
-                    source_conversation_id=conversation_id,
-                )
-
-                logger.info(
-                    "Memory pipeline completed: status=%s, user_id=%s",
-                    memory_result.status,
-                    user_id,
-                )
+                if result.get("memory_decision_executed"):
+                    memory_result = None
+                    logger.info(
+                        "Autonomous memory decision already executed before routing | user_id=%s",
+                        user_id,
+                    )
+                else:
+                    memory_result = self.memory_pipeline.process(
+                        user_id=user_id,
+                        content=normalized_content,
+                        memory_enabled=(
+                            memory_enabled
+                            and result.get("assistant_route") != "memory_update"
+                        ),
+                        source_conversation_id=conversation_id,
+                    )
+                if memory_result is not None:
+                    logger.info(
+                        "Memory pipeline completed: status=%s, user_id=%s",
+                        memory_result.status,
+                        user_id,
+                    )
 
             except Exception:
                 logger.exception(

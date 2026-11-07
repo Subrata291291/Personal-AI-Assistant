@@ -23,7 +23,8 @@ class OAuthState(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "service IS NULL OR service IN ('gmail', 'calendar', 'calendar_write')",
+            "service IS NULL OR service IN "
+            "('gmail', 'calendar', 'calendar_write', 'calendar_list_read')",
             name="ck_pa_oauth_states_service",
         ),
         UniqueConstraint(

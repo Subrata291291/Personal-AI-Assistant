@@ -63,13 +63,13 @@ function eventDateTime(value) {
     return { dateTime: null, timeZone: null, allDay: false }
   }
   return {
-    dateTime: value.dateTime || value.date || null,
-    timeZone: value.timeZone || null,
+    dateTime: value.dateTime || value.date_time || value.date || null,
+    timeZone: value.timeZone || value.time_zone || null,
     allDay: Boolean(value.date && !value.dateTime),
   }
 }
 
-function getCalendarEventDetails(proposal) {
+function getCalendarEventDetails(proposal, original = false) {
   const parameters = proposal.parameters
   if (proposal.action_type === 'calendar.create_event') {
     return {
@@ -82,8 +82,24 @@ function getCalendarEventDetails(proposal) {
     }
   }
 
-  if (proposal.action_type !== 'calendar.update_event') return null
   const currentEvent = parameters.current_event || {}
+  const currentStart = eventDateTime(currentEvent.start)
+  const currentEnd = eventDateTime(currentEvent.end)
+  if (proposal.action_type === 'calendar.delete_event' || original) {
+    return {
+      title: currentEvent.summary,
+      start: currentStart,
+      end: currentEnd,
+      timeZone: currentStart.timeZone
+        || currentEnd.timeZone
+        || parameters.time_zone,
+      calendarId: parameters.calendar_id,
+      allDay: currentStart.allDay,
+      attendees: currentEvent.attendees || [],
+    }
+  }
+  if (proposal.action_type !== 'calendar.update_event') return null
+
   const changes = parameters.changes || {}
   const start = eventDateTime(changes.start || currentEvent.start)
   const end = eventDateTime(changes.end || currentEvent.end)
@@ -94,7 +110,145 @@ function getCalendarEventDetails(proposal) {
     timeZone: parameters.time_zone || start.timeZone || end.timeZone,
     calendarId: parameters.calendar_id,
     allDay: start.allDay,
+    attendees: changes.attendees || currentEvent.attendees || [],
   }
+}
+
+function formatEventChangeValue(key, value, timeZone) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => (
+        typeof item === 'string'
+          ? item
+          : item?.email || item?.display_name || item?.displayName
+      ))
+      .filter(Boolean)
+      .join(', ') || 'None listed'
+  }
+  if (key !== 'start' && key !== 'end') return displayValue(value)
+  const eventTime = eventDateTime(value)
+  if (eventTime.allDay) {
+    return `${formatEventDate(eventTime.dateTime, 'UTC')} (all day)`
+  }
+  if (eventTime.dateTime) {
+    const date = formatEventDate(eventTime.dateTime, timeZone)
+    const time = formatEventTime(eventTime.dateTime, timeZone)
+    return `${date} ${time}`.trim()
+  }
+  return displayValue(value)
+}
+
+function CalendarEventDetails({ details, label, isDark }) {
+  if (!details) return null
+  const localStartDate = details.start.dateTime
+    ? formatEventDate(
+      details.start.dateTime,
+      details.timeZone || 'UTC',
+    )
+    : ''
+  const localEndDate = details.end.dateTime
+    ? formatEventDate(
+      details.allDay
+        ? formatAllDayEndDate(details.end.dateTime)
+        : details.end.dateTime,
+      details.timeZone || 'UTC',
+    )
+    : ''
+  const isMultiDay = localStartDate && localEndDate &&
+    localStartDate !== localEndDate
+
+  return (
+    <section
+      aria-label={label}
+      className={`rounded-lg px-3 py-3 ${
+        isDark ? 'bg-[#171a27] text-slate-200' : 'bg-slate-50 text-slate-700'
+      }`}
+    >
+      <h4 className={`text-[11px] font-bold uppercase tracking-wide ${
+        isDark ? 'text-slate-400' : 'text-slate-500'
+      }`}>
+        {label}
+      </h4>
+      <dl className="mt-2 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-[110px_1fr]">
+        {details.title && (
+          <>
+            <dt className="font-semibold">Title</dt>
+            <dd className="break-words">{details.title}</dd>
+          </>
+        )}
+        {details.start.dateTime && (
+          <>
+            <dt className="font-semibold">Date</dt>
+            <dd>{isMultiDay
+              ? `${localStartDate} – ${localEndDate}`
+              : localStartDate}
+            </dd>
+          </>
+        )}
+        {details.allDay ? (
+          <>
+            <dt className="font-semibold">Event timing</dt>
+            <dd>All day</dd>
+          </>
+        ) : (
+          <>
+            {details.start.dateTime && (
+              <>
+                <dt className="font-semibold">Start time</dt>
+                <dd>
+                  {formatEventTime(
+                    details.start.dateTime,
+                    details.timeZone || 'UTC',
+                  )}
+                </dd>
+              </>
+            )}
+            {details.end.dateTime && (
+              <>
+                <dt className="font-semibold">End time</dt>
+                <dd>
+                  {formatEventTime(
+                    details.end.dateTime,
+                    details.timeZone || 'UTC',
+                  )}
+                  {isMultiDay && ` (${localEndDate})`}
+                </dd>
+              </>
+            )}
+            {details.timeZone && (
+              <>
+                <dt className="font-semibold">Timezone</dt>
+                <dd>{details.timeZone}</dd>
+              </>
+            )}
+          </>
+        )}
+        {details.calendarId && (
+          <>
+            <dt className="font-semibold">Calendar</dt>
+            <dd>{details.calendarId}</dd>
+          </>
+        )}
+        {details.attendees && (
+          <>
+            <dt className="font-semibold">Attendees</dt>
+            <dd className="break-words">
+              {details.attendees.length
+                ? details.attendees
+                  .map((attendee) => (
+                    typeof attendee === 'string'
+                      ? attendee
+                      : attendee.email || attendee.display_name || attendee.displayName
+                  ))
+                  .filter(Boolean)
+                  .join(', ') || 'None listed'
+                : 'None listed'}
+            </dd>
+          </>
+        )}
+      </dl>
+    </section>
+  )
 }
 
 function updateProposalMessage(message, proposal, onUpdated) {
@@ -196,9 +350,9 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       setExecutionAttemptFailed(false)
       updateProposalMessage(message, response.proposal, onUpdated)
       if (
-        isCalendarCreate &&
+        isCalendarAction &&
         response.proposal.status === 'completed' &&
-        response.proposal.result?.outcome === 'created'
+        response.proposal.result?.outcome === calendarOutcome
       ) {
         await Promise.all([
           queryClient.invalidateQueries({
@@ -289,7 +443,9 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
   const approvalStatus = {
     pending: 'Pending',
     approved: 'Approved',
-    rejected: 'Rejected',
+    rejected: proposal.result?.outcome === 'superseded'
+      ? 'Superseded'
+      : 'Rejected',
     expired: 'Expired',
   }[visibleStatus] || 'Approved'
   const executionStatus = visibleStatus === 'approved'
@@ -377,22 +533,12 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
     && (!isCalendarAction || proposal.execution_available === true)
   )
   const calendarEventDetails = getCalendarEventDetails(proposal)
-  const localStartDate = calendarEventDetails?.start.dateTime
-    ? formatEventDate(
-      calendarEventDetails.start.dateTime,
-      calendarEventDetails.timeZone || 'UTC',
-    )
-    : ''
-  const localEndDate = calendarEventDetails?.end.dateTime
-    ? formatEventDate(
-      calendarEventDetails.allDay
-        ? formatAllDayEndDate(calendarEventDetails.end.dateTime)
-        : calendarEventDetails.end.dateTime,
-      calendarEventDetails.timeZone || 'UTC',
-    )
-    : ''
-  const isMultiDay = localStartDate && localEndDate &&
-    localStartDate !== localEndDate
+  const originalCalendarEventDetails = isCalendarUpdate
+    ? getCalendarEventDetails(proposal, true)
+    : null
+  const updateChanges = isCalendarUpdate
+    ? Object.entries(proposal.parameters.changes || {})
+    : []
 
   return (
     <section
@@ -427,9 +573,25 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       </header>
 
       <div className="space-y-3 p-4">
-        {calendarEventDetails && (
+        <CalendarEventDetails
+          details={calendarEventDetails}
+          label={isCalendarUpdate
+            ? 'Proposed event'
+            : isCalendarDelete
+              ? 'Event to delete'
+              : 'Event details'}
+          isDark={isDark}
+        />
+        {originalCalendarEventDetails && (
+          <CalendarEventDetails
+            details={originalCalendarEventDetails}
+            label="Original event"
+            isDark={isDark}
+          />
+        )}
+        {updateChanges.length > 0 && (
           <section
-            aria-label="Event details"
+            aria-label="Proposed changes"
             className={`rounded-lg px-3 py-3 ${
               isDark ? 'bg-[#171a27] text-slate-200' : 'bg-slate-50 text-slate-700'
             }`}
@@ -437,69 +599,40 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
             <h4 className={`text-[11px] font-bold uppercase tracking-wide ${
               isDark ? 'text-slate-400' : 'text-slate-500'
             }`}>
-              Event details
+              Proposed changes
             </h4>
             <dl className="mt-2 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-[110px_1fr]">
-              {calendarEventDetails.title && (
-                <>
-                  <dt className="font-semibold">Title</dt>
-                  <dd className="break-words">{calendarEventDetails.title}</dd>
-                </>
-              )}
-              {calendarEventDetails.start.dateTime && (
-                <>
-                  <dt className="font-semibold">Date</dt>
-                  <dd>
-                    {isMultiDay
-                      ? `${localStartDate} – ${localEndDate}`
-                      : localStartDate}
-                  </dd>
-                </>
-              )}
-              {calendarEventDetails.allDay ? (
-                <>
-                  <dt className="font-semibold">Event timing</dt>
-                  <dd>All day</dd>
-                </>
-              ) : (
-                <>
-                  {calendarEventDetails.start.dateTime && (
-                    <>
-                      <dt className="font-semibold">Start time</dt>
-                      <dd>
-                        {formatEventTime(
-                          calendarEventDetails.start.dateTime,
-                          calendarEventDetails.timeZone || 'UTC',
+              {updateChanges.map(([key, value]) => {
+                const originalValue = proposal.parameters.current_event?.[key]
+                const timeZone = proposal.parameters.time_zone
+                  || 'UTC'
+                const originalTimeZone = originalCalendarEventDetails.timeZone
+                  || timeZone
+                return (
+                  <div
+                    key={key}
+                    className="grid gap-1 border-t border-slate-200/50 py-2 first:border-0 first:pt-0 sm:col-span-2 sm:grid-cols-[110px_1fr_1fr]"
+                  >
+                    <dt className="font-semibold capitalize">
+                      {key.replaceAll('_', ' ')}
+                    </dt>
+                    <dd className="break-words">
+                      <span className="font-semibold">Original: </span>
+                      {originalValue === undefined
+                        ? 'Not set'
+                        : formatEventChangeValue(
+                          key,
+                          originalValue,
+                          originalTimeZone,
                         )}
-                      </dd>
-                    </>
-                  )}
-                  {calendarEventDetails.end.dateTime && (
-                    <>
-                      <dt className="font-semibold">End time</dt>
-                      <dd>
-                        {formatEventTime(
-                          calendarEventDetails.end.dateTime,
-                          calendarEventDetails.timeZone || 'UTC',
-                        )}
-                        {isMultiDay && ` (${localEndDate})`}
-                      </dd>
-                    </>
-                  )}
-                  {calendarEventDetails.timeZone && (
-                    <>
-                      <dt className="font-semibold">Timezone</dt>
-                      <dd>{calendarEventDetails.timeZone}</dd>
-                    </>
-                  )}
-                </>
-              )}
-              {calendarEventDetails.calendarId && (
-                <>
-                  <dt className="font-semibold">Calendar</dt>
-                  <dd>{calendarEventDetails.calendarId}</dd>
-                </>
-              )}
+                    </dd>
+                    <dd className="break-words">
+                      <span className="font-semibold">Proposed: </span>
+                      {formatEventChangeValue(key, value, timeZone)}
+                    </dd>
+                  </div>
+                )
+              })}
             </dl>
           </section>
         )}
@@ -520,6 +653,7 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
             .filter(([key]) => ![
               'expected_etag',
               'current_event',
+              ...(isCalendarUpdate ? ['changes'] : []),
               ...(isCalendarCreate
                 ? ['summary', 'start', 'end', 'time_zone', 'calendar_id', 'all_day']
                 : []),
@@ -550,21 +684,6 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
               </dd>
             </div>
           ))}
-          {(isCalendarUpdate || isCalendarDelete) && (
-            <div className="grid gap-1 py-2 sm:grid-cols-[110px_1fr]">
-              <dt className={`font-semibold ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-                Current event
-              </dt>
-              <dd className={`break-words whitespace-pre-wrap ${
-                isDark ? 'text-slate-200' : 'text-slate-700'
-              }`}>
-                {displayValue(Object.fromEntries(
-                  Object.entries(proposal.parameters.current_event || {})
-                    .filter(([key]) => key !== 'etag'),
-                ))}
-              </dd>
-            </div>
-          )}
         </dl>
 
         <p className={`text-[11px] ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>

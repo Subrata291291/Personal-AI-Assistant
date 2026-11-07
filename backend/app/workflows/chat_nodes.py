@@ -10,8 +10,6 @@ from app.workflows.chat_state import ChatState
 
 
 PERSONAL_CALENDAR_CLAIM_PATTERN = re.compile(
-    r"\byour\b.{0,80}\b(?:calendar|schedule|agenda|meetings?|events?|"
-    r"appointments?|availability|free|busy)\b|"
     r"\byou(?:'re| are| have| had| will have| will be)\b.{0,80}"
     r"\b(?:meetings?|events?|appointments?|free|busy|available)\b|"
     r"\b(?:meeting|event|appointment)\b.{0,80}"

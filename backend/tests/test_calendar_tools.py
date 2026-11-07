@@ -68,6 +68,7 @@ def test_factory_registers_only_read_tools_and_hides_identity_arguments():
     )
 
     assert {tool.name for tool in tools} == {
+        "list_calendars",
         "list_calendar_events",
         "get_calendar_event",
         "get_today_schedule",
@@ -100,6 +101,7 @@ def test_factory_registers_operations_independently_for_granted_scopes():
     )
 
     assert {tool.name for tool in event_tools} == {
+        "list_calendars",
         "list_calendar_events",
         "get_calendar_event",
         "get_today_schedule",
@@ -108,6 +110,56 @@ def test_factory_registers_operations_independently_for_granted_scopes():
     assert [tool.name for tool in freebusy_tools] == [
         "check_calendar_availability",
     ]
+
+
+def test_list_calendars_tool_uses_selected_user_and_connection(monkeypatch):
+    service = SimpleNamespace(list_calendars=AsyncMock(return_value={
+        "calendars": [{
+            "id": "work-calendar-id",
+            "summary": "Work",
+            "primary": False,
+            "access_role": "writer",
+            "time_zone": "Asia/Kolkata",
+        }],
+    }))
+    tools, db_factory = build_tools(monkeypatch, service)
+
+    output = invoke(tools["list_calendars"], {})
+
+    assert output == {
+        "ok": True,
+        "data": {
+            "calendars": [{
+                "id": "work-calendar-id",
+                "summary": "Work",
+                "primary": False,
+                "access_role": "writer",
+                "time_zone": "Asia/Kolkata",
+            }],
+        },
+    }
+    service.list_calendars.assert_awaited_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        max_results=100,
+        page_token=None,
+    )
+    assert db_factory.call_count == 1
+
+
+def test_list_calendars_missing_scope_returns_targeted_reauthorization_guidance(
+    monkeypatch,
+):
+    service = SimpleNamespace(
+        list_calendars=AsyncMock(side_effect=PermissionError("scope missing")),
+    )
+    tools, _ = build_tools(monkeypatch, service)
+
+    output = invoke(tools["list_calendars"], {})
+
+    assert output["ok"] is False
+    assert output["error"]["code"] == "calendar_list_permission_missing"
+    assert "Grant Calendar List Access" in output["error"]["message"]
 
 
 def test_list_events_tool_returns_json_safe_structured_result(monkeypatch):
@@ -225,6 +277,21 @@ def test_today_tool_uses_the_captured_request_time(monkeypatch):
             },
         ),
         (
+            "get_calendar_schedule",
+            {
+                "date": "2026-11-05",
+                "period": "month",
+                "time_zone": "Asia/Kolkata",
+            },
+            "get_schedule",
+            {
+                "start_date": date(2026, 11, 5),
+                "period": "month",
+                "time_zone": "Asia/Kolkata",
+                "calendar_id": "primary",
+            },
+        ),
+        (
             "check_calendar_availability",
             {
                 "time_min": "2026-11-05T09:00:00-08:00",
@@ -287,7 +354,7 @@ def test_invalid_tool_arguments_are_rejected_before_service_execution(
     with pytest.raises(ValidationError):
         GetCalendarScheduleInput.model_validate({
             "date": "2026-11-05",
-            "period": "month",
+            "period": "year",
             "time_zone": "UTC",
         })
     with pytest.raises(ValidationError):
@@ -392,7 +459,10 @@ def test_tools_bind_user_and_connection_separately_and_graph_routes_calendar(
     }
     # The second factory's bound identity is verified when invoked against
     # the same service implementation.
-    invoke(tools_two[0], {})
+    invoke(
+        next(tool for tool in tools_two if tool.name == "list_calendar_events"),
+        {},
+    )
 
     assert invocations[0]["user_id"] == USER_ID
     assert invocations[0]["connection_id"] == CONNECTION_ID

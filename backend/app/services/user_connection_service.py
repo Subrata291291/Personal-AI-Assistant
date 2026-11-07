@@ -25,6 +25,7 @@ class UserConnectionService:
     )
     CALENDAR_EVENTS_READ_SCOPE = google_scopes.CALENDAR_EVENTS_READ_SCOPE
     CALENDAR_EVENTS_WRITE_SCOPE = google_scopes.CALENDAR_EVENTS_WRITE_SCOPE
+    CALENDAR_LIST_READ_SCOPES = google_scopes.CALENDAR_LIST_READ_SCOPES
     CALENDAR_FREEBUSY_SCOPE = google_scopes.CALENDAR_FREEBUSY_SCOPE
     CALENDAR_EVENT_READ_SCOPES = google_scopes.CALENDAR_EVENT_READ_SCOPES
     CALENDAR_FREEBUSY_SCOPES = google_scopes.CALENDAR_FREEBUSY_SCOPES
@@ -128,6 +129,9 @@ class UserConnectionService:
             calendar_events_read = bool(
                 granted_scopes & self.CALENDAR_EVENT_READ_SCOPES
             )
+            calendar_list_read = bool(
+                granted_scopes & self.CALENDAR_LIST_READ_SCOPES
+            )
             calendar_freebusy = bool(
                 granted_scopes & self.CALENDAR_FREEBUSY_SCOPES
             )
@@ -156,6 +160,7 @@ class UserConnectionService:
                     ),
                     "calendar": calendar_connected,
                     "calendar_events_read": calendar_events_read,
+                    "calendar_list_read": calendar_list_read,
                     "calendar_freebusy": calendar_freebusy,
                     "calendar_api_available": calendar_api_available,
                     "calendar_api_complete": calendar_api_complete,

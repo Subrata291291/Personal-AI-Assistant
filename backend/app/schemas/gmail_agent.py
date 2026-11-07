@@ -45,6 +45,7 @@ class IntegrationPlan(GmailPlanBase):
         "tasks",
     ]
     calendar_tool: Literal[
+        "list_calendars",
         "list_calendar_events",
         "get_calendar_event",
         "get_today_schedule",

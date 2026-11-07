@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.api import deps
 from app.api.v1.endpoints import calendar as calendar_endpoint
+from app.core.config import Settings
 from app.db.session import get_db
 from app.integrations.google.api_client import GoogleAPIClient
 from app.integrations.google.exceptions import GoogleAPIError
@@ -22,6 +23,7 @@ OTHER_USER_ID = uuid4()
 CONNECTION_ID = uuid4()
 OTHER_CONNECTION_ID = uuid4()
 CALENDAR_SCOPE = CalendarService.CALENDAR_EVENTS_READ_SCOPE
+CALENDAR_LIST_SCOPE = CalendarService.CALENDAR_LIST_READ_SCOPE
 FREEBUSY_SCOPE = CalendarService.CALENDAR_FREEBUSY_SCOPE
 UTC = timezone.utc
 
@@ -38,7 +40,7 @@ def make_service(scopes=None, connection=None):
         scopes=list(
             scopes
             if scopes is not None
-            else [CALENDAR_SCOPE, FREEBUSY_SCOPE]
+            else [CALENDAR_SCOPE, CALENDAR_LIST_SCOPE, FREEBUSY_SCOPE]
         )
     )
     service.connection_repository = SimpleNamespace(
@@ -75,6 +77,12 @@ def test_missing_calendar_connection_is_not_found_and_never_calls_google():
 
     assert calls["connection"] == (USER_ID, CONNECTION_ID)
     assert not google_calls
+
+
+def test_calendar_mutation_flags_default_to_disabled():
+    assert Settings.model_fields["CALENDAR_CREATE_EVENT_ENABLED"].default is False
+    assert Settings.model_fields["CALENDAR_UPDATE_EVENT_ENABLED"].default is False
+    assert Settings.model_fields["CALENDAR_DELETE_EVENT_ENABLED"].default is False
 
 
 def test_calendar_scope_is_required_and_connection_is_user_scoped():
@@ -212,6 +220,103 @@ def test_event_list_uses_primary_calendar_range_search_and_pagination():
     assert [event["id"] for event in result["events"]] == ["event-match"]
     assert result["next_page_token"] == "next-page"
     assert result["time_zone"] == "America/Los_Angeles"
+
+
+def test_calendar_list_uses_owned_read_scope_and_continuation_token():
+    service, calls = make_service()
+    request = {}
+
+    async def fake_google_get(**kwargs):
+        request.update(kwargs)
+        return {
+            "items": [
+                {
+                    "id": "primary@example.com",
+                    "summary": "Primary",
+                    "primary": True,
+                    "accessRole": "owner",
+                    "timeZone": "Asia/Kolkata",
+                },
+                {
+                    "id": "team@example.com",
+                    "summary": "Team calendar",
+                    "primary": False,
+                    "accessRole": "reader",
+                },
+            ],
+            "nextPageToken": "next-calendar-page",
+        }
+
+    service._google_get = fake_google_get
+    result = asyncio.run(
+        service.list_calendars(
+            USER_ID,
+            CONNECTION_ID,
+            max_results=25,
+            page_token="previous-calendar-page",
+        )
+    )
+
+    assert calls["connection"] == (USER_ID, CONNECTION_ID)
+    assert request["endpoint"] == "users/me/calendarList"
+    assert request["params"] == {
+        "maxResults": 25,
+        "pageToken": "previous-calendar-page",
+    }
+    assert result == {
+        "calendars": [
+            {
+                "id": "primary@example.com",
+                "summary": "Primary",
+                "primary": True,
+                "access_role": "owner",
+                "time_zone": "Asia/Kolkata",
+            },
+            {
+                "id": "team@example.com",
+                "summary": "Team calendar",
+                "primary": False,
+                "access_role": "reader",
+                "time_zone": None,
+            },
+        ],
+        "next_page_token": "next-calendar-page",
+    }
+
+
+def test_calendar_list_rejects_unowned_connection_and_missing_scope():
+    service, calls = make_service(scopes=[CALENDAR_SCOPE])
+    google_calls = []
+
+    async def fake_google_get(**kwargs):
+        google_calls.append(kwargs)
+        return {"items": []}
+
+    service._google_get = fake_google_get
+    with pytest.raises(PermissionError, match="permission has not been granted"):
+        asyncio.run(service.list_calendars(USER_ID, CONNECTION_ID))
+    assert calls["connection"] == (USER_ID, CONNECTION_ID)
+    assert not google_calls
+
+    service, calls = make_service()
+    service.connection_repository.get_active_google_connection = (
+        lambda *, user_id, connection_id: None
+    )
+    service._google_get = fake_google_get
+    with pytest.raises(ValueError, match="account was not found"):
+        asyncio.run(service.list_calendars(OTHER_USER_ID, CONNECTION_ID))
+    assert not google_calls
+
+
+def test_calendar_list_rejects_invalid_pagination_metadata():
+    service, _ = make_service()
+
+    async def fake_google_get(**_kwargs):
+        return {"items": [], "nextPageToken": ""}
+
+    service._google_get = fake_google_get
+    with pytest.raises(GoogleAPIError, match="pagination metadata"):
+        asyncio.run(service.list_calendars(USER_ID, CONNECTION_ID))
 
 
 @pytest.mark.parametrize(
@@ -530,6 +635,66 @@ def test_week_schedule_starts_on_monday():
     assert result["date"] == date(2026, 11, 2)
 
 
+@pytest.mark.parametrize(
+    ("schedule_date", "expected_start", "expected_end", "expected_date"),
+    [
+        (
+            date(2026, 11, 5),
+            "2026-10-31T18:30:00Z",
+            "2026-11-30T18:30:00Z",
+            date(2026, 11, 1),
+        ),
+        (
+            date(2024, 2, 29),
+            "2024-01-31T18:30:00Z",
+            "2024-02-29T18:30:00Z",
+            date(2024, 2, 1),
+        ),
+        (
+            date(2026, 12, 31),
+            "2026-11-30T18:30:00Z",
+            "2026-12-31T18:30:00Z",
+            date(2026, 12, 1),
+        ),
+    ],
+)
+def test_month_schedule_uses_local_month_boundaries(
+    schedule_date,
+    expected_start,
+    expected_end,
+    expected_date,
+):
+    service, _ = make_service()
+    request = {}
+
+    async def fake_list_events(**kwargs):
+        request.update(kwargs)
+        return {
+            "calendar_id": "primary",
+            "events": [],
+            "next_page_token": None,
+            "time_zone": kwargs["time_zone"],
+        }
+
+    service.list_events = fake_list_events
+    result = asyncio.run(
+        service.get_schedule(
+            USER_ID,
+            CONNECTION_ID,
+            schedule_date,
+            "month",
+            "Asia/Kolkata",
+            page_token="next-schedule-page",
+        )
+    )
+
+    assert request["time_min"] == aware(expected_start)
+    assert request["time_max"] == aware(expected_end)
+    assert request["page_token"] == "next-schedule-page"
+    assert result["date"] == expected_date
+    assert result["period"] == "month"
+
+
 def test_invalid_or_naive_ranges_and_timezones_are_rejected():
     service, _ = make_service()
 
@@ -808,6 +973,8 @@ def test_calendar_service_only_uses_event_get_and_readonly_freebusy_post():
 
     async def fake_api_request(**kwargs):
         calls.append(kwargs)
+        if kwargs["url"].endswith("/calendarList"):
+            return {"items": []}
         return {"items": []} if kwargs["method"] == "GET" else {"calendars": {}}
 
     class FakeDB:
@@ -818,6 +985,7 @@ def test_calendar_service_only_uses_event_get_and_readonly_freebusy_post():
     service_module_session = calendar_service_module.SessionLocal
     calendar_service_module.SessionLocal = lambda: FakeDB()
     try:
+        asyncio.run(service.list_calendars(USER_ID, CONNECTION_ID))
         asyncio.run(service.list_events(USER_ID, CONNECTION_ID))
         asyncio.run(
             service.query_freebusy(
@@ -836,6 +1004,11 @@ def test_calendar_service_only_uses_event_get_and_readonly_freebusy_post():
         (
             "GET",
             "https://www.googleapis.com/calendar/v3/"
+            "users/me/calendarList",
+        ),
+        (
+            "GET",
+            "https://www.googleapis.com/calendar/v3/"
             "calendars/primary/events",
         ),
         (
@@ -846,16 +1019,32 @@ def test_calendar_service_only_uses_event_get_and_readonly_freebusy_post():
 
 
 def test_calendar_http_contracts_and_no_event_write_routes(monkeypatch):
+    observed_schedule_calls = []
+    observed_event_list_calls = []
+
     class FakeCalendarService:
         def __init__(self, _db):
             pass
 
-        async def list_events(self, **_kwargs):
+        async def list_events(self, **kwargs):
+            observed_event_list_calls.append(kwargs)
             return {
                 "calendar_id": "primary",
                 "events": [],
                 "next_page_token": "next",
                 "time_zone": "UTC",
+            }
+
+        async def list_calendars(self, **kwargs):
+            return {
+                "calendars": [{
+                    "id": "primary",
+                    "summary": "Primary",
+                    "primary": True,
+                    "access_role": "owner",
+                    "time_zone": "Asia/Kolkata",
+                }],
+                "next_page_token": kwargs.get("page_token"),
             }
 
         async def get_event(self, **_kwargs):
@@ -873,16 +1062,23 @@ def test_calendar_http_contracts_and_no_event_write_routes(monkeypatch):
                 "next_page_token": None,
             }
 
-        async def get_schedule(self, **_kwargs):
+        async def get_schedule(self, **kwargs):
+            observed_schedule_calls.append(kwargs)
+            period = kwargs["period"]
+            schedule_date = kwargs["start_date"]
+            if period == "week":
+                schedule_date = date(2026, 11, 2)
+            elif period == "month":
+                schedule_date = date(2026, 11, 1)
             return {
                 "calendar_id": "primary",
-                "date": date(2026, 11, 2),
-                "period": "week",
-                "time_zone": "UTC",
+                "date": schedule_date,
+                "period": period,
+                "time_zone": kwargs["time_zone"],
                 "events": [],
                 "conflicts": [],
                 "conflicts_complete": True,
-                "next_page_token": None,
+                "next_page_token": kwargs.get("page_token"),
             }
 
         async def query_freebusy(self, **kwargs):
@@ -900,9 +1096,21 @@ def test_calendar_http_contracts_and_no_event_write_routes(monkeypatch):
     app.dependency_overrides[get_db] = lambda: None
     try:
         with TestClient(app) as client:
+            calendars = client.get(
+                "/api/v1/calendar/calendars",
+                params={
+                    "connection_id": str(CONNECTION_ID),
+                    "page_token": "calendar-page-token",
+                },
+            )
             events = client.get(
                 "/api/v1/calendar/events",
-                params={"connection_id": str(CONNECTION_ID)},
+                params={
+                    "connection_id": str(CONNECTION_ID),
+                    "calendar_id": "team@example.com",
+                    "time_zone": "Asia/Kolkata",
+                    "page_token": "event-page-token",
+                },
             )
             detail = client.get(
                 "/api/v1/calendar/events/event-1",
@@ -915,15 +1123,19 @@ def test_calendar_http_contracts_and_no_event_write_routes(monkeypatch):
                     "time_zone": "UTC",
                 },
             )
-            schedule = client.get(
-                "/api/v1/calendar/schedule",
-                params={
-                    "connection_id": str(CONNECTION_ID),
-                    "date": "2026-11-05",
-                    "period": "week",
-                    "time_zone": "UTC",
-                },
-            )
+            schedules = [
+                client.get(
+                    "/api/v1/calendar/schedule",
+                    params={
+                        "connection_id": str(CONNECTION_ID),
+                        "date": "2026-11-05",
+                        "period": period,
+                        "time_zone": "Asia/Kolkata",
+                        "page_token": f"{period}-page",
+                    },
+                )
+                for period in ("day", "week", "month")
+            ]
             freebusy = client.post(
                 "/api/v1/calendar/freebusy",
                 json={
@@ -937,15 +1149,39 @@ def test_calendar_http_contracts_and_no_event_write_routes(monkeypatch):
                 "/api/v1/calendar/events",
                 json={"connection_id": str(CONNECTION_ID)},
             )
+            calendar_list_write_attempt = client.post(
+                "/api/v1/calendar/calendars",
+                json={"connection_id": str(CONNECTION_ID)},
+            )
 
+        assert calendars.status_code == 200
+        assert calendars.json()["calendars"][0]["id"] == "primary"
+        assert calendars.json()["next_page_token"] == "calendar-page-token"
+        assert calendars.headers["cache-control"] == "private, no-store"
         assert events.status_code == 200
         assert events.json()["next_page_token"] == "next"
         assert events.headers["cache-control"] == "private, no-store"
+        assert observed_event_list_calls[0]["page_token"] == "event-page-token"
+        assert observed_event_list_calls[0]["calendar_id"] == "team@example.com"
+        assert observed_event_list_calls[0]["time_zone"] == "Asia/Kolkata"
         assert detail.status_code == 200
         assert today.status_code == 200
-        assert schedule.status_code == 200
+        assert [schedule.status_code for schedule in schedules] == [200, 200, 200]
+        assert [call["period"] for call in observed_schedule_calls] == [
+            "day",
+            "week",
+            "month",
+        ]
+        assert observed_schedule_calls[-1]["start_date"] == date(2026, 11, 5)
+        assert [call["page_token"] for call in observed_schedule_calls] == [
+            "day-page",
+            "week-page",
+            "month-page",
+        ]
+        assert schedules[-1].json()["next_page_token"] == "month-page"
         assert freebusy.status_code == 200
         assert write_attempt.status_code == 405
+        assert calendar_list_write_attempt.status_code == 405
     finally:
         app.dependency_overrides.clear()
 

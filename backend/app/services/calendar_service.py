@@ -24,12 +24,15 @@ class CalendarService:
 
     CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
     CALENDAR_EVENTS_READ_SCOPE = google_scopes.CALENDAR_EVENTS_READ_SCOPE
+    CALENDAR_LIST_READ_SCOPE = google_scopes.CALENDAR_LIST_READ_SCOPE
     CALENDAR_FREEBUSY_SCOPE = google_scopes.CALENDAR_FREEBUSY_SCOPE
     EVENT_READ_SCOPES = google_scopes.CALENDAR_EVENT_READ_SCOPES
+    CALENDAR_LIST_READ_SCOPES = google_scopes.CALENDAR_LIST_READ_SCOPES
     FREEBUSY_READ_SCOPES = google_scopes.CALENDAR_FREEBUSY_SCOPES
 
     MAX_LIST_RESULTS = 2500
     MAX_PAGE_TOKEN_LENGTH = 4096
+    MAX_CALENDARS_PER_PAGE = 250
     _RESOURCE_ID = re.compile(r"[A-Za-z0-9._@+-]{1,1024}\Z")
     _EMAIL = re.compile(r"[^@\s]{1,254}@[^@\s]{1,254}\Z")
 
@@ -455,6 +458,115 @@ class CalendarService:
         )
         return self._normalize_event(result)
 
+    async def list_calendars(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        max_results: int = 100,
+        page_token: str | None = None,
+    ) -> dict[str, Any]:
+        self._validate_connection(
+            user_id,
+            connection_id,
+            self.CALENDAR_LIST_READ_SCOPES,
+        )
+        if not 1 <= max_results <= self.MAX_CALENDARS_PER_PAGE:
+            raise ValueError(
+                "max_results must be between 1 and "
+                f"{self.MAX_CALENDARS_PER_PAGE}."
+            )
+        if page_token is not None and (
+            not page_token
+            or len(page_token) > self.MAX_PAGE_TOKEN_LENGTH
+            or any(ord(char) < 32 for char in page_token)
+        ):
+            raise ValueError("Invalid page_token.")
+
+        params: dict[str, Any] = {"maxResults": max_results}
+        if page_token:
+            params["pageToken"] = page_token
+        result = await self._google_get(
+            user_id=user_id,
+            connection_id=connection_id,
+            endpoint="users/me/calendarList",
+            params=params,
+        )
+        if not isinstance(result, dict):
+            raise GoogleAPIError(
+                status_code=502,
+                message="Google Calendar returned an invalid calendar list.",
+            )
+        items = result.get("items", [])
+        if (
+            not isinstance(items, list)
+            or any(not isinstance(item, dict) for item in items)
+        ):
+            raise GoogleAPIError(
+                status_code=502,
+                message="Google Calendar returned an invalid calendar list.",
+            )
+        next_page_token = result.get("nextPageToken")
+        if "nextPageToken" in result and (
+            not isinstance(next_page_token, str)
+            or not next_page_token
+            or len(next_page_token) > self.MAX_PAGE_TOKEN_LENGTH
+            or any(ord(char) < 32 for char in next_page_token)
+        ):
+            raise GoogleAPIError(
+                status_code=502,
+                message="Google Calendar returned invalid pagination metadata.",
+            )
+
+        calendars = []
+        for item in items:
+            calendar_id = item.get("id")
+            summary = item.get("summary")
+            if (
+                not isinstance(calendar_id, str)
+                or not calendar_id.strip()
+                or not isinstance(summary, str)
+                or not summary.strip()
+            ):
+                raise GoogleAPIError(
+                    status_code=502,
+                    message="Google Calendar returned an invalid calendar.",
+                )
+            self._validate_resource_id(calendar_id, "calendar_id")
+            primary = item.get("primary")
+            access_role = item.get("accessRole")
+            time_zone = item.get("timeZone")
+            if (
+                primary is not None
+                and not isinstance(primary, bool)
+                or access_role is not None
+                and not isinstance(access_role, str)
+                or time_zone is not None
+                and not isinstance(time_zone, str)
+            ):
+                raise GoogleAPIError(
+                    status_code=502,
+                    message="Google Calendar returned invalid calendar metadata.",
+                )
+            if time_zone is not None:
+                try:
+                    self._validate_time_zone(time_zone)
+                except ValueError as exc:
+                    raise GoogleAPIError(
+                        status_code=502,
+                        message="Google Calendar returned an invalid calendar timezone.",
+                    ) from exc
+            calendars.append({
+                "id": calendar_id,
+                "summary": summary,
+                "primary": primary,
+                "access_role": access_role,
+                "time_zone": time_zone,
+            })
+        return {
+            "calendars": calendars,
+            "next_page_token": next_page_token,
+        }
+
     async def validate_create_event_access(
         self,
         user_id: UUID,
@@ -517,18 +629,26 @@ class CalendarService:
         period: str,
         time_zone: str,
         calendar_id: str = "primary",
+        page_token: str | None = None,
     ) -> dict[str, Any]:
         zone = self._validate_time_zone(time_zone)
-        if period not in {"day", "week"}:
-            raise ValueError("period must be 'day' or 'week'.")
+        if period not in {"day", "week", "month"}:
+            raise ValueError("period must be 'day', 'week', or 'month'.")
         if period == "week":
             start_date = start_date - timedelta(days=start_date.weekday())
             day_count = 7
+            end_date = start_date + timedelta(days=day_count)
+        elif period == "month":
+            start_date = start_date.replace(day=1)
+            end_date = (
+                start_date.replace(day=28) + timedelta(days=4)
+            ).replace(day=1)
         else:
             day_count = 1
+            end_date = start_date + timedelta(days=day_count)
         local_start = datetime.combine(start_date, time.min, tzinfo=zone)
         local_end = datetime.combine(
-            start_date + timedelta(days=day_count),
+            end_date,
             time.min,
             tzinfo=zone,
         )
@@ -540,6 +660,7 @@ class CalendarService:
             time_min=local_start,
             time_max=local_end,
             time_zone=time_zone,
+            page_token=page_token,
         )
         events = events_result["events"]
         return {

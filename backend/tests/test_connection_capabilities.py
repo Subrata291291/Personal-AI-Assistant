@@ -47,6 +47,7 @@ def test_list_connections_reports_service_capabilities_from_granted_scopes():
         "gmail_send": False,
         "calendar": False,
         "calendar_events_read": False,
+        "calendar_list_read": False,
         "calendar_freebusy": False,
         "calendar_api_available": False,
         "calendar_api_complete": False,
@@ -67,6 +68,7 @@ def test_list_connections_reports_service_capabilities_from_granted_scopes():
         "gmail_send": False,
         "calendar": True,
         "calendar_events_read": True,
+        "calendar_list_read": False,
         "calendar_freebusy": False,
         "calendar_api_available": True,
         "calendar_api_complete": False,
@@ -113,6 +115,7 @@ def test_list_connections_does_not_report_non_google_as_gmail():
         "gmail_send": False,
         "calendar": False,
         "calendar_events_read": False,
+        "calendar_list_read": False,
         "calendar_freebusy": False,
         "calendar_api_available": False,
         "calendar_api_complete": False,
@@ -149,6 +152,7 @@ def test_list_connections_reports_both_services_only_when_both_scopes_are_grante
             UserConnectionService.GMAIL_DRAFT_SCOPE,
             UserConnectionService.GMAIL_SEND_SCOPE,
             UserConnectionService.CALENDAR_EVENTS_READ_SCOPE,
+            *UserConnectionService.CALENDAR_LIST_READ_SCOPES,
             UserConnectionService.CALENDAR_FREEBUSY_SCOPE,
         ],
     )
@@ -165,6 +169,7 @@ def test_list_connections_reports_both_services_only_when_both_scopes_are_grante
         "gmail_send": True,
         "calendar": True,
         "calendar_events_read": True,
+        "calendar_list_read": True,
         "calendar_freebusy": True,
         "calendar_api_available": True,
         "calendar_api_complete": True,
@@ -210,6 +215,7 @@ def test_legacy_calendar_events_grant_is_partial_and_requests_new_consent():
 
     assert reported["calendar"] is True
     assert reported["calendar_events_read"] is True
+    assert reported["calendar_list_read"] is False
     assert reported["calendar_freebusy"] is False
     assert reported["calendar_api_available"] is True
     assert reported["calendar_api_complete"] is False

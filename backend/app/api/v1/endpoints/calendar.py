@@ -9,6 +9,7 @@ from app.api.deps import CurrentUser, require_integration_enabled
 from app.db.session import get_db
 from app.integrations.google.exceptions import GoogleAPIError
 from app.schemas.calendar import (
+    CalendarListResponse,
     CalendarEvent,
     CalendarEventListResponse,
     CalendarScheduleResponse,
@@ -73,6 +74,33 @@ def _handle_calendar_error(exc: Exception) -> None:
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="Unable to process Calendar request.",
     ) from exc
+
+
+@router.get(
+    "/calendars",
+    response_model=CalendarListResponse,
+)
+async def list_calendars(
+    response: Response,
+    current_user: CurrentUser,
+    connection_id: UUID,
+    max_results: int = Query(default=100, ge=1, le=250),
+    page_token: str | None = Query(default=None, max_length=4096),
+    db: Session = Depends(get_db),
+):
+    """List calendars available to an owned Google connection."""
+    response.headers["Cache-Control"] = "private, no-store"
+    try:
+        return await CalendarService(db).list_calendars(
+            user_id=_get_user_id(current_user),
+            connection_id=connection_id,
+            max_results=max_results,
+            page_token=page_token,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _handle_calendar_error(exc)
 
 
 @router.get(
@@ -174,12 +202,13 @@ async def get_calendar_schedule(
     current_user: CurrentUser,
     connection_id: UUID,
     schedule_date: date = Query(alias="date"),
-    period: str = Query(default="day", pattern="^(day|week)$"),
+    period: str = Query(default="day", pattern="^(day|week|month)$"),
     time_zone: str = Query(..., max_length=100),
     calendar_id: str = Query(default="primary", max_length=1024),
+    page_token: str | None = Query(default=None, max_length=4096),
     db: Session = Depends(get_db),
 ):
-    """Retrieve a daily or Monday-based weekly schedule."""
+    """Retrieve a daily, Monday-based weekly, or monthly schedule."""
     response.headers["Cache-Control"] = "private, no-store"
     try:
         return await CalendarService(db).get_schedule(
@@ -189,6 +218,7 @@ async def get_calendar_schedule(
             period=period,
             time_zone=time_zone,
             calendar_id=calendar_id,
+            page_token=page_token,
         )
     except HTTPException:
         raise

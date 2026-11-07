@@ -94,6 +94,35 @@ export function requireCalendarEventListResponse(value) {
   return value
 }
 
+export function requireCalendarListResponse(value) {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    !Array.isArray(value.calendars) ||
+    !value.calendars.every((calendar) =>
+      calendar &&
+      typeof calendar === 'object' &&
+      !Array.isArray(calendar) &&
+      typeof calendar.id === 'string' &&
+      calendar.id.trim() &&
+      typeof calendar.summary === 'string' &&
+      calendar.summary.trim() &&
+      (calendar.primary === null || typeof calendar.primary === 'boolean') &&
+      (calendar.access_role === null || typeof calendar.access_role === 'string') &&
+      (calendar.time_zone === null || typeof calendar.time_zone === 'string')
+    ) ||
+    !(
+      value.next_page_token === null ||
+      typeof value.next_page_token === 'string'
+    )
+  ) {
+    throw new Error('Google Calendar returned an invalid calendar list response.')
+  }
+
+  return value
+}
+
 export function requireCalendarScheduleResponse(value) {
   if (
     !value ||
@@ -101,7 +130,7 @@ export function requireCalendarScheduleResponse(value) {
     Array.isArray(value) ||
     typeof value.calendar_id !== 'string' ||
     typeof value.date !== 'string' ||
-    !['day', 'week'].includes(value.period) ||
+    !['day', 'week', 'month'].includes(value.period) ||
     typeof value.time_zone !== 'string' ||
     !Array.isArray(value.events) ||
     !value.events.every(isCalendarEvent) ||

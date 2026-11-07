@@ -12,7 +12,10 @@ from app.schemas.calendar_approval import (
     CalendarDeleteEventParameters,
     CalendarUpdateEventParameters,
 )
-from app.integrations.google.exceptions import GoogleAPIError
+from app.integrations.google.exceptions import (
+    GoogleAPIError,
+    GoogleAPIMutationError,
+)
 from app.integrations.connectors.permissions.approval_policy import (
     ApprovalPolicy,
 )
@@ -238,6 +241,24 @@ def test_approved_update_uses_conditional_patch_and_confirms_readback(
     assert request["json_data"] == {"summary": "Updated design review"}
 
 
+def test_update_readback_verifies_unchanged_snapshot_fields():
+    updated = _normalized_event("Updated design review")
+    changes = {"summary": "Updated design review"}
+
+    assert CalendarActionExecutor._event_matches_update(
+        updated,
+        changes,
+        CURRENT_EVENT,
+    )
+
+    updated["location"] = "Unexpected change"
+    assert not CalendarActionExecutor._event_matches_update(
+        updated,
+        changes,
+        CURRENT_EVENT,
+    )
+
+
 def test_approved_delete_uses_conditional_delete_and_confirms_absence(
     monkeypatch,
 ):
@@ -263,6 +284,91 @@ def test_approved_delete_uses_conditional_delete_and_confirms_absence(
     assert request["method"] == "DELETE"
     assert request["headers"] == {"If-Match": '"etag-1"'}
     assert request["json_data"] is None
+
+
+def test_uncertain_delete_reconciles_verified_absence_as_completed(
+    monkeypatch,
+):
+    parameters = CalendarDeleteEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "event-123",
+        "expected_etag": '"etag-1"',
+        "current_event": CURRENT_EVENT,
+    }).model_dump(mode="json")
+    executor, approval, _api, proposal, completed = _executor(
+        monkeypatch,
+        "calendar.delete_event",
+        parameters,
+        None,
+    )
+    proposal.status = "execution_uncertain"
+    executor._finish = Mock(return_value=completed)
+
+    result = asyncio.run(
+        executor._reconcile_update_or_delete(
+            user_id=USER_ID,
+            proposal=proposal,
+        )
+    )
+
+    assert result is completed
+    executor._finish.assert_called_once_with(
+        user_id=USER_ID,
+        proposal_id=PROPOSAL_ID,
+        expected_state="execution_uncertain",
+        state="completed",
+        classification="confirmed",
+        reconciliation="confirmed",
+        result={
+            "outcome": "deleted",
+            "google_event_id": "event-123",
+        },
+    )
+    update_reconciliation = (
+        approval.calendar_operation_repository.update_uncertain_reconciliation
+    )
+    update_reconciliation.assert_not_called()
+
+
+def test_delete_404_is_idempotently_confirmed_after_absence_check(monkeypatch):
+    parameters = CalendarDeleteEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "event-123",
+        "expected_etag": '"etag-1"',
+        "current_event": CURRENT_EVENT,
+    }).model_dump(mode="json")
+    executor, _approval, api, _proposal, completed = _executor(
+        monkeypatch,
+        "calendar.delete_event",
+        parameters,
+        None,
+    )
+    api.request_mutation.side_effect = GoogleAPIMutationError(
+        status_code=404,
+        message="The event is already absent.",
+        outcome_unknown=False,
+        reason="provider_rejected",
+    )
+    executor._finish = Mock(return_value=completed)
+
+    result = asyncio.run(
+        executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+    )
+
+    assert result is completed
+    executor._read_event_for_reconciliation.assert_awaited_once()
+    executor._finish.assert_called_once_with(
+        user_id=USER_ID,
+        proposal_id=PROPOSAL_ID,
+        expected_state="executing",
+        state="completed",
+        classification="confirmed",
+        reconciliation="confirmed",
+        result={
+            "outcome": "deleted",
+            "google_event_id": "event-123",
+        },
+    )
 
 
 def test_approved_calendar_create_confirms_google_readback_for_saved_payload(

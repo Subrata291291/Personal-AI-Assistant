@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useOutletContext } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { useAuth } from '../context/AuthContext'
 import { api } from '../lib/api.js'
 import {
@@ -733,6 +733,9 @@ export default function Calendar() {
   const [connectionId, setConnectionId] = useState(
     () => getCalendarState(userId, 'connection', ''),
   )
+  const [calendarId, setCalendarId] = useState(
+    () => getCalendarState(userId, 'calendar-id', 'primary'),
+  )
   const [eventId, setEventId] = useState('')
   const [searchOpen, setSearchOpen] = useState(
     () => Boolean(getCalendarState(userId, 'search-query', '')),
@@ -806,6 +809,44 @@ export default function Calendar() {
   const selectedConnection = calendarConnections.find(
     (connection) => connection.id === selectedConnectionId,
   )
+  const connectionsVerified =
+    Boolean(connectionsQuery.data) &&
+    ![401, 403].includes(connectionsQuery.error?.status)
+  const calendarListQuery = useInfiniteQuery({
+    queryKey: ['calendar-list', userId, selectedConnectionId],
+    enabled: Boolean(
+      selectedConnectionId &&
+      selectedConnection?.capabilities?.calendar_list_read === true &&
+      connectionsVerified &&
+      enabled
+    ),
+    initialPageParam: undefined,
+    queryFn: ({ pageParam }) => calendarService.listCalendars({
+      connectionId: selectedConnectionId,
+      pageToken: pageParam,
+    }),
+    getNextPageParam: (lastPage) =>
+      lastPage.next_page_token || undefined,
+    staleTime: PRIVATE_DATA_STALE_TIME,
+    gcTime: PRIVATE_DATA_GC_TIME,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
+    retry: false,
+  })
+  const calendars = useMemo(() => {
+    const seen = new Set()
+    return (calendarListQuery.data?.pages || [])
+      .flatMap((page) => page.calendars || [])
+      .filter((calendar) => {
+        if (seen.has(calendar.id)) return false
+        seen.add(calendar.id)
+        return true
+      })
+  }, [calendarListQuery.data])
+  const selectedCalendarId = calendars.length &&
+    !calendars.some((calendar) => calendar.id === calendarId)
+    ? calendars.find((calendar) => calendar.primary)?.id || calendars[0].id
+    : calendarId
   useEffect(() => {
     if (!userId) return
     sessionStorage.setItem(CALENDAR_STATE_KEY(userId, 'date'), selectedDate)
@@ -838,17 +879,22 @@ export default function Calendar() {
       sessionStorage.removeItem(key)
     }
   }, [userId, connectionsQuery.data, selectedConnectionId])
-  const connectionsVerified =
-    Boolean(connectionsQuery.data) &&
-    ![401, 403].includes(connectionsQuery.error?.status)
+  useEffect(() => {
+    if (!userId) return
+    sessionStorage.setItem(
+      CALENDAR_STATE_KEY(userId, 'calendar-id'),
+      selectedCalendarId,
+    )
+  }, [userId, selectedCalendarId])
   const range = useMemo(() => getViewRange(selectedDate, view), [selectedDate, view])
-  const eventsQuery = useQuery({
+  const eventsQuery = useInfiniteQuery({
     queryKey: [
       'calendar-events',
       userId,
       selectedConnectionId,
       timeZone,
       view,
+      selectedCalendarId,
       range.start,
       range.end,
       searchQuery,
@@ -866,19 +912,25 @@ export default function Calendar() {
     refetchOnMount: true,
     refetchOnWindowFocus: true,
     retry: false,
-    queryFn: () => calendarService.listEvents({
+    initialPageParam: undefined,
+    queryFn: ({ pageParam }) => calendarService.listEvents({
       connectionId: selectedConnectionId,
       timeMin: startOfLocalDateToIso(range.start, timeZone),
       timeMax: startOfLocalDateToIso(range.end, timeZone),
       query: searchQuery || undefined,
       timeZone,
+      calendarId: selectedCalendarId,
+      pageToken: pageParam,
     }),
+    getNextPageParam: (lastPage) =>
+      lastPage.next_page_token || undefined,
   })
   const eventQuery = useQuery({
     queryKey: ['calendar-event', userId, selectedConnectionId, eventId],
     queryFn: () => calendarService.getEvent({
       connectionId: selectedConnectionId,
       eventId,
+      calendarId: selectedCalendarId,
     }),
     enabled: Boolean(
       selectedConnectionId &&
@@ -892,7 +944,16 @@ export default function Calendar() {
     retry: false,
   })
   const eventDescription = formatEventDescription(eventQuery.data?.description)
-  const allEvents = eventsQuery.data?.events || []
+  const allEvents = useMemo(() => {
+    const seen = new Set()
+    return (eventsQuery.data?.pages || [])
+      .flatMap((page) => page.events || [])
+      .filter((event) => {
+        if (seen.has(event.id)) return false
+        seen.add(event.id)
+        return true
+      })
+  }, [eventsQuery.data])
   const events = allEvents.filter((event) => (
     typeof event.start?.date === 'string'
       ? showAllDayEvents
@@ -1216,6 +1277,78 @@ export default function Calendar() {
                 <p className={`mt-1 truncate ${text}`}>
                   {selectedConnection.email || 'Selected Google account'}
                 </p>
+                {selectedConnection.capabilities?.calendar_list_read === true && (
+                  <>
+                    {calendarListQuery.isError && (
+                      <div className="mt-2">
+                        <p role="alert" className="text-xs text-rose-400">
+                          Calendar list is unavailable. {calendarListQuery.error.message}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => calendarListQuery.refetch()}
+                          className={`mt-1 text-xs font-semibold underline ${
+                            isDark ? 'text-violet-300' : 'text-[#245C4B]'
+                          }`}
+                        >
+                          Retry calendar list
+                        </button>
+                      </div>
+                    )}
+                    {calendarListQuery.isPending && (
+                      <p role="status" className={`mt-2 text-xs ${text}`}>
+                        Loading calendars…
+                      </p>
+                    )}
+                    {calendars.length > 0 && (
+                      <label className={`mt-3 block text-xs ${text}`}>
+                        <span className="mb-1.5 block font-medium">Calendar</span>
+                        <select
+                          aria-label="Google Calendar"
+                          value={selectedCalendarId}
+                          onChange={(event) => {
+                            setCalendarId(event.target.value)
+                            setEventId('')
+                          }}
+                          className={`w-full rounded-lg border px-3 py-2 ${input}`}
+                        >
+                          {calendars.map((calendar) => (
+                            <option key={calendar.id} value={calendar.id}>
+                              {calendar.summary}{calendar.primary ? ' (primary)' : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    {calendarListQuery.hasNextPage && (
+                      <button
+                        type="button"
+                        onClick={() => calendarListQuery.fetchNextPage()}
+                        disabled={calendarListQuery.isFetchingNextPage}
+                        className={`mt-2 text-xs font-semibold underline disabled:opacity-50 ${
+                          isDark ? 'text-violet-300' : 'text-[#245C4B]'
+                        }`}
+                      >
+                        {calendarListQuery.isFetchingNextPage
+                          ? 'Loading calendars…'
+                          : 'Load more calendars'}
+                      </button>
+                    )}
+                    {calendarListQuery.isFetchNextPageError && (
+                      <p role="alert" className="mt-2 text-xs text-rose-400">
+                        More calendars could not be loaded.
+                      </p>
+                    )}
+                  </>
+                )}
+                {selectedConnection.capabilities?.calendar_events_read === true &&
+                  selectedConnection.capabilities?.calendar_list_read !== true && (
+                  <p role="status" className={`mt-2 text-xs ${text}`}>
+                    Calendar list access is not granted. Use “Grant Calendar
+                    List Access” for this account in Connected Apps to choose
+                    among calendars.
+                  </p>
+                )}
                 {selectedConnection.capabilities?.calendar_freebusy === true && (
                   <button
                     type="button"
@@ -1359,13 +1492,13 @@ export default function Calendar() {
                     </p>
                   )}
                   {selectedConnection.capabilities?.calendar_events_read === true &&
-                    eventsQuery.isError && (
+                    eventsQuery.isError && !eventsQuery.data && (
                     <p role="alert" className="rounded-xl border border-red-500/30 p-4 text-sm text-red-400">
                       Live Calendar data could not be retrieved. {eventsQuery.error.message}
                     </p>
                   )}
                   {selectedConnection.capabilities?.calendar_events_read === true &&
-                    eventsQuery.isSuccess && !eventId && events.length === 0 && (
+                    eventsQuery.data && !eventId && events.length === 0 && (
                     <p role="status" className={`py-10 text-center text-sm ${text}`}>
                       {allEvents.length === 0
                         ? `Google Calendar returned no events for this ${view}.`
@@ -1373,7 +1506,7 @@ export default function Calendar() {
                     </p>
                   )}
                   {selectedConnection.capabilities?.calendar_events_read === true &&
-                    eventsQuery.isSuccess && !eventId && (
+                    eventsQuery.data && !eventId && (
                     view === 'month'
                       ? (
                         <div className="overflow-x-auto">
@@ -1482,6 +1615,41 @@ export default function Calendar() {
                           userAvatar={userAvatar}
                         />
                       )
+                  )}
+                  {eventsQuery.data && !eventId && (
+                    <div className="mt-4 flex flex-col items-center gap-2">
+                      {eventsQuery.isFetchNextPageError && (
+                        <p role="alert" className="text-sm text-rose-400">
+                          More events could not be loaded.
+                        </p>
+                      )}
+                      {(eventsQuery.hasNextPage ||
+                        eventsQuery.isFetchNextPageError) && (
+                        <button
+                          type="button"
+                          onClick={() => eventsQuery.fetchNextPage()}
+                          disabled={eventsQuery.isFetchingNextPage}
+                          className={`rounded-lg border px-4 py-2 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                            isDark
+                              ? 'border-[#34384b] text-slate-300 hover:bg-white/5'
+                              : 'border-[#C9E2D6] bg-white text-[#245C4B] hover:bg-[#EFF7F2]'
+                          }`}
+                        >
+                          {eventsQuery.isFetchingNextPage
+                            ? 'Loading more events…'
+                            : eventsQuery.isFetchNextPageError
+                              ? 'Retry loading more events'
+                              : 'Load more events'}
+                        </button>
+                      )}
+                      {!eventsQuery.hasNextPage &&
+                        !eventsQuery.isFetchNextPageError &&
+                        allEvents.length > 0 && (
+                        <p className={`text-xs ${text}`}>
+                          All matching events are loaded.
+                        </p>
+                      )}
+                    </div>
                   )}
                   {eventId &&
                     selectedConnection.capabilities?.calendar_events_read === true && (

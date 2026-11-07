@@ -1,5 +1,6 @@
 import { api } from '../lib/api.js'
 import {
+  requireCalendarListResponse,
   requireCalendarEventListResponse,
   requireCalendarScheduleResponse,
   requireFreeBusyResponse,
@@ -14,6 +15,18 @@ function requireConnectionId(connectionId) {
 }
 
 export const calendarService = {
+  async listCalendars({ connectionId, maxResults = 100, pageToken }) {
+    requireConnectionId(connectionId)
+    const params = new URLSearchParams({
+      connection_id: connectionId,
+      max_results: String(maxResults),
+    })
+    if (pageToken) params.set('page_token', pageToken)
+    return requireCalendarListResponse(
+      await api.get(`${BASE_PATH}/calendars?${params}`),
+    )
+  },
+
   async getToday({ connectionId, timeZone, calendarId = 'primary' }) {
     requireConnectionId(connectionId)
     const params = new URLSearchParams({
@@ -32,6 +45,7 @@ export const calendarService = {
     period = 'day',
     timeZone,
     calendarId = 'primary',
+    pageToken,
   }) {
     requireConnectionId(connectionId)
     const params = new URLSearchParams({
@@ -41,6 +55,7 @@ export const calendarService = {
       time_zone: timeZone,
       calendar_id: calendarId,
     })
+    if (pageToken) params.set('page_token', pageToken)
     return requireCalendarScheduleResponse(
       await api.get(`${BASE_PATH}/schedule?${params}`),
     )
@@ -53,6 +68,7 @@ export const calendarService = {
     query,
     timeZone,
     calendarId = 'primary',
+    pageToken,
   }) {
     requireConnectionId(connectionId)
     const params = new URLSearchParams({
@@ -64,6 +80,7 @@ export const calendarService = {
     if (timeMax) params.set('time_max', timeMax)
     if (query?.trim()) params.set('query', query.trim())
     if (timeZone) params.set('time_zone', timeZone)
+    if (pageToken) params.set('page_token', pageToken)
     return requireCalendarEventListResponse(
       await api.get(`${BASE_PATH}/events?${params}`),
     )

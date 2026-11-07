@@ -2,11 +2,40 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
 
+import pytest
 from sqlalchemy.dialects import postgresql
 
 from app.db.models.user_settings import UserSettings
 from app.memory.memory_pipeline import MemoryPipeline
 from app.repositories.user_settings_repository import UserSettingsRepository
+from app.memory.memory_decision import MemoryDecision
+
+
+@pytest.mark.parametrize(
+    ("memory_type", "action"),
+    (
+        ("long_term", "CREATE"),
+        ("semantic", "CREATE"),
+        ("episodic", "UPDATE"),
+        ("procedural", "IGNORE"),
+    ),
+)
+def test_memory_decision_schema_accepts_supported_actions_and_types(
+    memory_type,
+    action,
+):
+    decision = MemoryDecision(
+        action=action,
+        memory_type=memory_type,
+        target_memory_id=None,
+        proposed_content="User is learning LangGraph.",
+        confidence=0.95,
+        importance=7,
+        reason="Meaningful new information.",
+    )
+
+    assert decision.action == action
+    assert decision.memory_type == memory_type
 
 
 def test_new_settings_rows_enable_automatic_memory_without_overwriting_existing_choice():

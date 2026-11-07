@@ -40,6 +40,12 @@ class ChatState(TypedDict):
 
     request_time: NotRequired[str]
 
+    memory_update_result: NotRequired[dict[str, Any]]
+    memory_decision_result: NotRequired[dict[str, Any]]
+    memory_decision_executed: NotRequired[bool]
+    memory_enabled: NotRequired[bool]
+    memory_execution_trace: NotRequired[dict[str, Any]]
+
     assistant_capabilities: NotRequired[dict[str, Any]]
 
     pending_calendar_create_proposal: NotRequired[dict[str, Any]]
