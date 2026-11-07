@@ -238,7 +238,7 @@ def _plan_prompt(state: ChatState) -> str:
         "end date and set time_zone to null. Ask clarification when details "
         "or timezone are ambiguous. Never mix Calendar writes with Gmail. "
         "For Calendar requests, select calendar_tool from "
-        "list_calendar_events, get_calendar_event, "
+        "list_calendars, list_calendar_events, get_calendar_event, "
         "get_today_schedule, get_calendar_schedule, "
         "check_calendar_availability, create_calendar_event_proposal, "
         "update_calendar_event_proposal, delete_calendar_event_proposal, "
@@ -268,8 +268,12 @@ def _plan_prompt(state: ChatState) -> str:
         "page_token; attendee must be an explicitly known email address. "
         "get_calendar_event accepts event_id and calendar_id. "
         "get_today_schedule accepts time_zone and calendar_id. "
-        "get_calendar_schedule accepts date, period (day or week), time_zone, "
-        "and calendar_id. check_calendar_availability accepts aware time_min "
+        "get_calendar_schedule accepts date, period (day, week, or month), time_zone, "
+        "and calendar_id. list_calendars returns accessible calendar summaries "
+        "and IDs. For a named calendar, use its actual summary to resolve the "
+        "calendar ID; do not silently substitute primary. If several calendars "
+        "match, ask the user to clarify. Use primary when no calendar name is "
+        "requested. check_calendar_availability accepts aware time_min "
         "and time_max, time_zone, and calendar_ids. Never include a user ID, "
         "connection ID, credentials, or extra fields. Use an explicit IANA timezone from "
         "the runtime. Use check_calendar_availability only for explicit time "
@@ -653,7 +657,8 @@ def _calendar_pending_time_revision(
 
 def _calendar_create_title(text: str) -> str | None:
     title = re.sub(
-        r"^\s*(?:please\s+)?(?:add|create|book|schedule)\b",
+        r"^\s*(?:please\s+)?(?:set|put|add|create|book|schedule)\b"
+        r"(?:\s+(?:in|on|to)\s+(?:my\s+|the\s+)?(?:google\s+)?calendar\b)?",
         "",
         text,
         flags=re.IGNORECASE,
@@ -674,6 +679,20 @@ def _calendar_create_title(text: str) -> str | None:
         flags=re.IGNORECASE,
     )
     title = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", "", title)
+    title = re.sub(
+        r"^\s*,?\s*(?:i\s+(?:will|am|would)|we\s+(?:will|are|would)|"
+        r"i(?:'|’)?m)\b",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"^\s*(?:will\s+|am\s+going\s+to\s+|going\s+to\s+|"
+        r"go\s+to\s+|going\s+|be\s+going\s+to\s+)",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
     title = re.sub(
         r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?\b",
         "",
@@ -720,10 +739,10 @@ def _calendar_clock_matches(text: str) -> list[datetime_time] | None:
 def _calendar_create_request(text: str) -> bool:
     lowered = text.casefold()
     return bool(re.search(
-        r"\b(?:create|add|book|schedule)\b.{0,60}"
+        r"\b(?:set|put|create|add|book|schedule)\b.{0,60}"
         r"\b(?:meetings?|events?|appointments?|sessions?|classes?|calendar)\b|"
         r"\b(?:meetings?|events?|appointments?|sessions?|classes?)\b.{0,60}"
-        r"\b(?:create|add|book|schedule)\b|"
+        r"\b(?:set|put|create|add|book|schedule)\b|"
         r"\b(?:move|reschedule)\b.{0,60}"
         r"\b(?:meetings?|events?|appointments?)\b|"
         r"\b(?:meetings?|events?|appointments?)\b.{0,60}"
@@ -735,10 +754,10 @@ def _calendar_create_request(text: str) -> bool:
 def _calendar_event_creation_request(text: str) -> bool:
     lowered = text.casefold()
     return bool(re.search(
-        r"\b(?:create|add|book|schedule)\b.{0,60}"
+        r"\b(?:set|put|create|add|book|schedule)\b.{0,60}"
         r"\b(?:meetings?|events?|appointments?|sessions?|classes?|calendar)\b|"
         r"\b(?:meetings?|events?|appointments?|sessions?|classes?)\b.{0,60}"
-        r"\b(?:create|add|book|schedule)\b",
+        r"\b(?:set|put|create|add|book|schedule)\b",
         lowered,
     ))
 
@@ -840,7 +859,7 @@ def _deterministic_calendar_plan(
             return _calendar_plan("clarify")
 
     creation_request = bool(re.search(
-        r"\b(?:create|add|book|schedule|cancel|delete|remove|update|edit|"
+        r"\b(?:set|put|create|add|book|schedule|cancel|delete|remove|update|edit|"
         r"change|modify|move|reschedule|invite|rsvp)\b.{0,60}"
         r"\b(?:meetings?|events?|appointments?|calendar)\b|"
         r"\b(?:meetings?|events?|appointments?)\b.{0,60}\b(?:cancel|delete|remove|update|"
@@ -932,6 +951,13 @@ def _deterministic_calendar_plan(
                 )
         return _calendar_plan("clarify")
 
+    if re.search(
+        r"\b(?:show|list|find|what are|what's|what is)\b.{0,30}"
+        r"\b(?:my|all(?:\s+my)?|available|accessible)\s+calendars\b",
+        lowered,
+    ):
+        return _calendar_plan("list_calendars", {})
+
     if len(explicit_date_matches) == 2 and re.search(
         r"\b(?:from|between|through|until|to)\b",
         lowered,
@@ -1010,17 +1036,51 @@ def _deterministic_calendar_plan(
             },
         )
 
-    month_match = re.search(r"\b(this|next)\s+month\b", lowered)
-    if month_match and re.search(
-        r"\b(?:show|list|find|get|open|check|what|when|tell me)\b",
+    month_read_request = re.search(
+        r"\b(?:show|list|find|get|open|check|what|when|tell me|"
+        r"do i have|have)\b",
         lowered,
+    )
+    relative_month_match = re.search(r"\b(this|next)\s+month\b", lowered)
+    named_month_match = re.search(
+        r"\b(january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\b(?:\s+(20\d{2}))?\b",
+        lowered,
+    )
+    if month_read_request and (
+        relative_month_match or named_month_match
     ):
-        month_offset = 1 if month_match.group(1) == "next" else 0
-        month_start = date(
-            today.year + (today.month - 1 + month_offset) // 12,
-            (today.month - 1 + month_offset) % 12 + 1,
-            1,
-        )
+        if relative_month_match:
+            month_offset = (
+                1 if relative_month_match.group(1) == "next" else 0
+            )
+            month_start = date(
+                today.year + (today.month - 1 + month_offset) // 12,
+                (today.month - 1 + month_offset) % 12 + 1,
+                1,
+            )
+        else:
+            month_names = (
+                "january",
+                "february",
+                "march",
+                "april",
+                "may",
+                "june",
+                "july",
+                "august",
+                "september",
+                "october",
+                "november",
+                "december",
+            )
+            month_number = month_names.index(named_month_match.group(1)) + 1
+            month_year = (
+                int(named_month_match.group(2))
+                if named_month_match.group(2)
+                else today.year
+            )
+            month_start = date(month_year, month_number, 1)
         next_month_start = date(
             month_start.year + (month_start.month == 12),
             month_start.month % 12 + 1,
@@ -1039,12 +1099,12 @@ def _deterministic_calendar_plan(
         if range_start is None or range_end is None:
             return _calendar_plan("clarify")
         return _calendar_plan(
-            "list_calendar_events",
+            "get_calendar_schedule",
             {
-                "time_min": range_start.isoformat(),
-                "time_max": range_end.isoformat(),
+                "date": month_start.isoformat(),
+                "period": "month",
                 "time_zone": timezone,
-                "max_results": 100,
+                "calendar_id": "primary",
             },
         )
 
@@ -1134,6 +1194,32 @@ def _deterministic_calendar_plan(
                 "max_results": 1,
             },
         )
+
+    named_calendar_match = re.search(
+        r"\b(?:my|the)\s+([a-z0-9][\w &'’-]{0,39}?)\s+calendar\b|"
+        r"\b(?:show|list|view|open)\s+"
+        r"([a-z0-9][\w &'’-]{0,39}?)\s+calendar\b",
+        text,
+        re.IGNORECASE,
+    )
+    if named_calendar_match and re.search(
+        r"\b(?:show|list|find|get|open|view|what|when|tell me)\b",
+        lowered,
+    ):
+        calendar_name = (
+            named_calendar_match.group(1)
+            or named_calendar_match.group(2)
+            or ""
+        ).strip()
+        if calendar_name.casefold() not in {"google", "primary", "my", "the"}:
+            return _calendar_plan(
+                "list_calendar_events",
+                {
+                    "time_min": request_now.isoformat(),
+                    "time_zone": timezone,
+                    "max_results": 100,
+                },
+            )
 
     title_match = re.search(
         r"\b(?:find|search|show|list|get)\b.{0,30}"
@@ -1317,6 +1403,25 @@ def _deterministic_assistant_plan(
 ) -> tuple[dict[str, Any], str] | None:
     text = state["user_message"].strip()
     lowered = text.casefold()
+
+    if _is_explicit_memory_update_request(text):
+        return (
+            {"intent": "memory_update", "memory_scope": "episodic"},
+            "memory_update",
+        )
+
+    if _is_explicit_memory_request(text):
+        return (
+            {
+                "intent": "memory_retrieval",
+                "memory_scope": (
+                    "episodic"
+                    if re.search(r"\bepisodic\b", lowered)
+                    else "all"
+                ),
+            },
+            "general",
+        )
 
     draft_plan = _deterministic_draft_plan(state)
     if draft_plan is not None:
@@ -1584,16 +1689,18 @@ def _requires_intent_planning(user_message: str) -> bool:
 
 def _is_calendar_request(user_message: str) -> bool:
     lowered = user_message.casefold()
+    if _is_explicit_memory_request(user_message):
+        return False
     asks_calendar = bool(re.search(
-        r"\b(?:calendar|meetings?|events?|appointments?|sessions?|classes?|"
-        r"schedule)\b",
+        r"\b(?:calendars?|meetings?|events?|appointments?|sessions?|classes?|"
+        r"schedules?|scheduled)\b",
         lowered,
     ))
     has_action = bool(re.search(
         r"\b(?:show|list|find|get|open|check|what|when|do i have|"
         r"am i|are we|is there|tell me|schedule|add|create|book|"
         r"cancel|delete|remove|update|edit|change|modify|move|"
-        r"reschedule|invite|rsvp)\b",
+        r"reschedule|invite|rsvp|set|put)\b",
         lowered,
     ))
     return (
@@ -1602,6 +1709,62 @@ def _is_calendar_request(user_message: str) -> bool:
             r"\b(?:am i|are we|is it)\b.{0,30}\b(?:free|available)\b",
             lowered,
         ))
+    )
+
+
+def _is_explicit_memory_request(user_message: str) -> bool:
+    lowered = user_message.casefold()
+    memory_source = bool(re.search(
+        r"\b(?:episodic\s+memor(?:y|ies)|stored\s+(?:in\s+)?memor(?:y|ies)|"
+        r"saved\s+(?:memory|memories|records)|memory\s+records|memor(?:y|ies)\b|"
+        r"last\s+recorded)\b",
+        lowered,
+    ))
+    if not memory_source:
+        return False
+    calendar_source = bool(re.search(
+        r"\b(?:google\s+calendar|calendar)\b",
+        lowered,
+    ))
+    negative_calendar = bool(re.search(
+        r"\b(?:do\s+not|don't|never|without)\b.{0,30}"
+        r"\b(?:check|use|open|query|consult)\b.{0,30}"
+        r"\b(?:google\s+)?calendar\b",
+        lowered,
+    ))
+    if calendar_source and not negative_calendar:
+        return False
+    return True
+
+
+def _is_explicit_memory_update_request(user_message: str) -> bool:
+    lowered = user_message.casefold()
+    update_action = bool(re.search(
+        r"\b(?:update|change|changed|edit|modify|replace|correct|"
+        r"new\s+time|has\s+changed)\b",
+        lowered,
+    ))
+    memory_context = bool(re.search(
+        r"\b(?:memor(?:y|ies)|saved\s+(?:record|records|information)|"
+        r"episodic\s+record)\b",
+        lowered,
+    ))
+    event_context = bool(re.search(
+        r"\b(?:meeting|appointment|event|session|schedule|gym|class)\b",
+        lowered,
+    ))
+    time_context = bool(re.search(
+        r"\b(?:\d{1,2}:?\d{2}|time|instead)\b",
+        lowered,
+    ))
+    calendar_source = bool(re.search(
+        r"\b(?:google\s+calendar|calendar)\b",
+        lowered,
+    ))
+    return (
+        update_action
+        and (memory_context or (event_context and time_context))
+        and not calendar_source
     )
 
 
@@ -1756,6 +1919,29 @@ def _contextual_followup_messages(state: ChatState) -> list[dict[str, str]]:
 
 def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
     """Produce one strict, validated assistant intent decision."""
+    if _is_explicit_memory_update_request(state["user_message"]):
+        return {
+            "gmail_plan": {
+                "intent": "memory_update",
+                "memory_scope": "episodic",
+            },
+            "assistant_route": "memory_update",
+        }
+
+    if _is_explicit_memory_request(state["user_message"]):
+        lowered = state["user_message"].casefold()
+        return {
+            "gmail_plan": {
+                "intent": "memory_retrieval",
+                "memory_scope": (
+                    "episodic"
+                    if re.search(r"\bepisodic\b", lowered)
+                    else "all"
+                ),
+            },
+            "assistant_route": "general",
+        }
+
     if re.search(
         r"\bwhat\s+(?:can|could)\s+you\s+(?:do|help\s+me\s+with)\b|"
         r"\bwhat\s+are\s+your\s+(?:capabilities|features)\b|"
@@ -1929,6 +2115,7 @@ def route_after_assistant_intent(state: ChatState) -> str:
     selected_route = state.get("assistant_route")
     if selected_route in {
         "general",
+        "memory_update",
         "gmail",
         "capabilities",
         "google_drive",

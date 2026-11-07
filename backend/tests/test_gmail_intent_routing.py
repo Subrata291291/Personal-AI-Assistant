@@ -1,6 +1,8 @@
 import json
+import re
 from datetime import datetime
 from types import SimpleNamespace
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -21,7 +23,9 @@ from app.workflows.chat_nodes import (
 )
 from app.workflows import chat_nodes
 from app.workflows import gmail_agent_nodes
+from app.workflows import chat_graph
 from app.workflows.calendar_agent_node import calendar_agent_node
+from app.workflows.memory_retrieval_node import memory_retrieval_node
 
 
 SUBSCRIPTION_REQUEST = (
@@ -251,12 +255,22 @@ def test_calendar_and_gmail_requests_route_to_their_service():
         (
             "Show my calendar this month.",
             "google_calendar",
-            "list_calendar_events",
+            "get_calendar_schedule",
         ),
         (
             "Show my Google Calendar this month.",
             "google_calendar",
+            "get_calendar_schedule",
+        ),
+        (
+            "Show my work calendar.",
+            "google_calendar",
             "list_calendar_events",
+        ),
+        (
+            "Show me all my calendars.",
+            "google_calendar",
+            "list_calendars",
         ),
         (
             "What meetings do I have tomorrow?",
@@ -417,10 +431,76 @@ def test_calendar_month_plan_uses_request_time_and_selected_timezone():
     arguments = routed["gmail_plan"]["calendar_arguments"]
 
     assert routed["assistant_route"] == "google_calendar"
-    assert routed["gmail_plan"]["calendar_tool"] == "list_calendar_events"
-    assert arguments["time_min"] == "2026-11-01T00:00:00-07:00"
-    assert arguments["time_max"] == "2026-12-01T00:00:00-08:00"
+    assert routed["gmail_plan"]["calendar_tool"] == "get_calendar_schedule"
+    assert arguments["date"] == "2026-11-01"
+    assert arguments["period"] == "month"
     assert arguments["time_zone"] == "America/Los_Angeles"
+
+
+def test_calendar_monthly_read_requests_parse_relative_and_named_months():
+    request_time = datetime(2026, 11, 4, 17, 0, tzinfo=ZoneInfo("UTC"))
+    cases = (
+        ("Show my calendar for this month.", "2026-11-01"),
+        ("Show my schedule for November.", "2026-11-01"),
+        ("What do I have scheduled next month?", "2026-12-01"),
+        ("Show my calendar for December 2026.", "2026-12-01"),
+        ("Show my schedule next month.", "2026-12-01"),
+    )
+
+    for text, expected_date in cases:
+        routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+            text,
+            user_timezone="America/Los_Angeles",
+            request_time=request_time,
+        ))
+        plan = routed["gmail_plan"]
+
+        assert routed["assistant_route"] == "google_calendar"
+        assert plan["calendar_tool"] == "get_calendar_schedule"
+        assert plan["calendar_arguments"]["date"] == expected_date
+        assert plan["calendar_arguments"]["period"] == "month"
+        assert plan["calendar_arguments"]["time_zone"] == (
+            "America/Los_Angeles"
+        )
+        assert plan["calendar_arguments"]["calendar_id"] == "primary"
+
+
+@pytest.mark.parametrize(
+    ("request_time", "text", "expected_date"),
+    (
+        (
+            datetime(2026, 11, 30, 20, 30, tzinfo=ZoneInfo("UTC")),
+            "Show my schedule next month.",
+            "2026-12-01",
+        ),
+        (
+            datetime(2026, 12, 31, 20, 30, tzinfo=ZoneInfo("UTC")),
+            "What do I have scheduled next month?",
+            "2027-01-01",
+        ),
+        (
+            datetime(2027, 1, 1, 8, 0, tzinfo=ZoneInfo("UTC")),
+            "Show my calendar for December 2026.",
+            "2026-12-01",
+        ),
+    ),
+)
+def test_calendar_monthly_routing_handles_year_boundaries(
+    request_time,
+    text,
+    expected_date,
+):
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        text,
+        user_timezone="America/Los_Angeles",
+        request_time=request_time,
+    ))
+    arguments = routed["gmail_plan"]["calendar_arguments"]
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "get_calendar_schedule"
+    assert arguments["date"] == expected_date
+    assert arguments["period"] == "month"
 
 
 def test_capability_questions_use_a_deterministic_capability_route():
@@ -1007,6 +1087,33 @@ def test_calendar_create_without_complete_details_asks_for_clarification(
     assert routed["gmail_plan"]["calendar_arguments"] is None
 
 
+def test_explicit_set_in_calendar_create_routes_to_proposal_with_missing_end_time():
+    request_time = datetime(2026, 11, 6, 14, 30, tzinfo=ZoneInfo("UTC"))
+    capabilities = {
+        "google_calendar": {
+            "write_permission_granted": True,
+            "create_execution_available": False,
+            "write_execution_available": False,
+            "create_feature_enabled": False,
+        },
+    }
+    state = _state(
+        "Set in calendar, I will go to gym tomorrow at 10am.",
+        user_timezone="Asia/Kolkata",
+        request_time=request_time,
+        assistant_capabilities=capabilities,
+    )
+
+    result = gmail_agent_nodes.gmail_intent_router_node(state)
+
+    assert result["assistant_route"] == "google_calendar"
+    assert result["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
+    assert result["gmail_plan"]["calendar_arguments"] is None
+    assert gmail_agent_nodes._calendar_create_title(state["user_message"]) == "Gym"
+
+
 def test_gym_event_creation_clarifies_missing_date_and_resolves_followup():
     request_time = datetime(
         2026, 11, 6, 14, 30, tzinfo=ZoneInfo("UTC")
@@ -1317,6 +1424,630 @@ def test_general_response_keeps_unrelated_answers(monkeypatch):
     ))
 
     assert result["assistant_response"] == content
+
+
+def test_general_greeting_response_can_explain_calendar_capability(monkeypatch):
+    content = (
+        "I'm your personal AI assistant. I can help with general questions, "
+        "emails, and Calendar tasks such as reviewing your schedule and "
+        "showing upcoming events."
+    )
+    monkeypatch.setattr(
+        chat_nodes.llm_router,
+        "generate",
+        lambda request: SimpleNamespace(
+            content=content,
+            provider="test",
+            model="test-model",
+            completion_metadata=lambda: {},
+        ),
+    )
+
+    result = llm_node(_state(
+        "Hello! Who are you and how can you help me?",
+        assistant_route="general",
+    ))
+
+    assert result["assistant_response"] == content
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_route", "expected_tool"),
+    [
+        ("Hello! Who are you and how can you help me?", "general", "general"),
+        ("My name is Subrata. I am a software developer.", "general", "general"),
+        ("What is my profession?", "general", "general"),
+        ("What technologies am I learning?", "general", "general"),
+        ("Show my calendar for today.", "google_calendar", "get_today_schedule"),
+        ("What meetings do I have tomorrow?", "google_calendar", "get_calendar_schedule"),
+    ],
+)
+def test_general_and_daily_calendar_regression_routes(text, expected_route, expected_tool):
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        text,
+        user_timezone="America/Los_Angeles",
+        request_time=datetime(
+            2026, 11, 4, 17, 0, tzinfo=ZoneInfo("UTC")
+        ),
+    ))
+
+    assert routed["assistant_route"] == expected_route
+    assert routed["gmail_plan"]["intent"] == (
+        expected_tool if expected_route == "general" else "google_calendar"
+    )
+    if expected_route == "google_calendar":
+        assert routed["gmail_plan"]["calendar_tool"] == expected_tool
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "List all my stored episodic memories.",
+        "List all my stored episodic memories. Do not check Google Calendar.",
+        "What meetings have I stored in memory?",
+        "What was my last recorded gym session?",
+        (
+            "List all my stored episodic memories. Do not check Google Calendar. "
+            "Retrieve only from my saved memory records."
+        ),
+    ),
+)
+def test_explicit_memory_requests_precede_calendar_routing(text):
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(text))
+
+    assert routed["gmail_plan"]["intent"] == "memory_retrieval"
+    assert routed["assistant_route"] == "general"
+    selected_route = gmail_agent_nodes.route_after_assistant_intent(routed)
+    assert selected_route == "general"
+    assert chat_graph.ASSISTANT_ROUTE_NODES[selected_route] == (
+        "memory_retrieval"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_tool"),
+    (
+        (
+            "What meetings do I have tomorrow in Google Calendar?",
+            "get_calendar_schedule",
+        ),
+        (
+            "Show my upcoming Google Calendar events.",
+            "list_calendar_events",
+        ),
+    ),
+)
+def test_explicit_google_calendar_requests_keep_calendar_routing(text, expected_tool):
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        text,
+        user_timezone="UTC",
+        request_time=datetime(2026, 11, 7, 16, 0, tzinfo=ZoneInfo("UTC")),
+    ))
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["intent"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == expected_tool
+    selected_route = gmail_agent_nodes.route_after_assistant_intent(routed)
+    assert selected_route == "google_calendar"
+    assert chat_graph.ASSISTANT_ROUTE_NODES[selected_route] == (
+        "calendar_agent"
+    )
+
+
+def test_memory_only_retrieval_lists_episodic_records_without_calendar(monkeypatch):
+    from app.workflows import memory_retrieval_node as memory_module
+
+    records = [
+        SimpleNamespace(
+            id="11111111-1111-1111-1111-111111111111",
+            memory_type="episodic",
+            content="Gym session with strength training.",
+            created_at=None,
+            metadata_=None,
+        ),
+        SimpleNamespace(
+            id="22222222-2222-2222-2222-222222222222",
+            memory_type="episodic",
+            content="Team planning meeting.",
+            created_at=datetime(2026, 11, 1, 9, 30, tzinfo=ZoneInfo("UTC")),
+            metadata_={"date": "2026-11-01", "time": "09:30 UTC"},
+        ),
+    ]
+
+    class FakeSession:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeMemoryService:
+        def __init__(self, session):
+            self.list_calls = []
+
+        def list_memories(self, **kwargs):
+            self.list_calls.append(kwargs)
+            return records
+
+    monkeypatch.setattr(memory_module, "SessionLocal", FakeSession)
+    monkeypatch.setattr(memory_module, "MemoryService", FakeMemoryService)
+    calendar_calls = []
+
+    result = memory_module.memory_retrieval_node(_state(
+        "List all my stored episodic memories. Do not check Google Calendar.",
+        user_id="00000000-0000-0000-0000-000000000001",
+    ))
+
+    assert len(result["retrieved_memories"]) == 2
+    assert "Gym session with strength training." in result["memory_context"]
+    assert "stored_at=" not in result["memory_context"].splitlines()[0]
+    assert "stored_at=2026-11-01T09:30:00+00:00" in (
+        result["memory_context"]
+    )
+    assert calendar_calls == []
+
+
+def test_exact_memory_reproduction_executes_memory_node_not_calendar(monkeypatch):
+    execution_trace = []
+
+    def fake_memory_node(state):
+        execution_trace.append("memory_retrieval")
+        return {
+            "retrieved_memories": [{
+                "memory_id": "11111111-1111-1111-1111-111111111111",
+                "memory_type": "episodic",
+                "content": "Recorded gym session.",
+            }],
+            "memory_context": (
+                "1. [episodic] Recorded gym session."
+            ),
+        }
+
+    def fake_calendar_node(state):
+        execution_trace.append("calendar_agent")
+        return {"assistant_response": "calendar fallback should not run"}
+
+    def fake_llm_node(state):
+        execution_trace.append("llm")
+        return {"assistant_response": "Returned saved episodic memories."}
+
+    monkeypatch.setattr(chat_graph, "memory_retrieval_node", fake_memory_node)
+    monkeypatch.setattr(chat_graph, "calendar_agent_node", fake_calendar_node)
+    monkeypatch.setattr(chat_graph, "llm_node", fake_llm_node)
+
+    graph = chat_graph.build_chat_graph()
+    result = graph.invoke(
+        _state(
+            (
+                "List all my stored episodic memories. Do not check Google "
+                "Calendar. Retrieve only from my saved memory records."
+            ),
+            user_id="00000000-0000-0000-0000-000000000001",
+        ),
+        config={"configurable": {"thread_id": "memory-trace-test"}},
+    )
+
+    assert "memory_retrieval" in execution_trace
+    assert "llm" in execution_trace
+    assert "calendar_agent" not in execution_trace
+    assert result["assistant_route"] == "general"
+    assert result["gmail_plan"]["intent"] == "memory_retrieval"
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        (
+            "My meeting time has changed. It is now scheduled from 16:00 "
+            "to 17:00 instead of 14:00 to 15:00. Please update this "
+            "information in my memory."
+        ),
+        (
+            "My meeting time has changed. It is now scheduled from 16:00 "
+            "to 17:00 instead of 14:00 to 15:00."
+        ),
+        "Please update my stored meeting memory from 14:00 to 15:00 to 16:00 to 17:00.",
+    ),
+)
+def test_explicit_memory_update_routes_before_gmail_and_calendar(text):
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(text))
+
+    assert routed["gmail_plan"]["intent"] == "memory_update"
+    assert routed["assistant_route"] == "memory_update"
+    assert gmail_agent_nodes.route_after_assistant_intent(routed) == "memory_update"
+    assert chat_graph.ASSISTANT_ROUTE_NODES["memory_update"] == "memory_update"
+
+
+@pytest.mark.parametrize(
+    ("stored_range", "message"),
+    (
+        ("14:00 to 15:00", "My meeting changed from 14:00 to 15:00 to 16:00 to 17:00."),
+        ("14:00–15:00", "My meeting changed from 14:00–15:00 to 16:00–17:00."),
+        ("2:00 PM to 3:00 PM", "My meeting changed from 2:00 PM to 3:00 PM to 4:00 PM to 5:00 PM."),
+        ("2 PM–3 PM", "My meeting changed from 2 PM–3 PM to 4 PM–5 PM."),
+    ),
+)
+def test_memory_update_normalizes_time_formats(stored_range, message):
+    from app.workflows.memory_update_node import (
+        _compact_time_range,
+        _replace_time_range,
+    )
+
+    content = f"User has a meeting scheduled tomorrow from {stored_range}."
+    old_match = gmail_agent_nodes.re.findall(
+        r"\b(?:\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?\s*(?:-|–|—|\bto\b)\s*"
+        r"\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?|"
+        r"\d{1,2}:\d{2}\s*(?:-|–|—|\bto\b)\s*\d{1,2}:\d{2})\b",
+        message,
+        re.IGNORECASE,
+    )
+    assert old_match
+
+    old_text = old_match[0]
+    new_text = old_match[-1]
+    if old_text == new_text:
+        return
+
+    updated = _replace_time_range(content, old_text, new_text)
+    assert updated != content
+    assert _compact_time_range(old_text) != _compact_time_range(new_text)
+
+
+def test_memory_update_persists_replacement_and_preserves_id(monkeypatch):
+    from app.workflows import memory_update_node as update_module
+
+    memory_id = "11111111-1111-1111-1111-111111111111"
+    memory = SimpleNamespace(
+        id=memory_id,
+        memory_type="episodic",
+        content="User has a meeting scheduled for tomorrow from 14:00 to 15:00.",
+        metadata_={"source": "chat", "topic": "meeting"},
+    )
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeMemoryService:
+        def __init__(self, session):
+            self.updated_calls = []
+
+        def list_memories(self, **kwargs):
+            assert kwargs["memory_type"] == "episodic"
+            return [memory]
+
+        def update_memory(self, **kwargs):
+            assert kwargs["user_id"] == UUID(
+                "00000000-0000-0000-0000-000000000001"
+            )
+            assert kwargs["memory_id"] == memory_id
+            memory.content = kwargs["content"]
+            return memory
+
+    monkeypatch.setattr(update_module, "SessionLocal", FakeSession)
+    monkeypatch.setattr(update_module, "MemoryService", FakeMemoryService)
+
+    result = update_module.memory_update_node(_state(
+        (
+            "My meeting time has changed. It is now scheduled from 16:00 "
+            "to 17:00 instead of 14:00 to 15:00. Please update this "
+            "information in your memory."
+        ),
+        user_id="00000000-0000-0000-0000-000000000001",
+    ))
+
+    assert result["memory_update_result"]["status"] == "updated"
+    assert result["memory_update_result"]["memory_id"] == memory_id
+    assert memory.content == (
+        "User has a meeting scheduled for tomorrow from 16:00 to 17:00."
+    )
+    assert memory.metadata_ == {"source": "chat", "topic": "meeting"}
+
+
+def test_memory_update_is_ambiguous_without_duplicate_update(monkeypatch):
+    from app.workflows import memory_update_node as update_module
+
+    memories = [
+        SimpleNamespace(
+            id="11111111-1111-1111-1111-111111111111",
+            memory_type="episodic",
+            content="User has a meeting from 14:00 to 15:00.",
+        ),
+        SimpleNamespace(
+            id="22222222-2222-2222-2222-222222222222",
+            memory_type="episodic",
+            content="User also has a meeting from 14:00-15:00.",
+        ),
+    ]
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeMemoryService:
+        def __init__(self, session):
+            pass
+
+        def list_memories(self, **kwargs):
+            return memories
+
+        def update_memory(self, **kwargs):
+            raise AssertionError("Ambiguous memory must not be updated")
+
+    monkeypatch.setattr(update_module, "SessionLocal", FakeSession)
+    monkeypatch.setattr(update_module, "MemoryService", FakeMemoryService)
+
+    result = update_module.memory_update_node(_state(
+        "My meeting changed from 14:00 to 15:00 to 16:00 to 17:00. Update my memory.",
+        user_id="00000000-0000-0000-0000-000000000001",
+    ))
+
+    assert result["memory_update_result"]["status"] == "clarification_required"
+
+
+def test_memory_update_graph_trace_executes_memory_node_without_tools(monkeypatch):
+    execution_trace = []
+
+    def fake_memory_update_node(state):
+        execution_trace.append("memory_update")
+        return {
+            "memory_update_result": {
+                "status": "updated",
+                "memory_id": "11111111-1111-1111-1111-111111111111",
+                "content": (
+                    "User has a meeting scheduled for tomorrow from 16:00 to 17:00."
+                ),
+            },
+            "assistant_response": "Updated the stored meeting memory.",
+        }
+
+    def fake_calendar_node(state):
+        execution_trace.append("calendar_agent")
+        return {"assistant_response": "calendar must not run"}
+
+    def fake_gmail_node(state):
+        execution_trace.append("gmail_agent")
+        return {"assistant_response": "gmail must not run"}
+
+    monkeypatch.setattr(chat_graph, "memory_update_node", fake_memory_update_node)
+    monkeypatch.setattr(chat_graph, "calendar_agent_node", fake_calendar_node)
+    monkeypatch.setattr(chat_graph, "gmail_agent_node", fake_gmail_node)
+
+    graph = chat_graph.build_chat_graph()
+    result = graph.invoke(
+        _state(
+            (
+                "My meeting time has changed. It is now scheduled from 16:00 "
+                "to 17:00 instead of 14:00 to 15:00. Please update this "
+                "information in my memory."
+            ),
+            user_id="00000000-0000-0000-0000-000000000001",
+        ),
+        config={"configurable": {"thread_id": "memory-update-trace-test"}},
+    )
+
+    assert "memory_update" in execution_trace
+    assert "gmail_agent" not in execution_trace
+    assert "calendar_agent" not in execution_trace
+    assert result["assistant_route"] == "memory_update"
+    assert result["gmail_plan"]["intent"] == "memory_update"
+
+
+def test_autonomous_memory_update_decision_precedes_external_routing(monkeypatch):
+    from app.workflows import autonomous_memory_node as autonomous_module
+
+    memory_id = UUID("11111111-1111-1111-1111-111111111111")
+    memory = SimpleNamespace(
+        id=memory_id,
+        memory_type="episodic",
+        content=(
+            "User has a meeting scheduled for tomorrow "
+            "from 14:00 to 15:00."
+        ),
+    )
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeMemoryService:
+        def __init__(self, session):
+            pass
+
+        def list_memories(self, **kwargs):
+            return [memory]
+
+    monkeypatch.setattr(autonomous_module, "SessionLocal", FakeSession)
+    monkeypatch.setattr(autonomous_module, "MemoryService", FakeMemoryService)
+
+    result = autonomous_module.autonomous_memory_node(_state(
+        "My meeting has moved from 14:00–15:00 to 16:00–17:00 tomorrow.",
+        user_id="00000000-0000-0000-0000-000000000001",
+        conversation_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    ))
+
+    decision = result["memory_decision_result"]
+    assert decision["action"] == "UPDATE"
+    assert decision["target_memory_id"] == str(memory_id)
+    assert result["memory_decision_executed"] is True
+    assert result["assistant_route"] == "memory_update"
+
+
+def test_real_autonomous_memory_update_graph_persists_without_external_nodes(monkeypatch):
+    from app.workflows import autonomous_memory_node as autonomous_module
+    from app.workflows import memory_update_node as update_module
+
+    memory_id = UUID("11111111-1111-1111-1111-111111111111")
+    memory = SimpleNamespace(
+        id=memory_id,
+        content="User has a meeting scheduled for tomorrow from 14:00 to 15:00.",
+    )
+    update_count = {"value": 0}
+    execution_trace = []
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeMemoryService:
+        def __init__(self, session):
+            pass
+
+        def list_memories(self, **kwargs):
+            return [memory]
+
+        def update_memory(self, *, user_id, memory_id, content):
+            update_count["value"] += 1
+            assert memory_id == memory.id
+            memory.content = content
+            return memory
+
+    monkeypatch.setattr(autonomous_module, "SessionLocal", FakeSession)
+    monkeypatch.setattr(autonomous_module, "MemoryService", FakeMemoryService)
+    monkeypatch.setattr(update_module, "SessionLocal", FakeSession)
+    monkeypatch.setattr(update_module, "MemoryService", FakeMemoryService)
+
+    real_autonomous = autonomous_module.autonomous_memory_node
+    real_update = update_module.memory_update_node
+
+    def traced_autonomous(state):
+        execution_trace.append("autonomous_memory")
+        return real_autonomous(state)
+
+    def traced_update(state):
+        execution_trace.append("memory_update")
+        return real_update(state)
+
+    monkeypatch.setattr(chat_graph, "autonomous_memory_node", traced_autonomous)
+    monkeypatch.setattr(chat_graph, "memory_update_node", traced_update)
+
+    def fake_calendar_node(state):
+        execution_trace.append("calendar_agent")
+        return {"assistant_response": "calendar must not run"}
+
+    def fake_gmail_node(state):
+        execution_trace.append("gmail_agent")
+        return {"assistant_response": "gmail must not run"}
+
+    monkeypatch.setattr(chat_graph, "calendar_agent_node", fake_calendar_node)
+    monkeypatch.setattr(chat_graph, "gmail_agent_node", fake_gmail_node)
+
+    graph = chat_graph.build_chat_graph()
+    result = graph.invoke(
+        _state(
+            "My meeting has moved from 14:00–15:00 to 16:00–17:00 tomorrow.",
+            user_id="00000000-0000-0000-0000-000000000001",
+        ),
+        config={"configurable": {"thread_id": "real-autonomous-memory-update-test"}},
+    )
+
+    assert execution_trace == ["autonomous_memory", "memory_update"]
+    assert result["memory_decision_result"]["action"] == "UPDATE"
+    assert result["memory_update_result"]["status"] == "updated"
+    assert result["memory_update_result"]["memory_id"] == str(memory_id)
+    assert (
+        "16:00 to 17:00" in memory.content
+        or "16:00–17:00" in memory.content
+    )
+    assert "14:00 to 15:00" not in memory.content
+    assert update_count["value"] == 1
+    assert result["memory_execution_trace"]["gmail_node_executed"] is False
+    assert result["memory_execution_trace"]["calendar_node_executed"] is False
+
+
+def test_autonomous_memory_decision_graph_trace(monkeypatch):
+    execution_trace = []
+
+    def fake_autonomous_memory_node(state):
+        execution_trace.append("autonomous_memory")
+        return {
+            "memory_decision_result": {
+                "action": "UPDATE",
+                "memory_type": "episodic",
+                "reason": "Unique matching episodic memory.",
+            },
+            "memory_decision_executed": True,
+            "assistant_route": "memory_update",
+            "gmail_plan": {
+                "intent": "memory_update",
+                "memory_scope": "episodic",
+            },
+            "memory_execution_trace": {
+                "first_node": "autonomous_memory",
+                "memory_decision": "UPDATE",
+                "selected_memory_id": "11111111-1111-1111-1111-111111111111",
+                "next_node": "memory_update",
+                "gmail_node_executed": False,
+                "calendar_node_executed": False,
+            },
+        }
+
+    def fake_memory_update_node(state):
+        execution_trace.append("memory_update")
+        return {
+            "memory_update_result": {
+                "status": "updated",
+                "memory_id": "11111111-1111-1111-1111-111111111111",
+                "content": (
+                    "User has a meeting scheduled for tomorrow "
+                    "from 16:00 to 17:00."
+                ),
+            },
+            "assistant_response": "I updated the stored meeting memory.",
+        }
+
+    def fake_calendar_node(state):
+        execution_trace.append("calendar_agent")
+        return {"assistant_response": "calendar must not run"}
+
+    def fake_gmail_node(state):
+        execution_trace.append("gmail_agent")
+        return {"assistant_response": "gmail must not run"}
+
+    monkeypatch.setattr(
+        chat_graph,
+        "autonomous_memory_node",
+        fake_autonomous_memory_node,
+    )
+    monkeypatch.setattr(
+        chat_graph,
+        "memory_update_node",
+        fake_memory_update_node,
+    )
+    monkeypatch.setattr(chat_graph, "calendar_agent_node", fake_calendar_node)
+    monkeypatch.setattr(chat_graph, "gmail_agent_node", fake_gmail_node)
+
+    graph = chat_graph.build_chat_graph()
+    result = graph.invoke(
+        _state(
+            "My meeting has moved from 14:00–15:00 to 16:00–17:00 tomorrow.",
+            user_id="00000000-0000-0000-0000-000000000001",
+        ),
+        config={"configurable": {"thread_id": "autonomous-memory-trace-test"}},
+    )
+
+    assert execution_trace == ["autonomous_memory", "memory_update"]
+    assert "gmail_agent" not in execution_trace
+    assert "calendar_agent" not in execution_trace
+    assert result["memory_decision_result"]["action"] == "UPDATE"
+    assert result["memory_update_result"]["status"] == "updated"
+    assert result["memory_execution_trace"]["first_node"] == "autonomous_memory"
+    assert result["memory_execution_trace"]["memory_decision"] == "UPDATE"
+    assert result["memory_execution_trace"]["next_node"] == "memory_update"
+    assert result["memory_execution_trace"]["gmail_node_executed"] is False
+    assert result["memory_execution_trace"]["calendar_node_executed"] is False
 
 
 def test_compose_without_recipient_requests_only_the_recipient(monkeypatch):
