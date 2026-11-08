@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+from uuid import UUID
 from datetime import date, datetime, timedelta
 from datetime import time as datetime_time
 from email.utils import getaddresses, parsedate_to_datetime
@@ -41,6 +42,8 @@ from app.schemas.email_draft import (
 from app.schemas.calendar_approval import CalendarCreateEventParameters
 from app.services.gmail_action_executor import GmailActionExecutor
 from app.services.gmail_service import GmailService
+from app.services.action_approval_service import ActionApprovalService
+from app.db.session import SessionLocal
 from app.workflows.chat_state import ChatContext, ChatState
 from app.workflows.gmail_tools import execute_gmail_read
 
@@ -239,6 +242,7 @@ def _plan_prompt(state: ChatState) -> str:
         "or timezone are ambiguous. Never mix Calendar writes with Gmail. "
         "For Calendar requests, select calendar_tool from "
         "list_calendars, list_calendar_events, get_calendar_event, "
+        "get_calendar_proposal_status, "
         "get_today_schedule, get_calendar_schedule, "
         "check_calendar_availability, create_calendar_event_proposal, "
         "update_calendar_event_proposal, delete_calendar_event_proposal, "
@@ -435,7 +439,9 @@ def _calendar_create_followup_text(state: ChatState) -> str | None:
         not isinstance(assistant_reply, str)
         or not re.search(
             r"\b(?:what|which|provide|specify)\b.{0,60}\bdate\b|"
-            r"\bdate\b.{0,60}\b(?:schedule|event|calendar)\b",
+            r"\b(?:date|end time|start time|start and end times|"
+            r"date and start and end times)\b.{0,60}"
+            r"\b(?:schedule|event|calendar|use)\b",
             assistant_reply,
             re.IGNORECASE,
         )
@@ -532,7 +538,72 @@ def _calendar_create_followup_text(state: ChatState) -> str | None:
             f"from {effective_times[0].strftime('%H:%M')} "
             f"to {effective_times[1].strftime('%H:%M')}"
         )
+    elif current_times and "end time" in assistant_reply.casefold():
+        initial_times = parsed_part_times[0] if parsed_part_times else []
+        if len(initial_times) == 1 and len(current_times) == 1:
+            request_parts = [
+                time_pattern.sub(" ", part)
+                for part in request_parts[:-1]
+            ]
+            request_parts.append(
+                f"from {initial_times[0].strftime('%H:%M')} "
+                f"to {current_times[0].strftime('%H:%M')}"
+            )
+            return " ".join(request_parts)
     return " ".join(request_parts)
+
+
+def _calendar_resume_disabled_integration(
+    state: ChatState,
+) -> tuple[dict[str, Any], str] | None:
+    if not re.search(
+        r"\b(?:done|continue|try again|enabled|ready|proceed)\b",
+        state["user_message"],
+        re.IGNORECASE,
+    ):
+        return None
+
+    history = state.get("messages", [])
+    last_assistant = next(
+        (
+            item for item in reversed(history)
+            if isinstance(item, dict) and item.get("role") == "assistant"
+        ),
+        None,
+    )
+    if not isinstance(last_assistant, dict):
+        return None
+    assistant_text = str(last_assistant.get("content", ""))
+    if "Calendar is turned off" not in assistant_text and (
+        "calendar" not in assistant_text.casefold()
+        or "turned off" not in assistant_text.casefold()
+    ):
+        return None
+
+    original_request = next(
+        (
+            item.get("content")
+            for item in reversed(history)
+            if isinstance(item, dict)
+            and item.get("role") == "user"
+            and isinstance(item.get("content"), str)
+            and _calendar_event_creation_request(item["content"])
+        ),
+        None,
+    )
+    if not isinstance(original_request, str):
+        return None
+
+    calendar_capabilities = (
+        (state.get("assistant_capabilities") or {}).get("google_calendar", {})
+    )
+    integration_enabled = calendar_capabilities.get("integration_enabled", True)
+    if integration_enabled is False:
+        return {"calendar_tool": "clarify", "calendar_arguments": None}, "google_calendar"
+
+    resumed = dict(state)
+    resumed["user_message"] = original_request
+    return _deterministic_calendar_plan(resumed)
 
 
 def _calendar_pending_time_revision(
@@ -711,6 +782,12 @@ def _calendar_create_title(text: str) -> str | None:
     return title[:250].capitalize() if title else None
 
 
+def _calendar_create_description(title: str | None) -> str | None:
+    if title and title.casefold() == "gym":
+        return "Workout session"
+    return None
+
+
 def _calendar_clock_matches(text: str) -> list[datetime_time] | None:
     matches = list(re.finditer(
         r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b",
@@ -806,6 +883,44 @@ def _deterministic_calendar_plan(
         if not write_permission_granted:
             return _calendar_plan("delete_calendar_event_proposal")
         return None
+    proposal = state.get("pending_calendar_create_proposal")
+    status_request = bool(re.search(
+        r"\b(?:status|state|created|creation|exists|exist|added|successful(?:ly)?|"
+        r"actually create(?:d)?|live|actual|google calendar)\b",
+        lowered,
+    ))
+    proposal_reference = bool(re.search(
+        r"\b(?:gym|event|appointment|meeting|proposal)\b",
+        lowered,
+    ))
+    if isinstance(proposal, dict) and status_request and proposal_reference:
+        parameters = proposal.get("parameters")
+        if isinstance(parameters, dict):
+            live_check = bool(re.search(
+                r"\b(?:created in google calendar|actual calendar|exists?\b|"
+                r"live|actual(?:ly)?|google calendar|check whether|did you create|"
+                r"was .* added)\b",
+                lowered,
+            ))
+            if live_check:
+                return _calendar_plan(
+                    "verify_calendar_proposal_event",
+                    {
+                        "proposal_id": proposal.get("proposal_id"),
+                        "parameters": parameters,
+                    },
+                )
+            return _calendar_plan(
+                "get_calendar_proposal_status",
+                {
+                    "proposal_id": proposal.get("proposal_id"),
+                    "status": proposal.get("status"),
+                    "parameters": parameters,
+                    "execution_started_at": proposal.get("execution_started_at"),
+                    "completed_at": proposal.get("completed_at"),
+                    "calendar_event_id": proposal.get("calendar_event_id"),
+                },
+            )
 
     timezone = _validated_timezone(state)
     iana_match = re.search(
@@ -888,7 +1003,7 @@ def _deterministic_calendar_plan(
                     {
                         "calendar_id": "primary",
                         "summary": title,
-                        "description": None,
+                        "description": _calendar_create_description(title),
                         "start": target_date.isoformat(),
                         "end": (target_date + timedelta(days=1)).isoformat(),
                         "time_zone": None,
@@ -940,7 +1055,7 @@ def _deterministic_calendar_plan(
                     {
                         "calendar_id": "primary",
                         "summary": title,
-                        "description": None,
+                        "description": _calendar_create_description(title),
                         "start": meeting_start.isoformat(timespec="seconds"),
                         "end": meeting_end.isoformat(timespec="seconds"),
                         "time_zone": timezone,
@@ -1404,6 +1519,23 @@ def _deterministic_assistant_plan(
     text = state["user_message"].strip()
     lowered = text.casefold()
 
+    resumed_calendar = _calendar_resume_disabled_integration(state)
+    if resumed_calendar is not None:
+        return resumed_calendar
+
+    pending_calendar = state.get("pending_calendar_create_proposal")
+    if isinstance(pending_calendar, dict) and re.search(
+        r"\b(?:save(?:\s+it)?|approve(?:\s+it)?|yes(?:\s+please)?|"
+        r"confirm(?:\s+it)?|looks?\s+good)\b",
+        lowered,
+        re.IGNORECASE,
+    ):
+        plan = ApprovalWorkflowPlan(
+            intent="approval_workflow",
+            operation="approve",
+        ).model_dump(mode="json")
+        return plan, "google_calendar"
+
     if _is_explicit_memory_update_request(text):
         return (
             {"intent": "memory_update", "memory_scope": "episodic"},
@@ -1493,7 +1625,9 @@ def _deterministic_assistant_plan(
     ))
     if (
         _is_calendar_request(state["user_message"])
-        and not (mutation_request and write_permission_granted)
+        and mutation_request
+        and not _calendar_create_request(state["user_message"])
+        and not write_permission_granted
     ):
         return _calendar_plan("clarify")
     if (
@@ -1700,7 +1834,7 @@ def _is_calendar_request(user_message: str) -> bool:
         r"\b(?:show|list|find|get|open|check|what|when|do i have|"
         r"am i|are we|is there|tell me|schedule|add|create|book|"
         r"cancel|delete|remove|update|edit|change|modify|move|"
-        r"reschedule|invite|rsvp|set|put)\b",
+        r"reschedule|invite|rsvp|set|put|status|has|created|exists?)\b",
         lowered,
     ))
     return (
@@ -2205,6 +2339,47 @@ def gmail_agent_node(
             "reject": "reject",
             "execute": "execute",
         }[plan.operation]
+        pending_calendar = state.get("pending_calendar_create_proposal")
+        if isinstance(pending_calendar, dict) and operation != "execute":
+            proposal_id = pending_calendar.get("proposal_id")
+            user_id = state.get("user_id")
+            if proposal_id and user_id:
+                try:
+                    with SessionLocal() as db:
+                        service = ActionApprovalService(db)
+                        if operation == "approve":
+                            proposal = service.approve(
+                                user_id=UUID(str(user_id)),
+                                proposal_id=UUID(str(proposal_id)),
+                            )
+                        else:
+                            proposal = service.reject(
+                                user_id=UUID(str(user_id)),
+                                proposal_id=UUID(str(proposal_id)),
+                            )
+                    serialized = proposal.model_dump(mode="json")
+                    direct_response = (
+                        "The Calendar event proposal was approved. "
+                        "No Calendar mutation was executed."
+                        if operation == "approve"
+                        else "The Calendar event proposal was rejected. "
+                        "No Calendar mutation was executed."
+                    )
+                    return {
+                        **gmail_response_node(
+                            state,
+                            direct_response=direct_response,
+                        ),
+                        "calendar_approval_result": serialized,
+                    }
+                except Exception as exc:
+                    logger.warning(
+                        "Calendar chat approval failed | proposal_id=%s "
+                        "| operation=%s | error_type=%s",
+                        proposal_id,
+                        operation,
+                        type(exc).__name__,
+                    )
         return gmail_response_node(
             state,
             direct_response=(

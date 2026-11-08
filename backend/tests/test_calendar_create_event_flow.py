@@ -52,7 +52,7 @@ def _calendar_state(write_enabled: bool):
     }
 
 
-def test_calendar_create_proposal_is_not_prepared_without_write_capability(
+def test_calendar_create_proposal_is_prepared_while_execution_flag_is_disabled(
     monkeypatch,
 ):
     access_check = AsyncMock()
@@ -81,7 +81,7 @@ def test_calendar_create_proposal_is_not_prepared_without_write_capability(
         context,
     )
 
-    assert "calendar_create_event_proposal" not in result
+    assert result["calendar_create_event_proposal"] == PARAMETERS
     access_check.assert_not_awaited()
 
 
@@ -115,11 +115,7 @@ def test_calendar_create_proposal_preflights_access_and_returns_payload(
     )
 
     assert result["calendar_create_event_proposal"] == PARAMETERS
-    access_check.assert_awaited_once_with(
-        user_id=USER_ID,
-        connection_id=CONNECTION_ID,
-        calendar_id="primary",
-    )
+    access_check.assert_not_awaited()
 
 
 def test_revised_calendar_proposal_carries_superseded_proposal_id(
@@ -191,11 +187,7 @@ def test_calendar_create_proposal_is_prepared_while_execution_flag_is_disabled(
     assert "unless you approve and separately execute" in (
         result["assistant_response"]
     )
-    access_check.assert_awaited_once_with(
-        user_id=USER_ID,
-        connection_id=CONNECTION_ID,
-        calendar_id="primary",
-    )
+    access_check.assert_not_awaited()
 
 
 def test_calendar_create_without_end_time_asks_for_end_time():
@@ -216,6 +208,53 @@ def test_calendar_create_without_end_time_asks_for_end_time():
 
     assert "What end time should I use" in result["assistant_response"]
     assert "calendar_create_event_proposal" not in result
+
+
+def test_save_confirmation_approves_calendar_proposal_without_execute(monkeypatch):
+    approved = SimpleNamespace(
+        proposal_id=PROPOSAL_ID,
+        status="approved",
+        model_dump=lambda mode="json": {
+            "proposal_id": str(PROPOSAL_ID),
+            "action_type": "calendar.create_event",
+            "status": "approved",
+            "execution_available": False,
+        },
+    )
+    approval_service = SimpleNamespace(approve=Mock(return_value=approved))
+    monkeypatch.setattr(
+        calendar_node_module,
+        "ActionApprovalService",
+        lambda _db: approval_service,
+    )
+    monkeypatch.setattr(
+        calendar_node_module,
+        "SessionLocal",
+        SessionContext,
+    )
+    state = {
+        "user_id": str(USER_ID),
+        "user_message": "save it",
+        "gmail_plan": {
+            "intent": "approval_workflow",
+            "operation": "approve",
+        },
+        "pending_calendar_create_proposal": {
+            "proposal_id": str(PROPOSAL_ID),
+            "parameters": PARAMETERS,
+        },
+    }
+    context = SimpleNamespace(context={})
+
+    result = calendar_node_module.calendar_agent_node(state, context)
+
+    assert result["calendar_approval_result"]["status"] == "approved"
+    assert result["calendar_approval_result"]["execution_available"] is False
+    assert "No Calendar mutation was executed" in result["assistant_response"]
+    approval_service.approve.assert_called_once_with(
+        user_id=USER_ID,
+        proposal_id=PROPOSAL_ID,
+    )
 
 
 def test_calendar_executor_rechecks_write_access_before_claim(

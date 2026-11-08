@@ -1,4 +1,6 @@
 from datetime import date, datetime
+import logging
+from time import perf_counter
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -22,6 +24,7 @@ from app.services.calendar_service import CalendarService
 router = APIRouter(
     dependencies=[Depends(require_integration_enabled("calendar"))],
 )
+logger = logging.getLogger(__name__)
 
 
 def _get_user_id(current_user: dict) -> UUID:
@@ -123,8 +126,12 @@ async def list_calendar_events(
 ):
     """List upcoming or filtered events from an owned Google calendar."""
     response.headers["Cache-Control"] = "private, no-store"
+    started_at = perf_counter()
+    response_status = 200
+    provider_status = None
+    provider_error_category = None
     try:
-        return await CalendarService(db).list_events(
+        result = await CalendarService(db).list_events(
             user_id=_get_user_id(current_user),
             connection_id=connection_id,
             calendar_id=calendar_id,
@@ -136,10 +143,27 @@ async def list_calendar_events(
             attendee=str(attendee) if attendee else None,
             time_zone=time_zone,
         )
-    except HTTPException:
+        return result
+    except HTTPException as exc:
+        response_status = exc.status_code
         raise
-    except Exception as exc:
+    except GoogleAPIError as exc:
+        provider_status = exc.status_code
+        provider_error_category = "rate_limited" if exc.status_code == 429 else "provider_error"
+        response_status = 503 if exc.status_code in {429, 503} else 502
         _handle_calendar_error(exc)
+    except Exception as exc:
+        response_status = 500
+        _handle_calendar_error(exc)
+    finally:
+        logger.info(
+            "calendar_events_request_completed | path=/api/v1/calendar/events "
+            "| status=%s | provider_status=%s | provider_error_category=%s | duration_ms=%.2f",
+            response_status,
+            provider_status,
+            provider_error_category,
+            (perf_counter() - started_at) * 1000,
+        )
 
 
 @router.get("/events/{event_id}", response_model=CalendarEvent)

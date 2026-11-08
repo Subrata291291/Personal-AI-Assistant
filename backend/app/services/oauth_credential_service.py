@@ -1,5 +1,7 @@
 from uuid import UUID
 from typing import Any
+import asyncio
+from time import perf_counter
 
 from sqlalchemy.orm import Session
 
@@ -11,6 +13,7 @@ from app.repositories.oauth_credential_repository import (
 from datetime import datetime, timedelta, timezone
 
 from app.integrations.google.oauth_client import GoogleOAuthClient
+from app.core.request_metrics import record_timing
 
 class OAuthCredentialService:
     """
@@ -259,10 +262,16 @@ class OAuthCredentialService:
 
         The caller owns transaction management.
         """
+        _refresh_locks: dict[str, asyncio.Lock] = {}
 
-        credential = self.repository.get_by_connection_for_update(
+        lookup_started_at = perf_counter()
+        credential = self.repository.get_by_connection(
             user_id=user_id,
             connection_id=connection_id,
+        )
+        record_timing(
+            "credential_lookup",
+            (perf_counter() - lookup_started_at) * 1000,
         )
 
         if credential is None:
@@ -303,33 +312,112 @@ class OAuthCredentialService:
         if not refresh_token:
             raise GoogleOAuthAuthorizationError()
 
-        oauth_client = GoogleOAuthClient()
-
-        token_data = await oauth_client.refresh_access_token(
-            refresh_token=refresh_token,
+        refresh_key = f"{user_id}:{connection_id}"
+        refresh_lock = self._refresh_locks.setdefault(
+            refresh_key,
+            asyncio.Lock(),
         )
 
-        new_access_token = token_data["access_token"]
+        async with refresh_lock:
+            lookup_started_at = perf_counter()
+            credential = self.repository.get_by_connection(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            record_timing(
+                "credential_lookup",
+                (perf_counter() - lookup_started_at) * 1000,
+            )
+            if credential is None:
+                raise ValueError("OAuth credentials not found.")
 
-        new_expires_at = now + timedelta(
-            seconds=token_data["expires_in"]
-        )
-
-        updated_credentials = self.update_credentials(
-            user_id=user_id,
-            connection_id=connection_id,
-            access_token=new_access_token,
-            refresh_token=token_data.get("refresh_token"),
-            token_type=token_data.get(
-                "token_type",
-                credential.token_type,
-            ),
-            expires_at=new_expires_at,
-        )
-
-        if updated_credentials is None:
-            raise RuntimeError(
-                "Unable to persist refreshed Google credentials."
+            access_token = decrypt_data(
+                credential.access_token_encrypted
+            )
+            refresh_token = (
+                decrypt_data(credential.refresh_token_encrypted)
+                if credential.refresh_token_encrypted
+                else None
+            )
+            now = datetime.now(timezone.utc)
+            refresh_threshold = now + timedelta(minutes=5)
+            token_is_valid = (
+                credential.expires_at is not None
+                and credential.expires_at > refresh_threshold
             )
 
-        return new_access_token
+            if rejected_access_token is not None:
+                if (
+                    access_token != rejected_access_token
+                    and token_is_valid
+                ):
+                    return access_token
+            elif token_is_valid:
+                return access_token
+
+            if not refresh_token:
+                raise GoogleOAuthAuthorizationError()
+
+            oauth_client = GoogleOAuthClient()
+            refresh_started_at = perf_counter()
+            try:
+                token_data = await oauth_client.refresh_access_token(
+                    refresh_token=refresh_token,
+                )
+            finally:
+                record_timing(
+                    "google_oauth_api",
+                    (perf_counter() - refresh_started_at) * 1000,
+                )
+
+            new_access_token = token_data["access_token"]
+            new_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=token_data["expires_in"]
+            )
+
+            locked_lookup_started_at = perf_counter()
+            locked_credential = (
+                self.repository.get_by_connection_for_update(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                )
+            )
+            record_timing(
+                "connection_lock_acquisition",
+                (perf_counter() - locked_lookup_started_at) * 1000,
+            )
+            if locked_credential is None:
+                raise RuntimeError(
+                    "Unable to persist refreshed Google credentials."
+                )
+
+            current_access_token = decrypt_data(
+                locked_credential.access_token_encrypted
+            )
+            if current_access_token != access_token:
+                current_is_valid = (
+                    locked_credential.expires_at is not None
+                    and locked_credential.expires_at
+                    > datetime.now(timezone.utc) + timedelta(minutes=5)
+                )
+                if current_is_valid:
+                    return current_access_token
+
+            updated_credentials = self.update_credentials(
+                user_id=user_id,
+                connection_id=connection_id,
+                access_token=new_access_token,
+                refresh_token=token_data.get("refresh_token"),
+                token_type=token_data.get(
+                    "token_type",
+                    locked_credential.token_type,
+                ),
+                expires_at=new_expires_at,
+            )
+
+            if updated_credentials is None:
+                raise RuntimeError(
+                    "Unable to persist refreshed Google credentials."
+                )
+
+            return new_access_token

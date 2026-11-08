@@ -20,6 +20,16 @@ import { calendarService } from '../services/calendarService.js'
 const EMPTY_CONNECTIONS = []
 const CONNECTIONS_QUERY_KEY = (userId) => ['oauth-connections', userId]
 const DAY_MINUTES = 24 * 60
+export function isCalendarRequestCancellation(error) {
+  return (
+    error?.code === 'REQUEST_CANCELLED' ||
+    (
+      error?.name === 'AbortError' &&
+      !error?.timeout &&
+      !error?.networkFailure
+    )
+  )
+}
 const CALENDAR_STATE_KEY = (userId, key) =>
   `calendar-workspace-${key}-${userId}`
 const HTML_DESCRIPTION_TAG = /<\/?[a-z][^>]*>/i
@@ -764,8 +774,8 @@ export default function Calendar() {
 
   const connectionsQuery = useQuery({
     queryKey: CONNECTIONS_QUERY_KEY(userId),
-    queryFn: async () => requireConnectionsResponse(
-      await api.get('/api/v1/oauth/connections'),
+    queryFn: async ({ signal }) => requireConnectionsResponse(
+      await api.get('/api/v1/oauth/connections', { signal }),
     ),
     enabled: Boolean(userId),
     staleTime: GOOGLE_CONNECTIONS_STALE_TIME,
@@ -821,9 +831,10 @@ export default function Calendar() {
       enabled
     ),
     initialPageParam: undefined,
-    queryFn: ({ pageParam }) => calendarService.listCalendars({
+    queryFn: ({ pageParam, signal }) => calendarService.listCalendars({
       connectionId: selectedConnectionId,
       pageToken: pageParam,
+      signal,
     }),
     getNextPageParam: (lastPage) =>
       lastPage.next_page_token || undefined,
@@ -913,7 +924,7 @@ export default function Calendar() {
     refetchOnWindowFocus: true,
     retry: false,
     initialPageParam: undefined,
-    queryFn: ({ pageParam }) => calendarService.listEvents({
+    queryFn: ({ pageParam, signal }) => calendarService.listEvents({
       connectionId: selectedConnectionId,
       timeMin: startOfLocalDateToIso(range.start, timeZone),
       timeMax: startOfLocalDateToIso(range.end, timeZone),
@@ -921,16 +932,18 @@ export default function Calendar() {
       timeZone,
       calendarId: selectedCalendarId,
       pageToken: pageParam,
+      signal,
     }),
     getNextPageParam: (lastPage) =>
       lastPage.next_page_token || undefined,
   })
   const eventQuery = useQuery({
     queryKey: ['calendar-event', userId, selectedConnectionId, eventId],
-    queryFn: () => calendarService.getEvent({
+    queryFn: ({ signal }) => calendarService.getEvent({
       connectionId: selectedConnectionId,
       eventId,
       calendarId: selectedCalendarId,
+      signal,
     }),
     enabled: Boolean(
       selectedConnectionId &&
@@ -1493,9 +1506,24 @@ export default function Calendar() {
                   )}
                   {selectedConnection.capabilities?.calendar_events_read === true &&
                     eventsQuery.isError && !eventsQuery.data && (
-                    <p role="alert" className="rounded-xl border border-red-500/30 p-4 text-sm text-red-400">
-                      Live Calendar data could not be retrieved. {eventsQuery.error.message}
-                    </p>
+                    isCalendarRequestCancellation(eventsQuery.error)
+                      ? (
+                        <p role="status" className={`py-4 text-center text-sm ${text}`}>
+                          Loading Calendar events for the selected range…
+                        </p>
+                      )
+                      : (
+                        <div role="alert" className="rounded-xl border border-red-500/30 p-4 text-sm text-red-400">
+                          <p>Live Calendar data could not be retrieved. {eventsQuery.error.message}</p>
+                          <button
+                            type="button"
+                            onClick={() => eventsQuery.refetch()}
+                            className="mt-3 font-semibold underline"
+                          >
+                            Retry
+                          </button>
+                        </div>
+                      )
                   )}
                   {selectedConnection.capabilities?.calendar_events_read === true &&
                     eventsQuery.data && !eventId && events.length === 0 && (

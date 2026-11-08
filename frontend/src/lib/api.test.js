@@ -21,11 +21,12 @@ import { supabase } from './supabase.js'
 let api
 let notifyApiAuthChange
 let getApiAuthRevision
+let isApiCancellationError
 
 beforeAll(async () => {
   vi.stubEnv('VITE_API_BASE_URL', 'https://api.example.test')
   vi.stubEnv('VITE_API_REQUEST_TIMEOUT_MS', '1000')
-  ;({ api, notifyApiAuthChange, getApiAuthRevision } =
+  ;({ api, notifyApiAuthChange, getApiAuthRevision, isApiCancellationError } =
     await import('./api.js'))
 })
 
@@ -267,6 +268,33 @@ describe('API request handling', () => {
     await assertion
 
     expect(requestOptions.signal.aborted).toBe(true)
+  })
+
+  it('classifies caller cancellation separately from a provider failure', async () => {
+    const caller = new AbortController()
+    vi.stubGlobal('fetch', vi.fn((_url, options) => {
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          reject(options.signal.reason)
+        }, { once: true })
+      })
+    }))
+
+    const request = api.get('/api/v1/calendar/events', { signal: caller.signal })
+    caller.abort()
+
+    let cancellationError
+    try {
+      await request
+    } catch (error) {
+      cancellationError = error
+    }
+    expect(cancellationError).toMatchObject({
+      code: 'REQUEST_CANCELLED',
+      networkFailure: false,
+      cancellationSource: 'caller',
+    })
+    expect(isApiCancellationError(cancellationError)).toBe(true)
   })
 
   it.each([401, 403, 404, 500])(

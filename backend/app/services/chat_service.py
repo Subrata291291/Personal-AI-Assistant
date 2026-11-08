@@ -188,7 +188,7 @@ class ChatService:
                 continue
             if (
                 proposal.get("action_type") != "calendar.create_event"
-                or proposal.get("status") != "pending"
+                or proposal.get("status") not in {"pending", "approved"}
                 or proposal.get("user_id") != str(user_id)
                 or proposal.get("conversation_id") != str(conversation_id)
             ):
@@ -643,6 +643,7 @@ class ChatService:
             )
             calendar_capabilities = {
                 **calendar_access["capabilities"],
+                "integration_enabled": calendar_enabled,
                 "events_read": bool(
                     event_read_connection_id
                 ),
@@ -955,6 +956,17 @@ class ChatService:
                         assistant_metadata["response_completion"] = (
                             result["response_metadata"]
                         )
+                    if isinstance(
+                        result.get("calendar_approval_result"),
+                        dict,
+                    ):
+                        assistant_metadata["action_approval"] = (
+                            result["calendar_approval_result"]
+                        )
+                    if isinstance(result.get("calendar_events"), list):
+                        assistant_metadata["calendar_events"] = (
+                            result["calendar_events"]
+                        )
                     assistant_message = (
                         self.message_service.create_request_message(
                             conversation_id=conversation_id,
@@ -992,6 +1004,10 @@ class ChatService:
                     write_connection_id = calendar_access.get(
                         "write_connection_id"
                     )
+                    if not write_connection_id:
+                        write_connection_id = calendar_access.get(
+                            "event_connection_id"
+                        )
                     if (
                         not isinstance(calendar_action, dict)
                         or not write_connection_id

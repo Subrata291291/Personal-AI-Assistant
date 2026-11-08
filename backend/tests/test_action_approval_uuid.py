@@ -209,7 +209,7 @@ def test_chat_service_exposes_only_current_users_pending_calendar_proposal():
         user_id=user_id,
         conversation_id=conversation_id,
         now=datetime.now(timezone.utc),
-    ) is None
+    ) == proposal
 
 
 def test_calendar_create_proposal_persists_gym_with_timezone_and_ownership(

@@ -1,4 +1,5 @@
 import re
+from time import perf_counter
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
@@ -17,6 +18,7 @@ from app.repositories.oauth_credential_repository import (
 from app.repositories.user_connection_repository import (
     UserConnectionRepository,
 )
+from app.core.request_metrics import record_timing
 
 
 class CalendarService:
@@ -158,6 +160,7 @@ class CalendarService:
                 method="GET",
                 url=f"{self.CALENDAR_API_BASE}/{endpoint}",
                 params=params,
+                allow_concurrent_read=True,
             )
         finally:
             api_db.close()
@@ -177,6 +180,7 @@ class CalendarService:
                 method="POST",
                 url=f"{self.CALENDAR_API_BASE}/freeBusy",
                 json_data=body,
+                allow_concurrent_read=True,
             )
         finally:
             api_db.close()
@@ -318,6 +322,7 @@ class CalendarService:
         attendee: str | None = None,
         time_zone: str | None = None,
     ) -> dict[str, Any]:
+        service_started_at = perf_counter()
         self._validate_connection(
             user_id,
             connection_id,
@@ -426,6 +431,10 @@ class CalendarService:
                     for item in event["attendees"]
                 )
             ]
+        record_timing(
+            "calendar_service",
+            (perf_counter() - service_started_at) * 1000,
+        )
         return {
             "calendar_id": calendar_id,
             "events": events,
@@ -465,6 +474,7 @@ class CalendarService:
         max_results: int = 100,
         page_token: str | None = None,
     ) -> dict[str, Any]:
+        service_started_at = perf_counter()
         self._validate_connection(
             user_id,
             connection_id,
@@ -562,6 +572,10 @@ class CalendarService:
                 "access_role": access_role,
                 "time_zone": time_zone,
             })
+        record_timing(
+            "calendar_service",
+            (perf_counter() - service_started_at) * 1000,
+        )
         return {
             "calendars": calendars,
             "next_page_token": next_page_token,

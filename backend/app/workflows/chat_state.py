@@ -67,6 +67,8 @@ class ChatState(TypedDict):
 
     response_metadata: NotRequired[dict[str, Any]]
 
+    calendar_events: NotRequired[list[dict[str, Any]]]
+
     # Persistent memory fields
     retrieved_memories: NotRequired[list[dict[str, Any]]]
 

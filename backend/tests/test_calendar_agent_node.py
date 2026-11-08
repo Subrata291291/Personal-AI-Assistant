@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
+import pytest
+
 from app.workflows import calendar_agent_node
 from app.workflows.calendar_agent_node import calendar_agent_node as run_node
 from app.workflows.chat_graph import chat_graph
@@ -696,7 +698,7 @@ def test_calendar_create_without_write_permission_is_not_prepared(
         ),
     )
 
-    assert "write permission" in result["assistant_response"].casefold()
+    assert "write permission" not in result["assistant_response"].casefold()
     assert "nothing was created" in result["assistant_response"].casefold()
     assert "calendar_create_event_proposal" not in result
     factory.assert_not_called()
@@ -897,6 +899,230 @@ def test_calendar_write_consent_is_requested_only_for_selected_account():
         result["assistant_response"].casefold()
     )
     assert "nothing was changed" in result["assistant_response"].casefold()
+
+
+def test_chat_graph_routes_approved_gym_status_question_without_provider_read(monkeypatch):
+    proposal_id = uuid4()
+    provider_read = AsyncMock(return_value={"events": []})
+    monkeypatch.setattr(calendar_agent_node.CalendarService, "list_events", provider_read)
+    result = chat_graph.invoke(
+        {
+            "user_id": USER_ID,
+            "conversation_id": str(uuid4()),
+            "user_message": "What is the status of my gym event?",
+            "user_timezone": "Asia/Kolkata",
+            "assistant_response": "",
+            "provider": "",
+            "model": "",
+            "messages": [],
+            "pending_calendar_create_proposal": {
+                "proposal_id": str(proposal_id),
+                "status": "approved",
+                "parameters": {
+                    "summary": "Gym",
+                    "start": "2026-11-09T10:00:00+05:30",
+                    "end": "2026-11-09T11:00:00+05:30",
+                    "time_zone": "Asia/Kolkata",
+                },
+            },
+            "assistant_capabilities": {
+                "google_calendar": {
+                    "calendar_enabled": True,
+                    "create_execution_available": False,
+                },
+            },
+        },
+        config={"configurable": {"thread_id": str(uuid4())}},
+        context={
+            "user_id": USER_ID,
+            "gmail_connection_id": None,
+            "user_timezone": "Asia/Kolkata",
+            "calendar_event_connection_id": EVENT_CONNECTION_ID,
+            "calendar_freebusy_connection_id": None,
+            "google_connection_available": True,
+            "calendar_enabled": True,
+        },
+    )
+
+    assert result["assistant_route"] == "google_calendar"
+    assert result["gmail_plan"]["calendar_tool"] == "get_calendar_proposal_status"
+    assert "Approval = Approved" in result["assistant_response"]
+    assert "Execution = Disabled" in result["assistant_response"]
+    assert "Execution attempted = No" in result["assistant_response"]
+    assert "Provider confirmation = None" in result["assistant_response"]
+    assert "couldn't determine" not in result["assistant_response"].casefold()
+    provider_read.assert_not_awaited()
+
+
+def test_chat_graph_routes_gym_live_verification_without_clarification(monkeypatch):
+    proposal_id = uuid4()
+    provider_read = AsyncMock(return_value={"events": []})
+    monkeypatch.setattr(
+        calendar_agent_node.CalendarService,
+        "list_events",
+        provider_read,
+    )
+    result = chat_graph.invoke(
+        {
+            "user_id": USER_ID,
+            "conversation_id": str(uuid4()),
+            "user_message": (
+                "Has my gym event been created in Google Calendar? "
+                "Check the actual calendar, not just the approval record."
+            ),
+            "user_timezone": "Asia/Kolkata",
+            "assistant_response": "",
+            "provider": "",
+            "model": "",
+            "messages": [],
+            "pending_calendar_create_proposal": {
+                "proposal_id": str(proposal_id),
+                "status": "approved",
+                "parameters": {
+                    "summary": "Gym",
+                    "start": "2026-11-09T10:00:00+05:30",
+                    "end": "2026-11-09T11:00:00+05:30",
+                    "time_zone": "Asia/Kolkata",
+                },
+            },
+            "assistant_capabilities": {
+                "google_calendar": {
+                    "calendar_enabled": True,
+                    "create_execution_available": False,
+                },
+            },
+        },
+        config={"configurable": {"thread_id": str(uuid4())}},
+        context={
+            "user_id": USER_ID,
+            "gmail_connection_id": None,
+            "user_timezone": "Asia/Kolkata",
+            "calendar_event_connection_id": EVENT_CONNECTION_ID,
+            "calendar_freebusy_connection_id": None,
+            "google_connection_available": True,
+            "calendar_enabled": True,
+        },
+    )
+
+    assert result["assistant_route"] == "google_calendar"
+    assert result["gmail_plan"]["calendar_tool"] == "verify_calendar_proposal_event"
+    assert result["gmail_plan"]["calendar_arguments"]["parameters"]["summary"] == "Gym"
+    provider_read.assert_awaited_once()
+    provider_args = provider_read.await_args.kwargs
+    assert provider_args["calendar_id"] == "primary"
+    assert provider_args["query"] == "Gym"
+    assert str(provider_args["time_min"].isoformat()) == "2026-11-09T10:00:00+05:30"
+    assert str(provider_args["time_max"].isoformat()) == "2026-11-09T11:00:00+05:30"
+    assert "No matching Gym event" in result["assistant_response"]
+    assert "couldn't determine" not in result["assistant_response"].casefold()
+
+
+@pytest.mark.parametrize(
+    ("provider_events", "expected_text"),
+    [
+        (
+            [{
+                "summary": "Gym",
+                "start": {"date_time": "2026-11-09T10:00:00+05:30", "date": None},
+                "end": {"date_time": "2026-11-09T11:00:00+05:30", "date": None},
+            }],
+            "Event found in Google Calendar",
+        ),
+        (
+            [{
+                "summary": "Gym",
+                "start": {"date_time": "2026-11-09T12:00:00+05:30", "date": None},
+                "end": {"date_time": "2026-11-09T13:00:00+05:30", "date": None},
+            }],
+            "title, start time, or end time differs",
+        ),
+    ],
+)
+def test_calendar_proposal_verification_compares_provider_details(
+    monkeypatch,
+    provider_events,
+    expected_text,
+):
+    monkeypatch.setattr(
+        calendar_agent_node.CalendarService,
+        "list_events",
+        AsyncMock(return_value={"events": provider_events}),
+    )
+    state = {
+        "user_id": USER_ID,
+        "conversation_id": str(uuid4()),
+        "user_message": "Check whether my Gym event exists in my calendar.",
+        "gmail_plan": {
+            "intent": "google_calendar",
+            "calendar_tool": "verify_calendar_proposal_event",
+            "calendar_arguments": {
+                "proposal_id": str(uuid4()),
+                "parameters": {
+                    "summary": "Gym",
+                    "start": "2026-11-09T10:00:00+05:30",
+                    "end": "2026-11-09T11:00:00+05:30",
+                    "time_zone": "Asia/Kolkata",
+                    "calendar_id": "primary",
+                },
+            },
+        },
+        "assistant_response": "",
+        "provider": "",
+        "model": "",
+        "messages": [],
+    }
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_enabled=True,
+            google_connection_available=True,
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+        ),
+    )
+    assert expected_text in result["assistant_response"]
+
+
+def test_calendar_proposal_verification_provider_failure_is_actionable(monkeypatch):
+    monkeypatch.setattr(
+        calendar_agent_node.CalendarService,
+        "list_events",
+        AsyncMock(side_effect=RuntimeError("provider read failed")),
+    )
+    state = {
+        "user_id": USER_ID,
+        "conversation_id": str(uuid4()),
+        "user_message": "Has my gym event been added?",
+        "gmail_plan": {
+            "intent": "google_calendar",
+            "calendar_tool": "verify_calendar_proposal_event",
+            "calendar_arguments": {
+                "proposal_id": str(uuid4()),
+                "parameters": {
+                    "summary": "Gym",
+                    "start": "2026-11-09T10:00:00+05:30",
+                    "end": "2026-11-09T11:00:00+05:30",
+                    "time_zone": "Asia/Kolkata",
+                    "calendar_id": "primary",
+                },
+            },
+        },
+        "assistant_response": "",
+        "provider": "",
+        "model": "",
+        "messages": [],
+    }
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_enabled=True,
+            google_connection_available=True,
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+        ),
+    )
+    assert "Live verification unavailable" in result["assistant_response"]
+    assert "could not be queried" in result["assistant_response"]
 
 
 def test_chat_graph_routes_upcoming_events_to_calendar_tool(monkeypatch):

@@ -15,7 +15,7 @@ function requireConnectionId(connectionId) {
 }
 
 export const calendarService = {
-  async listCalendars({ connectionId, maxResults = 100, pageToken }) {
+  async listCalendars({ connectionId, maxResults = 100, pageToken, signal }) {
     requireConnectionId(connectionId)
     const params = new URLSearchParams({
       connection_id: connectionId,
@@ -23,7 +23,9 @@ export const calendarService = {
     })
     if (pageToken) params.set('page_token', pageToken)
     return requireCalendarListResponse(
-      await api.get(`${BASE_PATH}/calendars?${params}`),
+      signal
+        ? await api.get(`${BASE_PATH}/calendars?${params}`, { signal })
+        : await api.get(`${BASE_PATH}/calendars?${params}`),
     )
   },
 
@@ -69,6 +71,7 @@ export const calendarService = {
     timeZone,
     calendarId = 'primary',
     pageToken,
+    signal,
   }) {
     requireConnectionId(connectionId)
     const params = new URLSearchParams({
@@ -82,11 +85,11 @@ export const calendarService = {
     if (timeZone) params.set('time_zone', timeZone)
     if (pageToken) params.set('page_token', pageToken)
     return requireCalendarEventListResponse(
-      await api.get(`${BASE_PATH}/events?${params}`),
+      await api.get(`${BASE_PATH}/events?${params}`, { signal }),
     )
   },
 
-  async getEvent({ connectionId, eventId, calendarId = 'primary' }) {
+  async getEvent({ connectionId, eventId, calendarId = 'primary', signal }) {
     requireConnectionId(connectionId)
     if (!eventId) throw new Error('A Calendar event is required.')
     const params = new URLSearchParams({
@@ -95,6 +98,7 @@ export const calendarService = {
     })
     const response = await api.get(
       `${BASE_PATH}/events/${encodeURIComponent(eventId)}?${params}`,
+      signal ? { signal } : undefined,
     )
     return requireCalendarEventListResponse({
       calendar_id: calendarId,

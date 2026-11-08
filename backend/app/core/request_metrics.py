@@ -8,8 +8,18 @@ class RequestMetrics:
     auth_duration_ms: float = 0
     db_duration_ms: float = 0
     db_query_count: int = 0
+    connection_lock_duration_ms: float = 0
+    connection_lock_count: int = 0
+    credential_lookup_duration_ms: float = 0
+    credential_lookup_count: int = 0
+    google_calendar_api_duration_ms: float = 0
+    google_calendar_api_call_count: int = 0
     gmail_api_duration_ms: float = 0
     gmail_api_call_count: int = 0
+    google_oauth_duration_ms: float = 0
+    google_oauth_call_count: int = 0
+    retry_backoff_duration_ms: float = 0
+    retry_backoff_count: int = 0
     llm_duration_ms: float = 0
     llm_call_count: int = 0
     llm_provider_duration_ms: float = 0
@@ -35,9 +45,24 @@ def record_timing(stage: str, duration_ms: float) -> None:
     elif stage == "database":
         metrics.db_duration_ms += duration_ms
         metrics.db_query_count += 1
+    elif stage == "google_calendar_api":
+        metrics.google_calendar_api_duration_ms += duration_ms
+        metrics.google_calendar_api_call_count += 1
     elif stage == "gmail_api":
         metrics.gmail_api_duration_ms += duration_ms
         metrics.gmail_api_call_count += 1
+    elif stage == "google_oauth_api":
+        metrics.google_oauth_duration_ms += duration_ms
+        metrics.google_oauth_call_count += 1
+    elif stage == "connection_lock_acquisition":
+        metrics.connection_lock_duration_ms += duration_ms
+        metrics.connection_lock_count += 1
+    elif stage == "credential_lookup":
+        metrics.credential_lookup_duration_ms += duration_ms
+        metrics.credential_lookup_count += 1
+    elif stage == "retry_backoff":
+        metrics.retry_backoff_duration_ms += duration_ms
+        metrics.retry_backoff_count += 1
     elif stage == "llm":
         metrics.llm_duration_ms += duration_ms
         metrics.llm_call_count += 1

@@ -71,7 +71,12 @@ async def request_metrics_middleware(request: Request, call_next):
             "http_request_completed | request_id=%s | method=%s "
             "| route=%s | status=%s | duration_ms=%.2f | "
             "auth_ms=%.2f | db_queries=%s | db_ms=%.2f | "
+            "google_calendar_api_calls=%s | google_calendar_api_ms=%.2f | "
             "gmail_api_calls=%s | gmail_api_ms=%.2f | "
+            "google_oauth_calls=%s | google_oauth_ms=%.2f | "
+            "connection_lock_acquisitions=%s | connection_lock_ms=%.2f | "
+            "credential_lookups=%s | credential_lookup_ms=%.2f | "
+            "retry_backoff_ms=%.2f | "
             "llm_calls=%s | llm_ms=%.2f | llm_provider_calls=%s "
             "| llm_provider_ms=%.2f | embedding_calls=%s | "
             "embedding_ms=%.2f | graph_nodes_ms=%s",
@@ -83,8 +88,17 @@ async def request_metrics_middleware(request: Request, call_next):
             metrics.auth_duration_ms,
             metrics.db_query_count,
             metrics.db_duration_ms,
+            metrics.google_calendar_api_call_count,
+            metrics.google_calendar_api_duration_ms,
             metrics.gmail_api_call_count,
             metrics.gmail_api_duration_ms,
+            metrics.google_oauth_call_count,
+            metrics.google_oauth_duration_ms,
+            metrics.connection_lock_count,
+            metrics.connection_lock_duration_ms,
+            metrics.credential_lookup_count,
+            metrics.credential_lookup_duration_ms,
+            metrics.retry_backoff_duration_ms,
             metrics.llm_call_count,
             metrics.llm_duration_ms,
             metrics.llm_provider_call_count,

@@ -64,6 +64,7 @@ def test_disconnected_connection_cannot_refresh_a_cached_access_token(
 ):
     credential_service = OAuthCredentialService(db=None)
     credential_service.repository = Mock()
+    credential_service.repository.get_by_connection.return_value = None
     credential_service.repository.get_by_connection_for_update.return_value = None
     refresh = AsyncMock()
     monkeypatch.setattr(

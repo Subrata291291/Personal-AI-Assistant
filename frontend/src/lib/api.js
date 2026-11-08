@@ -67,6 +67,17 @@ function authSessionChangedError() {
   return error
 }
 
+export function isApiCancellationError(error) {
+  return (
+    error?.code === 'REQUEST_CANCELLED' ||
+    (
+      error?.name === 'AbortError' &&
+      !error?.timeout &&
+      !error?.networkFailure
+    )
+  )
+}
+
 async function readResponseBody(response, requestId, timeoutOptions) {
   const contentType = response.headers.get('content-type') || ''
   let responseText
@@ -127,6 +138,7 @@ async function readResponseBody(response, requestId, timeoutOptions) {
 
 async function request(path, options = {}) {
   const startedAt = performance.now()
+  const startedTimestamp = new Date().toISOString()
   const requestId = globalThis.crypto?.randomUUID?.() || ''
   const deadline = Date.now() + API_REQUEST_TIMEOUT_MS
   const controller = new AbortController()
@@ -143,17 +155,37 @@ async function request(path, options = {}) {
   activeRequests.add(activeRequest)
   let authDurationMs = 0
   let status = 'not_sent'
+  let abortSource = null
   let fetchStarted = false
   let phase = 'session'
   const {
     responseType,
     authContext,
+    signal: callerSignal,
     ...fetchOptions
   } = options
+  const abortFromCaller = () => {
+    abortSource = 'caller'
+    const reason = callerSignal?.reason
+    if (reason instanceof DOMException) {
+      controller.abort(reason)
+    } else {
+      controller.abort(
+        typeof DOMException === 'function'
+          ? new DOMException('The request was cancelled.', 'AbortError')
+          : reason,
+      )
+    }
+  }
+  callerSignal?.addEventListener('abort', abortFromCaller, { once: true })
   const remainingTimeout = () =>
     Math.max(0, deadline - Date.now())
 
   try {
+    if (callerSignal?.aborted) {
+      abortSource = 'caller'
+      throw new DOMException('The request was aborted.', 'AbortError')
+    }
     if (
       authContext &&
       (
@@ -236,7 +268,14 @@ async function request(path, options = {}) {
         timeoutMs: remainingTimeout(),
         message: 'The API request timed out. Please try again.',
         getPhase: () => phase,
-        onTimeout: () => controller.abort(),
+        onTimeout: () => {
+          abortSource = 'timeout'
+          controller.abort(
+            typeof DOMException === 'function'
+              ? new DOMException('The API request timed out.', 'TimeoutError')
+              : undefined,
+          )
+        },
       },
     )
     status = response.status
@@ -253,7 +292,14 @@ async function request(path, options = {}) {
           timeoutMs: remainingTimeout(),
           message: 'The API request timed out. Please try again.',
           getPhase: () => phase,
-          onTimeout: () => controller.abort(),
+          onTimeout: () => {
+            abortSource = 'timeout'
+            controller.abort(
+              typeof DOMException === 'function'
+                ? new DOMException('The API request timed out.', 'TimeoutError')
+                : undefined,
+            )
+          },
         })
       } catch (error) {
         if (error?.timeout) error.status = response.status
@@ -265,7 +311,14 @@ async function request(path, options = {}) {
       timeoutMs: remainingTimeout(),
       message: 'The API request timed out. Please try again.',
       getPhase: () => phase,
-      onTimeout: () => controller.abort(),
+      onTimeout: () => {
+        abortSource = 'timeout'
+        controller.abort(
+          typeof DOMException === 'function'
+            ? new DOMException('The API request timed out.', 'TimeoutError')
+            : undefined,
+        )
+      },
     }
     let responseData
 
@@ -297,7 +350,12 @@ async function request(path, options = {}) {
 
     return responseData
   } catch (error) {
-    if (error?.timeout) {
+    if (
+      callerSignal?.aborted &&
+      (error?.name === 'AbortError' || controller.signal.aborted)
+    ) {
+      status = 'cancelled'
+    } else if (error?.timeout) {
       status = 'timeout'
     } else if (activeRequest.authChanged) {
       status = 'auth_changed'
@@ -330,14 +388,27 @@ async function request(path, options = {}) {
       requestError.code = 'AUTH_SESSION_CHANGED'
       requestError.networkFailure = false
     }
+    if (status === 'cancelled') {
+      requestError.code = 'REQUEST_CANCELLED'
+      requestError.cancellationSource = 'caller'
+      requestError.networkFailure = false
+      if (!(requestError.name === 'AbortError')) {
+        requestError.name = 'AbortError'
+      }
+    }
     throw requestError
   } finally {
+    callerSignal?.removeEventListener('abort', abortFromCaller)
     activeRequests.delete(activeRequest)
     console.info('api_request_completed', {
       requestId: requestId || null,
       method: fetchOptions.method || 'GET',
+      path: String(path).split('?')[0],
       status,
       phase,
+      abortSource,
+      startedAt: startedTimestamp,
+      completedAt: new Date().toISOString(),
       authDurationMs: Number(authDurationMs.toFixed(2)),
       durationMs: Number((performance.now() - startedAt).toFixed(2)),
     })
@@ -345,9 +416,10 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  get(path) {
+  get(path, options = {}) {
     return request(path, {
       method: 'GET',
+      ...options,
     })
   },
 

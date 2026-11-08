@@ -244,6 +244,7 @@ describe('Calendar workspace', () => {
     expect(calendarService.listCalendars).toHaveBeenCalledWith({
       connectionId: 'calendar-account',
       pageToken: undefined,
+      signal: expect.any(AbortSignal),
     })
   })
 
@@ -348,6 +349,7 @@ describe('Calendar workspace', () => {
     expect(calendarService.listCalendars).toHaveBeenLastCalledWith({
       connectionId: 'calendar-account',
       pageToken: 'calendar-page-2',
+      signal: expect.any(AbortSignal),
     })
     fireEvent.change(screen.getByRole('combobox', {
       name: 'Google Calendar',
@@ -720,6 +722,26 @@ describe('Calendar workspace', () => {
       .not.toBeInTheDocument()
   })
 
+  it('changes the weekly range to include November 9, 2026', async () => {
+    vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
+    renderCalendar()
+
+    await screen.findByRole('heading', { name: 'Google Calendar' })
+    fireEvent.change(screen.getByLabelText('Calendar date'), {
+      target: { value: '2026-11-09' },
+    })
+
+    await waitFor(() => {
+      const rangeCalls = calendarService.listEvents.mock.calls.filter(
+        ([options]) => options.timeMin === '2026-11-08T18:30:00.000Z',
+      )
+      expect(rangeCalls.length).toBeGreaterThan(0)
+      const latest = rangeCalls.at(-1)?.[0]
+      expect(latest.timeMin).toBe('2026-11-08T18:30:00.000Z')
+      expect(latest.timeMax).toBe('2026-11-15T18:30:00.000Z')
+    })
+  })
+
   it('renders provider event details and all-day events without shifting dates', async () => {
     const event = {
       id: 'event-1',
@@ -853,6 +875,7 @@ describe('Calendar workspace', () => {
       connectionId: 'calendar-account',
       eventId: event.id,
       calendarId: 'primary',
+      signal: expect.any(AbortSignal),
     })
   })
 

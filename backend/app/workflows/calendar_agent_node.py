@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import re
-from datetime import date, datetime, time, timedelta, timezone
+from html.parser import HTMLParser
+from urllib.parse import urlsplit
+from datetime import date, datetime, time, timedelta, timezone, UTC
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -17,6 +19,7 @@ from app.schemas.calendar_approval import (
     CalendarUpdateEventParameters,
 )
 from app.services.calendar_service import CalendarService
+from app.services.action_approval_service import ActionApprovalService
 from app.workflows.calendar_tools import create_calendar_tools
 from app.workflows.chat_state import ChatContext, ChatState
 
@@ -268,6 +271,188 @@ def _format_event_time(
     return local.strftime("%Y-%m-%d %I:%M %p %Z")
 
 
+class _CalendarDescriptionParser(HTMLParser):
+    _HIDDEN_TAGS = {"script", "style", "template", "noscript"}
+    _BLOCK_TAGS = {
+        "address", "article", "aside", "blockquote", "div", "footer",
+        "h1", "h2", "h3", "h4", "h5", "h6", "header", "li", "ol",
+        "p", "pre", "section", "table", "tr", "ul",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.links: list[str] = []
+        self.hidden_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.casefold()
+        if tag in self._HIDDEN_TAGS:
+            self.hidden_depth += 1
+            return
+        if self.hidden_depth:
+            return
+        if tag == "br":
+            self.parts.append("\n")
+        elif tag in self._BLOCK_TAGS:
+            self._append_break()
+        elif tag == "li":
+            self.parts.append("• ")
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if isinstance(href, str):
+                link = href.strip()
+                if self._safe_link(link) and link not in self.links:
+                    self.links.append(link)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if tag in self._HIDDEN_TAGS:
+            if self.hidden_depth:
+                self.hidden_depth -= 1
+            return
+        if self.hidden_depth:
+            return
+        if tag in self._BLOCK_TAGS:
+            self._append_break()
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden_depth:
+            self.parts.append(data)
+
+    def _append_break(self) -> None:
+        text = "".join(self.parts)
+        if text and not text.endswith("\n"):
+            self.parts.append("\n")
+
+    def text(self) -> str:
+        text = "".join(self.parts)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n[ \t]+", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    @staticmethod
+    def _safe_link(value: str) -> bool:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return False
+        return parsed.scheme.casefold() in {"http", "https", "mailto"} and (
+            parsed.scheme.casefold() == "mailto"
+            or bool(parsed.hostname)
+        )
+
+
+def _calendar_description(description: object) -> tuple[str, list[str]]:
+    if not isinstance(description, str) or not description.strip():
+        return "", []
+    if not re.search(r"</?[a-z][^>]*>", description, re.IGNORECASE):
+        return description.strip(), []
+    parser = _CalendarDescriptionParser()
+    try:
+        parser.feed(description)
+        parser.close()
+    except Exception:
+        return re.sub(r"<[^>]+>", "", description).strip(), []
+    return parser.text(), parser.links
+
+
+def _safe_meeting_links(event: dict[str, Any], description_links: list[str]) -> list[str]:
+    candidates = description_links[:]
+    html_link = event.get("html_link")
+    if isinstance(html_link, str):
+        candidates.append(html_link)
+    links: list[str] = []
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if value in links:
+            continue
+        if _CalendarDescriptionParser._safe_link(value):
+            links.append(value)
+    return links[:10]
+
+
+def _structured_calendar_events(
+    data: dict[str, Any],
+    timezone_name: str,
+    calendar_name: str | None = None,
+) -> list[dict[str, Any]]:
+    raw_events = data.get("events")
+    if not isinstance(raw_events, list):
+        raw_events = [data] if isinstance(data.get("id"), str) else []
+    if data.get("calendar_id"):
+        calendar_name = calendar_name or str(data["calendar_id"])
+
+    cards: list[dict[str, Any]] = []
+    for event in raw_events:
+        if not isinstance(event, dict):
+            continue
+        event_id = event.get("id")
+        if not isinstance(event_id, str) or not event_id.strip():
+            continue
+        description, description_links = _calendar_description(
+            event.get("description"),
+        )
+        attendees = [
+            {
+                "display_name": item.get("display_name"),
+                "email": item.get("email"),
+            }
+            for item in (event.get("attendees") or [])
+            if isinstance(item, dict)
+        ]
+        cards.append({
+            "id": event_id,
+            "title": (
+                event["summary"].strip()
+                if isinstance(event.get("summary"), str)
+                and event["summary"].strip()
+                else "Untitled event"
+            ),
+            "date": _event_card_date(event.get("start"), timezone_name),
+            "start": _format_event_time(event.get("start"), timezone_name),
+            "end": _format_event_time(event.get("end"), timezone_name),
+            "timezone": timezone_name,
+            "location": (
+                event["location"].strip()
+                if isinstance(event.get("location"), str)
+                and event["location"].strip()
+                else None
+            ),
+            "calendar_name": calendar_name,
+            "attendees": attendees,
+            "description": description,
+            "meeting_links": _safe_meeting_links(event, description_links),
+        })
+    return cards
+
+
+def _event_card_date(
+    event_time: dict[str, Any] | None,
+    timezone_name: str,
+) -> str | None:
+    if not isinstance(event_time, dict):
+        return None
+    all_day = event_time.get("date")
+    if isinstance(all_day, str):
+        return all_day
+    raw = event_time.get("date_time")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        )
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m-%d")
+    except (ValueError, KeyError):
+        return None
+
+
 def _format_event(event: dict[str, Any], timezone: str) -> str:
     summary = event.get("summary")
     title = summary.strip() if isinstance(summary, str) and summary.strip() else "Untitled event"
@@ -279,7 +464,11 @@ def _format_event(event: dict[str, Any], timezone: str) -> str:
         lines.append(f"  - Location: {location.strip()}")
     description = event.get("description")
     if isinstance(description, str) and description.strip():
-        lines.append(f"  - Details: {description.strip()[:2000]}")
+        description_text, description_links = _calendar_description(description)
+        if description_text:
+            lines.append(f"  - Details: {description_text[:2000]}")
+        for link in _safe_meeting_links(event, description_links)[:3]:
+            lines.append(f"  - Meeting link: {link}")
     attendees = event.get("attendees")
     if isinstance(attendees, list):
         attendee_names = [
@@ -613,7 +802,10 @@ def _prepare_event_mutation(
             ],
         }
     user_id = context.get("user_id")
-    connection_id = context.get("calendar_write_connection_id")
+    connection_id = (
+        context.get("calendar_write_connection_id")
+        or context.get("calendar_event_connection_id")
+    )
     write_permission_granted = capabilities.get(
         "write_permission_granted",
         capabilities.get(enabled_key, False),
@@ -926,6 +1118,71 @@ def calendar_agent_node(
     runtime: Runtime[ChatContext],
 ) -> dict[str, Any]:
     plan = state.get("gmail_plan") or {}
+    if plan.get("intent") == "approval_workflow":
+        pending = state.get("pending_calendar_create_proposal")
+        operation = plan.get("operation")
+        if isinstance(pending, dict) and operation in {"approve", "reject"}:
+            proposal_id = pending.get("proposal_id")
+            user_id = state.get("user_id")
+            if proposal_id and user_id:
+                try:
+                    with SessionLocal() as db:
+                        service = ActionApprovalService(db)
+                        proposal = (
+                            service.approve(
+                                user_id=UUID(str(user_id)),
+                                proposal_id=UUID(str(proposal_id)),
+                            )
+                            if operation == "approve"
+                            else service.reject(
+                                user_id=UUID(str(user_id)),
+                                proposal_id=UUID(str(proposal_id)),
+                            )
+                        )
+                    response = (
+                        "The Calendar event proposal was approved. "
+                        "No Calendar mutation was executed."
+                        if operation == "approve"
+                        else "The Calendar event proposal was rejected. "
+                        "No Calendar mutation was executed."
+                    )
+                    return {
+                        "assistant_response": response,
+                        "provider": "",
+                        "model": "",
+                        "calendar_approval_result": proposal.model_dump(
+                            mode="json"
+                        ),
+                        "messages": [
+                            {"role": "user", "content": state["user_message"]},
+                            {"role": "assistant", "content": response},
+                        ],
+                    }
+                except Exception as exc:
+                    logger.warning(
+                        "Calendar chat approval failed | proposal_id=%s "
+                        "| operation=%s | error_type=%s",
+                        proposal_id,
+                        operation,
+                        type(exc).__name__,
+                    )
+        response = (
+            "Use the Execute action on the approved Calendar proposal card. "
+            "Execution is separate and chat confirmation does not execute "
+            "a Calendar mutation."
+            if operation == "execute"
+            else "I couldn’t approve or reject that Calendar proposal safely. "
+            "Use the action card and try again."
+        )
+        return {
+            "assistant_response": response,
+            "provider": "",
+            "model": "",
+            "messages": [
+                {"role": "user", "content": state["user_message"]},
+                {"role": "assistant", "content": response},
+            ],
+        }
     tool_name = plan.get("calendar_tool")
     arguments = plan.get("calendar_arguments")
     next_event_details = (
@@ -965,6 +1222,162 @@ def calendar_agent_node(
             "Google Calendar is turned off in Connected Apps. Turn it on "
             "there to use Calendar; your Google account remains connected."
         )
+        return {
+            "assistant_response": response,
+            "provider": "",
+            "model": "",
+            "messages": [
+                {"role": "user", "content": state["user_message"]},
+                {"role": "assistant", "content": response},
+            ],
+        }
+    if tool_name == "verify_calendar_proposal_event":
+        parameters = arguments.get("parameters") if isinstance(arguments, dict) else None
+        event_connection_id = runtime.context.get("calendar_event_connection_id")
+        user_id = runtime.context.get("user_id")
+        if not event_connection_id or not user_id:
+            response = (
+                "Live verification unavailable: Calendar read access or a "
+                "connected Google account is unavailable."
+            )
+        elif not isinstance(parameters, dict):
+            response = (
+                "Live verification unavailable: the saved proposal does not "
+                "contain enough event details."
+            )
+        else:
+            try:
+                start = parameters.get("start")
+                end = parameters.get("end")
+                summary = parameters.get("summary")
+                zone_name = parameters.get("time_zone") or "UTC"
+                start_dt = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+                with SessionLocal() as db:
+                    result = asyncio.run(
+                        CalendarService(db).list_events(
+                            user_id=UUID(str(user_id)),
+                            connection_id=UUID(str(event_connection_id)),
+                            calendar_id=str(parameters.get("calendar_id") or "primary"),
+                            time_min=start_dt,
+                            time_max=end_dt,
+                            query=str(summary) if summary else None,
+                            time_zone=zone_name,
+                            max_results=100,
+                        )
+                    )
+                events = result.get("events") if isinstance(result, dict) else None
+                title_matches: list[dict[str, Any]] = []
+                if isinstance(events, list):
+                    for event in events:
+                        if not isinstance(event, dict):
+                            continue
+                        event_summary = str(event.get("summary") or "").strip()
+                        if event_summary.casefold() == str(summary or "").strip().casefold():
+                            title_matches.append(event)
+
+                if not title_matches:
+                    response = (
+                        f"No matching {summary} event was found in Google Calendar "
+                        f"for the saved proposal's {start_dt.isoformat()}–"
+                        f"{end_dt.isoformat()} {zone_name} time window."
+                    )
+                else:
+                    exact_match = False
+                    for event in title_matches:
+                        event_start = (
+                            (event.get("start") or {}).get("date_time")
+                            if isinstance(event.get("start"), dict)
+                            else event.get("start")
+                        )
+                        event_end = (
+                            (event.get("end") or {}).get("date_time")
+                            if isinstance(event.get("end"), dict)
+                            else event.get("end")
+                        )
+                        try:
+                            actual_start = datetime.fromisoformat(
+                                str(event_start).replace("Z", "+00:00")
+                            )
+                            actual_end = datetime.fromisoformat(
+                                str(event_end).replace("Z", "+00:00")
+                            )
+                            starts_match = (
+                                actual_start.astimezone(UTC).replace(microsecond=0)
+                                == start_dt.astimezone(UTC).replace(microsecond=0)
+                            )
+                            ends_match = (
+                                actual_end.astimezone(UTC).replace(microsecond=0)
+                                == end_dt.astimezone(UTC).replace(microsecond=0)
+                            )
+                        except (TypeError, ValueError):
+                            starts_match = False
+                            ends_match = False
+                        if starts_match and ends_match:
+                            exact_match = True
+                            break
+                    if exact_match:
+                        response = (
+                            f"Event found in Google Calendar: a matching {summary} event "
+                            "was found at the saved proposal's date and time."
+                        )
+                    else:
+                        response = (
+                            f"A {summary} event was found in Google Calendar, but its "
+                            "title, start time, or end time differs from the saved proposal."
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "Calendar proposal verification failed | proposal_id=%s | error_type=%s",
+                    arguments.get("proposal_id") if isinstance(arguments, dict) else None,
+                    type(exc).__name__,
+                )
+                response = (
+                    "Live verification unavailable: Google Calendar could not "
+                    "be queried. Try again after checking the Calendar connection."
+                )
+        return {
+            "assistant_response": response,
+            "provider": "",
+            "model": "",
+            "messages": [
+                {"role": "user", "content": state["user_message"]},
+                {"role": "assistant", "content": response},
+            ],
+        }
+    if tool_name == "get_calendar_proposal_status":
+        proposal_status = arguments.get("status") if isinstance(arguments, dict) else None
+        proposal_status = (
+            str(proposal_status).lower()
+            if proposal_status is not None
+            else "unknown"
+        )
+        approval_text = (
+            "Approved"
+            if proposal_status == "approved"
+            else proposal_status.capitalize()
+        )
+        execution_available = bool(
+            (state.get("assistant_capabilities", {}).get("google_calendar", {})
+             .get("create_execution_available", False))
+        )
+        execution_text = "Available" if execution_available else "Disabled"
+        execution_attempted = bool(
+            arguments.get("execution_started_at")
+            or arguments.get("completed_at")
+            or arguments.get("calendar_event_id")
+        )
+        provider_confirmation = bool(
+            arguments.get("calendar_event_id")
+        )
+        lines = [
+            f"Approval = {approval_text}",
+            f"Execution = {execution_text}",
+            f"Execution attempted = {'Yes' if execution_attempted else 'No'}",
+            f"Provider confirmation = {'Present' if provider_confirmation else 'None'}",
+            "Approval does not prove that the event exists in Google Calendar.",
+        ]
+        response = "\n".join(lines)
         return {
             "assistant_response": response,
             "provider": "",
@@ -1051,45 +1464,8 @@ def calendar_agent_node(
                     {"role": "assistant", "content": response},
                 ],
             }
-        create_enabled = capabilities.get(
-            "write_permission_granted",
-            capabilities.get(
-                "create_execution_available",
-                capabilities.get("write_execution_available", False),
-            ),
-        )
         connection_id = context.get("calendar_write_connection_id")
         user_id = context.get("user_id")
-        if context.get("calendar_selected_write_scope_missing", False):
-            response = (
-                "Your selected Google account is missing Calendar write "
-                "permission. Grant access for that account in Connected Apps. "
-                "Nothing was created."
-            )
-            return {
-                "assistant_response": response,
-                "provider": "",
-                "model": "",
-                "messages": [
-                    {"role": "user", "content": state["user_message"]},
-                    {"role": "assistant", "content": response},
-                ],
-            }
-        if not create_enabled:
-            response = (
-                "The selected Google account is missing Calendar write "
-                "permission. Grant access for that account in Connected Apps. "
-                "Nothing was created."
-            )
-            return {
-                "assistant_response": response,
-                "provider": "",
-                "model": "",
-                "messages": [
-                    {"role": "user", "content": state["user_message"]},
-                    {"role": "assistant", "content": response},
-                ],
-            }
         if not connection_id or not user_id:
             response = (
                 "I couldn’t safely select an authorized Google Calendar account "
@@ -1155,14 +1531,6 @@ def calendar_agent_node(
             }
         try:
             parameters = CalendarCreateEventParameters.model_validate(arguments)
-            with SessionLocal() as db:
-                asyncio.run(
-                    CalendarService(db).validate_create_event_access(
-                        user_id=UUID(str(user_id)),
-                        connection_id=UUID(str(connection_id)),
-                        calendar_id=parameters.calendar_id,
-                    )
-                )
         except ValidationError:
             response = (
                 "I couldn’t validate the event details. Please provide a title, "
@@ -1510,10 +1878,30 @@ def calendar_agent_node(
             "I couldn’t validate that Calendar request. Please clarify the "
             "date, time range, or event details."
         )
+    calendar_events: list[dict[str, Any]] = []
+    try:
+        if (
+            tool_name in {
+                "list_calendar_events",
+                "get_calendar_event",
+                "get_today_schedule",
+                "get_calendar_schedule",
+            }
+            and "data" in locals()
+            and isinstance(locals()["data"], dict)
+        ):
+            calendar_events = _structured_calendar_events(
+                locals()["data"],
+                state.get("user_timezone", "UTC"),
+                arguments.get("calendar_id") if isinstance(arguments, dict) else None,
+            )
+    except Exception:
+        calendar_events = []
     return {
         "assistant_response": response,
         "provider": "",
         "model": "",
+        "calendar_events": calendar_events,
         "messages": [
             {"role": "user", "content": state["user_message"]},
             {"role": "assistant", "content": response},
