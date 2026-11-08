@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
 import pytest
@@ -8,6 +9,7 @@ from pydantic import ValidationError
 
 from app.api import deps
 from app.api.v1.endpoints.action_approvals import get_action_approval_service
+from app.api.v1.endpoints import action_approvals as action_approvals_endpoint
 from app.db.session import get_db
 from app.main import app
 from app.schemas.action_approval import (
@@ -210,6 +212,103 @@ def test_chat_service_exposes_only_current_users_pending_calendar_proposal():
         conversation_id=conversation_id,
         now=datetime.now(timezone.utc),
     ) == proposal
+
+
+def test_pending_calendar_create_draft_restores_and_explicitly_clears():
+    draft = {
+        "summary": "Planning",
+        "event_date": "2026-11-10",
+        "start_time": "10:00",
+        "time_zone": "Asia/Kolkata",
+        "calendar_name": "Work Calendar",
+    }
+    history = [
+        {
+            "role": "assistant",
+            "metadata": {"calendar_create_draft": draft},
+        },
+        {"role": "user", "content": "10:30 AM"},
+        {"role": "assistant", "metadata": {"provider": ""}},
+    ]
+
+    assert ChatService._pending_calendar_create_draft(history) == draft
+
+    history.append({
+        "role": "assistant",
+        "metadata": {
+            "action_approval": {
+                "action_type": "calendar.create_event",
+                "status": "pending",
+            },
+        },
+    })
+    assert ChatService._pending_calendar_create_draft(history) is None
+
+
+def test_calendar_approval_and_execute_are_separate_api_actions(monkeypatch):
+    connection_id = uuid4()
+    payload = ApprovalProposalCreate.model_validate({
+        "conversation_id": uuid4(),
+        "source_message_id": uuid4(),
+        "connection_id": connection_id,
+        "action_type": "calendar.create_event",
+        "parameters": {
+            "calendar_id": "primary",
+            "summary": "Calendar approval test",
+            "start": "2026-11-10T10:00:00+05:30",
+            "end": "2026-11-10T10:30:00+05:30",
+            "time_zone": "Asia/Kolkata",
+            "all_day": False,
+        },
+    })
+    pending = _proposal(USER_ID, payload)
+    approved = pending.model_copy(update={"status": "approved"})
+    completed = approved.model_copy(update={"status": "completed"})
+
+    class ServiceStub:
+        db = object()
+
+        def approve(self, **_kwargs):
+            return approved
+
+        def get_proposal(self, **_kwargs):
+            return approved
+
+    service = ServiceStub()
+    executor = SimpleNamespace(execute=AsyncMock(return_value=completed))
+    executor_factory = Mock(return_value=executor)
+    executor_factory.SUPPORTED_ACTION_TYPES = {"calendar.create_event"}
+    monkeypatch.setattr(
+        action_approvals_endpoint,
+        "CalendarActionExecutor",
+        executor_factory,
+    )
+    app.dependency_overrides[deps.get_current_user] = lambda: {
+        "id": str(USER_ID),
+    }
+    app.dependency_overrides[get_action_approval_service] = lambda: service
+
+    try:
+        client = TestClient(app)
+        approval_response = client.post(
+            f"/api/v1/action-approvals/{pending.proposal_id}/approve",
+        )
+        assert approval_response.status_code == 200
+        assert approval_response.json()["proposal"]["status"] == "approved"
+        executor_factory.assert_not_called()
+        executor.execute.assert_not_awaited()
+
+        execute_response = client.post(
+            f"/api/v1/action-approvals/{pending.proposal_id}/execute",
+        )
+        assert execute_response.status_code == 200
+        assert execute_response.json()["proposal"]["status"] == "completed"
+        executor.execute.assert_awaited_once_with(
+            user_id=USER_ID,
+            proposal_id=pending.proposal_id,
+        )
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_calendar_create_proposal_persists_gym_with_timezone_and_ownership(

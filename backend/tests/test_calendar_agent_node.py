@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -753,6 +754,138 @@ def test_calendar_create_with_missing_date_asks_before_preflight():
     assert "What date" in result["assistant_response"]
     assert "10am–11am" in result["assistant_response"]
     assert "Asia/Kolkata" in result["assistant_response"]
+    assert "calendar_create_event_proposal" not in result
+
+
+def test_calendar_create_draft_asks_only_missing_end_time_and_is_retained():
+    state = _state("create_calendar_event_proposal", None)
+    state["user_message"] = "10:00 AM"
+    state["calendar_create_draft"] = {
+        "summary": "Planning",
+        "event_date": "2026-11-10",
+        "start_time": "10:00",
+        "time_zone": "Asia/Kolkata",
+        "calendar_name": "Primary Calendar",
+        "calendar_id": "primary",
+    }
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_write_connection_id=EVENT_CONNECTION_ID,
+            google_connection_available=True,
+        ),
+    )
+
+    assert result["assistant_response"] == "What end time should I use?"
+    assert result["calendar_create_draft"] == state["calendar_create_draft"]
+    assert "calendar_create_event_proposal" not in result
+
+
+def test_calendar_create_resolves_named_calendar_and_preserves_full_proposal(
+    monkeypatch,
+):
+    state = _state("create_calendar_event_proposal", None)
+    state["user_message"] = "Prepare the saved proposal."
+    state["calendar_create_draft"] = {
+        "summary": "Planning",
+        "event_date": "2026-11-10",
+        "start_time": "10:00",
+        "end_time": "10:30",
+        "time_zone": "Asia/Kolkata",
+        "calendar_name": "Work Calendar",
+        "description": "Project planning",
+        "location": "Room 3",
+        "attendees": ["person@example.com"],
+    }
+    list_calendars = AsyncMock(return_value={
+        "calendars": [
+            {"id": "work-calendar-id", "summary": "Work Calendar"},
+        ],
+        "next_page_token": None,
+    })
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "CalendarService",
+        lambda _db: SimpleNamespace(list_calendars=list_calendars),
+    )
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "SessionLocal",
+        lambda: nullcontext(object()),
+    )
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_write_connection_id=EVENT_CONNECTION_ID,
+            google_connection_available=True,
+        ),
+    )
+
+    list_calendars.assert_awaited_once()
+    assert result["calendar_create_event_proposal"] == {
+        "calendar_id": "work-calendar-id",
+        "summary": "Planning",
+        "description": "Project planning",
+        "start": "2026-11-10T10:00:00+05:30",
+        "end": "2026-11-10T10:30:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "location": "Room 3",
+        "attendees": ["person@example.com"],
+        "all_day": False,
+    }
+    assert result["calendar_create_draft"]["calendar_id"] == (
+        "work-calendar-id"
+    )
+
+
+def test_calendar_create_ambiguous_named_calendar_keeps_draft_for_clarification(
+    monkeypatch,
+):
+    state = _state("create_calendar_event_proposal", None)
+    state["user_message"] = "Use Work Calendar."
+    draft = {
+        "summary": "Planning",
+        "event_date": "2026-11-10",
+        "start_time": "10:00",
+        "end_time": "10:30",
+        "time_zone": "Asia/Kolkata",
+        "calendar_name": "Work Calendar",
+    }
+    state["calendar_create_draft"] = draft
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "CalendarService",
+        lambda _db: SimpleNamespace(list_calendars=AsyncMock(return_value={
+            "calendars": [
+                {"id": "work-one", "summary": "Work Calendar"},
+                {"id": "work-two", "summary": "Work Calendar"},
+            ],
+            "next_page_token": None,
+        })),
+    )
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "SessionLocal",
+        lambda: nullcontext(object()),
+    )
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_write_connection_id=EVENT_CONNECTION_ID,
+            google_connection_available=True,
+        ),
+    )
+
+    assert "couldn’t uniquely resolve" in result["assistant_response"]
+    assert result["calendar_create_draft"]["calendar_name"] == (
+        "Work Calendar"
+    )
     assert "calendar_create_event_proposal" not in result
 
 

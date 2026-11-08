@@ -29,6 +29,11 @@ from app.workflows import gmail_tools
 from app.workflows import autonomous_memory_node
 from app.workflows.calendar_agent_node import calendar_agent_node
 from app.workflows.memory_retrieval_node import memory_retrieval_node
+from app.workflows.calendar_create_draft import (
+    draft_to_event_arguments,
+    extract_calendar_create_draft,
+    merge_calendar_create_draft,
+)
 
 
 SUBSCRIPTION_REQUEST = (
@@ -1004,6 +1009,17 @@ def test_routing_normalization_preserves_schedule_gym_text_and_inner_numbers():
     assert gmail_agent_nodes.normalize_prompt_for_routing(
         "Check event 10K on November 14th 2026 at 10 AM."
     ) == "Check event 10K on November 14th 2026 at 10 AM."
+    routed = gmail_agent_nodes.gmail_intent_router_node(_calendar_create_state(
+        numbered,
+    ))
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
+    assert routed["gmail_plan"]["calendar_arguments"]["summary"] == "Gym"
+    assert routed["gmail_plan"]["calendar_arguments"]["start"].startswith(
+        "2026-11-09T10:00:00"
+    )
 
 
 def test_numbered_memory_update_routes_without_changing_original_content(
@@ -1028,6 +1044,278 @@ def test_numbered_memory_update_routes_without_changing_original_content(
     assert result["memory_decision_result"]["action"] == "UPDATE"
     assert result["memory_decision_result"]["proposed_content"] == message
     assert state["user_message"] == message
+
+
+def test_labeled_calendar_draft_parses_natural_date_and_ignores_date_numbers_for_times():
+    draft = extract_calendar_create_draft(
+        "Create a calendar event with these details:\n"
+        "Title: Personal AI Assistant - Calendar Test\n"
+        "Date: November 10, 2026\n"
+        "Start time: 10:00 AM\n"
+        "End time: 10:30 AM\n"
+        "Timezone: Asia/Kolkata\n"
+        "Calendar: Primary Calendar",
+        default_time_zone="UTC",
+    )
+
+    arguments = draft_to_event_arguments(draft)
+
+    assert arguments == {
+        "calendar_id": "primary",
+        "summary": "Personal AI Assistant - Calendar Test",
+        "description": None,
+        "start": "2026-11-10T10:00:00+05:30",
+        "end": "2026-11-10T10:30:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "location": None,
+        "attendees": [],
+        "all_day": False,
+    }
+
+
+def test_calendar_draft_merge_keeps_omitted_values_and_calendar_name():
+    original = extract_calendar_create_draft(
+        "Title: Planning\nDate: November 10, 2026\n"
+        "Start time: 10 AM\nTimezone: Asia/Kolkata\n"
+        "Calendar: Work Calendar\nLocation: Room 3",
+        default_time_zone="UTC",
+    )
+    followup = extract_calendar_create_draft(
+        "End time: 10:30 AM",
+        default_time_zone="UTC",
+        use_default_time_zone=False,
+    )
+
+    merged = merge_calendar_create_draft(original, followup)
+
+    assert merged["summary"] == "Planning"
+    assert merged["event_date"] == "2026-11-10"
+    assert merged["start_time"] == "10:00"
+    assert merged["end_time"] == "10:30"
+    assert merged["time_zone"] == "Asia/Kolkata"
+    assert merged["calendar_name"] == "Work Calendar"
+    assert merged.get("calendar_id") is None
+    assert merged["location"] == "Room 3"
+
+
+def test_valid_date_followup_clears_previous_invalid_date_marker():
+    invalid_date = extract_calendar_create_draft(
+        "Date: November 38, 2026",
+        default_time_zone="Asia/Kolkata",
+    )
+    initial = merge_calendar_create_draft(
+        {"summary": "Planning", "calendar_id": "primary"},
+        invalid_date,
+    )
+    correction = extract_calendar_create_draft(
+        "November 10, 2026",
+        default_time_zone="UTC",
+        use_default_time_zone=False,
+    )
+
+    merged = merge_calendar_create_draft(initial, correction)
+
+    assert merged["event_date"] == "2026-11-10"
+    assert "invalid_fields" not in merged
+    assert merged["summary"] == "Planning"
+    assert merged["calendar_id"] == "primary"
+
+
+def test_changed_calendar_name_clears_previously_resolved_id():
+    existing = {
+        "summary": "Planning",
+        "event_date": "2026-11-10",
+        "start_time": "10:00",
+        "end_time": "10:30",
+        "time_zone": "Asia/Kolkata",
+        "calendar_name": "Primary Calendar",
+        "calendar_id": "primary",
+    }
+    update = extract_calendar_create_draft(
+        "Calendar: Work Calendar",
+        default_time_zone="UTC",
+        use_default_time_zone=False,
+    )
+
+    merged = merge_calendar_create_draft(existing, update)
+
+    assert merged["calendar_name"] == "Work Calendar"
+    assert "calendar_id" not in merged
+
+
+def _calendar_create_state(message, **overrides):
+    return _state(
+        message,
+        user_timezone="Asia/Kolkata",
+        request_time="2026-11-08T04:30:00+00:00",
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+        **overrides,
+    )
+
+
+def test_complete_labeled_calendar_create_request_uses_month_name_date():
+    message = (
+        "Create a calendar event with these details:\n"
+        "Title: Personal AI Assistant - Calendar Test\n"
+        "Date: November 10, 2026\n"
+        "Start time: 10:00 AM\n"
+        "End time: 10:30 AM\n"
+        "Timezone: Asia/Kolkata\n"
+        "Calendar: Primary Calendar\n\n"
+        "Prepare a saved event proposal. Wait for my approval. Do not execute."
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _calendar_create_state(message)
+    )
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
+    assert routed["gmail_plan"]["calendar_arguments"] == {
+        "calendar_id": "primary",
+        "summary": "Personal AI Assistant - Calendar Test",
+        "description": None,
+        "start": "2026-11-10T10:00:00+05:30",
+        "end": "2026-11-10T10:30:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "location": None,
+        "attendees": [],
+        "all_day": False,
+    }
+    assert routed["calendar_create_draft"]["calendar_name"] == (
+        "Primary Calendar"
+    )
+
+
+def test_calendar_create_date_only_followup_preserves_original_details():
+    initial_message = (
+        "Create a calendar event with these details:\n"
+        "Title: Personal AI Assistant - Calendar Test\n"
+        "Start time: 10:00 AM\n"
+        "End time: 10:30 AM\n"
+        "Timezone: Asia/Kolkata\n"
+        "Calendar: Primary Calendar"
+    )
+    initial = gmail_agent_nodes.gmail_intent_router_node(
+        _calendar_create_state(initial_message)
+    )
+    followup_message = (
+        "November 10, 2026. I already provided this date in my previous "
+        "message. Please retain all the other event details and prepare "
+        "the saved proposal. Do not execute it."
+    )
+    assert not gmail_agent_nodes._is_mixed_google_service_request(
+        followup_message
+    )
+    followup = gmail_agent_nodes.gmail_intent_router_node(
+        _calendar_create_state(
+            followup_message,
+            calendar_create_draft=initial["calendar_create_draft"],
+            messages=[
+                {"role": "user", "content": initial_message},
+                {
+                    "role": "assistant",
+                    "content": "What date should I use for this event?",
+                },
+            ],
+        )
+    )
+
+    arguments = followup["gmail_plan"]["calendar_arguments"]
+    assert followup["assistant_route"] == "google_calendar"
+    assert arguments["summary"] == "Personal AI Assistant - Calendar Test"
+    assert arguments["start"] == "2026-11-10T10:00:00+05:30"
+    assert arguments["end"] == "2026-11-10T10:30:00+05:30"
+    assert arguments["time_zone"] == "Asia/Kolkata"
+    assert arguments["calendar_id"] == "primary"
+
+
+def test_calendar_create_time_only_followup_preserves_title_timezone_and_calendar():
+    initial_message = (
+        "Create a calendar event with these details:\n"
+        "Title: Planning\nDate: November 10, 2026\n"
+        "Start time: 10:00 AM\nTimezone: Asia/Kolkata\n"
+        "Calendar: Primary Calendar"
+    )
+    initial = gmail_agent_nodes.gmail_intent_router_node(
+        _calendar_create_state(initial_message)
+    )
+    followup = gmail_agent_nodes.gmail_intent_router_node(
+        _calendar_create_state(
+            "10:30 AM",
+            calendar_create_draft=initial["calendar_create_draft"],
+            messages=[
+                {"role": "user", "content": initial_message},
+                {
+                    "role": "assistant",
+                    "content": "What end time should I use for this event?",
+                },
+            ],
+        )
+    )
+
+    arguments = followup["gmail_plan"]["calendar_arguments"]
+    assert arguments["summary"] == "Planning"
+    assert arguments["start"] == "2026-11-10T10:00:00+05:30"
+    assert arguments["end"] == "2026-11-10T10:30:00+05:30"
+    assert arguments["time_zone"] == "Asia/Kolkata"
+    assert arguments["calendar_id"] == "primary"
+
+
+def test_numbered_calendar_create_and_previous_message_do_not_route_as_mixed_services():
+    initial = gmail_agent_nodes.gmail_intent_router_node(
+        _calendar_create_state(
+            "1. Create a calendar event with these details:\n"
+            "Title: Planning\nDate: November 10, 2026\n"
+            "Start time: 10:00 AM\nEnd time: 10:30 AM\n"
+            "Timezone: Asia/Kolkata\nCalendar: Primary Calendar"
+        )
+    )
+    followup = gmail_agent_nodes.gmail_intent_router_node(
+        _calendar_create_state(
+            "November 10, 2026. I already provided this date in my previous "
+            "message. Please retain the event details and prepare the proposal.",
+            calendar_create_draft=initial["calendar_create_draft"],
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": "What date should I use for this event?",
+                },
+            ],
+        )
+    )
+
+    assert initial["assistant_route"] == "google_calendar"
+    assert followup["assistant_route"] == "google_calendar"
+    assert followup["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
+    assert followup["gmail_plan"]["intent"] == "google_calendar"
+
+
+def test_named_calendar_name_is_retained_until_resolution():
+    draft = extract_calendar_create_draft(
+        "Title: Planning\nDate: November 10, 2026\n"
+        "Start time: 10 AM\nEnd time: 10:30 AM\n"
+        "Timezone: Asia/Kolkata\nCalendar: Work Calendar",
+        default_time_zone="UTC",
+    )
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _calendar_create_state(
+            "Create a calendar event with these details:\n"
+            "Title: Planning\nDate: November 10, 2026\n"
+            "Start time: 10 AM\nEnd time: 10:30 AM\n"
+            "Timezone: Asia/Kolkata\nCalendar: Work Calendar"
+        )
+    )
+
+    assert routed["calendar_create_draft"]["calendar_name"] == "Work Calendar"
+    assert routed["calendar_create_draft"].get("calendar_id") is None
+    assert routed["gmail_plan"]["calendar_arguments"] is None
 
 
 def test_calendar_availability_ignores_prior_relative_context_when_explicit_date_is_given():

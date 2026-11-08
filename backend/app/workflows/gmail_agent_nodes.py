@@ -49,6 +49,14 @@ from app.db.session import SessionLocal
 from app.workflows.chat_state import ChatContext, ChatState
 from app.workflows.gmail_tools import execute_gmail_read
 from app.workflows.prompt_normalization import normalize_prompt_for_routing
+from app.workflows.calendar_create_draft import (
+    CalendarCreateDraft,
+    draft_missing_fields,
+    draft_to_event_arguments,
+    extract_calendar_create_draft,
+    extract_explicit_calendar_date as _extract_explicit_calendar_date,
+    merge_calendar_create_draft,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -389,48 +397,6 @@ def _request_time(state: ChatState) -> datetime:
     if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
         return datetime.now(ZoneInfo("UTC"))
     return parsed
-
-
-def _extract_explicit_calendar_date(text: str) -> date | None:
-    iso_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
-    if iso_match:
-        try:
-            return date.fromisoformat(iso_match.group(1))
-        except ValueError:
-            pass
-
-    natural_match = re.search(
-        r"\b(january|february|march|april|may|june|july|august|"
-        r"september|october|november|december)\s+"
-        r"(\d{1,2})(?:st|nd|rd|th)?(?:,\s*|\s+)(20\d{2})\b",
-        text,
-        re.IGNORECASE,
-    )
-    if natural_match:
-        month_names = (
-            "january",
-            "february",
-            "march",
-            "april",
-            "may",
-            "june",
-            "july",
-            "august",
-            "september",
-            "october",
-            "november",
-            "december",
-        )
-        try:
-            return date(
-                int(natural_match.group(3)),
-                month_names.index(natural_match.group(1).casefold()) + 1,
-                int(natural_match.group(2)),
-            )
-        except ValueError:
-            return None
-
-    return None
 
 
 def _calendar_plan(
@@ -832,6 +798,177 @@ def _calendar_create_description(title: str | None) -> str | None:
     if title and title.casefold() == "gym":
         return "Workout session"
     return None
+
+
+def _calendar_create_followup_seed(state: ChatState) -> dict[str, Any] | None:
+    current_draft = state.get("calendar_create_draft")
+    if isinstance(current_draft, dict):
+        try:
+            return CalendarCreateDraft.model_validate(
+                current_draft
+            ).model_dump(mode="json", exclude_none=True)
+        except ValidationError:
+            return None
+
+    history = state.get("messages", [])
+    last_assistant = next(
+        (
+            item for item in reversed(history)
+            if isinstance(item, dict) and item.get("role") == "assistant"
+        ),
+        None,
+    )
+    assistant_reply = (
+        last_assistant.get("content")
+        if isinstance(last_assistant, dict)
+        else None
+    )
+    if not isinstance(assistant_reply, str) or not re.search(
+        r"\b(?:what|which|provide|specify)\b.{0,60}"
+        r"\b(?:date|time|title|calendar)\b",
+        assistant_reply,
+        re.IGNORECASE,
+    ):
+        return None
+    if not re.search(
+        r"\b(?:calendar|event|meeting|appointment|schedule)\b",
+        assistant_reply,
+        re.IGNORECASE,
+    ):
+        return None
+
+    original_request = next(
+        (
+            item["content"]
+            for item in reversed(history)
+            if isinstance(item, dict)
+            and item.get("role") == "user"
+            and isinstance(item.get("content"), str)
+            and _calendar_event_creation_request(item["content"])
+        ),
+        None,
+    )
+    if not isinstance(original_request, str):
+        return None
+
+    timezone = _validated_timezone(state)
+    initial_fields = extract_calendar_create_draft(
+        original_request,
+        default_time_zone=timezone,
+        fallback_summary=_calendar_create_title(original_request),
+    )
+    if not initial_fields.get("calendar_id") and not initial_fields.get(
+        "calendar_name"
+    ):
+        initial_fields["calendar_id"] = "primary"
+    if not initial_fields.get("event_date"):
+        relative_date = _relative_calendar_date(original_request, state)
+        if relative_date is not None:
+            initial_fields["event_date"] = relative_date
+    try:
+        return merge_calendar_create_draft(None, initial_fields)
+    except ValidationError:
+        return None
+
+
+def _relative_calendar_date(text: str, state: ChatState) -> date | None:
+    timezone = _validated_timezone(state)
+    today = _request_time(state).astimezone(ZoneInfo(timezone)).date()
+    lowered = text.casefold()
+    if re.search(r"\btoday\b", lowered):
+        return today
+    if re.search(r"\btomorrow\b", lowered):
+        return today + timedelta(days=1)
+    weekday_match = re.search(
+        r"\b(?:(next|this)\s+)?"
+        r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        lowered,
+    )
+    if not weekday_match:
+        return None
+    weekdays = (
+        "monday", "tuesday", "wednesday", "thursday", "friday",
+        "saturday", "sunday",
+    )
+    days_ahead = (weekdays.index(weekday_match.group(2)) - today.weekday()) % 7
+    if weekday_match.group(1) == "next" and days_ahead == 0:
+        days_ahead = 7
+    return today + timedelta(days=days_ahead)
+
+
+def _calendar_create_draft_plan(
+    state: ChatState,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    current_message = state["user_message"].strip()
+    existing_draft = _calendar_create_followup_seed(state)
+    new_create_request = _calendar_event_creation_request(current_message) or (
+        bool(re.search(
+            r"^\s*(?:please\s+)?(?:schedule|book)\s+(?:a\s+)?"
+            r"[A-Za-z0-9][A-Za-z0-9 '&-]{0,80}\s+"
+            r"(?:today|tomorrow|on\b|from\b|at\b)",
+            current_message,
+            re.IGNORECASE,
+        ))
+    )
+    if not new_create_request and existing_draft is None:
+        return None
+
+    if existing_draft is not None and re.search(
+        r"\b(?:gmail|inbox|e-?mails?|mail|drive|files?|documents?|"
+        r"spreadsheets?|contacts?|address book)\b",
+        current_message,
+        re.IGNORECASE,
+    ):
+        return None
+
+    timezone = _validated_timezone(state)
+    updates = extract_calendar_create_draft(
+        current_message,
+        default_time_zone=timezone,
+        fallback_summary=(
+            _calendar_create_title(current_message)
+            if existing_draft is None
+            else None
+        ),
+        use_default_time_zone=existing_draft is None,
+    )
+    if existing_draft is None:
+        if not updates.get("event_date"):
+            relative_date = _relative_calendar_date(current_message, state)
+            if relative_date is not None:
+                updates["event_date"] = relative_date
+        if not updates.get("calendar_id") and not updates.get("calendar_name"):
+            updates["calendar_id"] = "primary"
+    elif not updates and not re.search(
+        r"\b(?:retain|keep|provided|previous|details|proposal)\b",
+        current_message,
+        re.IGNORECASE,
+    ):
+        return None
+
+    try:
+        draft = merge_calendar_create_draft(existing_draft, updates)
+        if (
+            draft.get("summary", "").casefold() == "gym"
+            and not draft.get("description")
+        ):
+            draft["description"] = _calendar_create_description("Gym")
+        arguments = draft_to_event_arguments(draft)
+    except (TypeError, ValueError, ValidationError):
+        draft = existing_draft or {}
+        arguments = None
+    if (
+        arguments is None
+        and not draft_missing_fields(draft)
+        and not draft.get("invalid_fields")
+    ):
+        plan, _route = _calendar_plan("clarify")
+        return plan, draft
+    plan, _route = _calendar_plan(
+        "create_calendar_event_proposal",
+        arguments,
+    )
+    return plan, draft
 
 
 def _calendar_clock_matches(text: str) -> list[datetime_time] | None:
@@ -2048,12 +2185,20 @@ def _calendar_fallback(state: ChatState) -> dict[str, Any] | None:
     ).model_dump(mode="json")
 
 
+def _mentions_gmail_service(lowered: str) -> bool:
+    return bool(
+        re.search(r"\b(?:gmail|inbox|e-?mails?|mail)\b", lowered)
+        or re.search(
+            r"\b(?:show|list|search|get|read|find|open)\b.{0,30}"
+            r"\bmessages?\b",
+            lowered,
+        )
+    )
+
+
 def _is_mixed_gmail_calendar_request(user_message: str) -> bool:
     lowered = user_message.casefold()
-    asks_gmail = bool(re.search(
-        r"\b(?:gmail|inbox|e-?mails?|mail|messages?)\b",
-        lowered,
-    ))
+    asks_gmail = _mentions_gmail_service(lowered)
     has_calendar_task = bool(re.search(
         r"\b(?:calendar|availability|freebusy)\b|"
         r"\b(?:show|list|find|get|check|when|"
@@ -2072,7 +2217,6 @@ def _is_mixed_gmail_calendar_request(user_message: str) -> bool:
 def _is_mixed_google_service_request(user_message: str) -> bool:
     lowered = user_message.casefold()
     service_mentions = (
-        r"\b(?:gmail|inbox|e-?mails?|mail|messages?)\b",
         r"\b(?:calendar|meetings?|events?|appointments?|schedule)\b",
         r"\b(?:drive|files?|pdfs?|documents?|spreadsheets?)\b",
         r"\b(?:contacts?|address book|phone numbers?|mobile numbers?)\b",
@@ -2080,7 +2224,7 @@ def _is_mixed_google_service_request(user_message: str) -> bool:
     mentioned_services = sum(
         bool(re.search(pattern, lowered))
         for pattern in service_mentions
-    )
+    ) + int(_mentions_gmail_service(lowered))
     return mentioned_services > 1 and bool(re.search(
         r"\b(?:and|also|then|plus)\b",
         lowered,
@@ -2227,6 +2371,15 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
         return {
             "gmail_plan": {"intent": "capabilities"},
             "assistant_route": "capabilities",
+        }
+
+    calendar_create = _calendar_create_draft_plan(state)
+    if calendar_create is not None:
+        plan, draft = calendar_create
+        return {
+            "gmail_plan": plan,
+            "assistant_route": "google_calendar",
+            "calendar_create_draft": draft,
         }
 
     if _is_mixed_gmail_calendar_request(state["user_message"]):

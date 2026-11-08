@@ -208,6 +208,28 @@ class ChatService:
             return proposal
         return None
 
+    @staticmethod
+    def _pending_calendar_create_draft(
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        for message in reversed(history):
+            if message.get("role") != "assistant":
+                continue
+            metadata = message.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            proposal = metadata.get("action_approval")
+            if (
+                isinstance(proposal, dict)
+                and proposal.get("action_type") == "calendar.create_event"
+            ):
+                return None
+            if "calendar_create_draft" not in metadata:
+                continue
+            draft = metadata.get("calendar_create_draft")
+            return draft if isinstance(draft, dict) else None
+        return None
+
     def _get_completed_response(
         self,
         user_id: UUID,
@@ -782,6 +804,13 @@ class ChatService:
                 initial_state["pending_calendar_create_proposal"] = (
                     pending_calendar_create
                 )
+            pending_calendar_draft = self._pending_calendar_create_draft(
+                history,
+            )
+            if pending_calendar_draft is not None:
+                initial_state["calendar_create_draft"] = (
+                    pending_calendar_draft
+                )
             if available_gmail_sources:
                 initial_state["available_gmail_sources"] = (
                     available_gmail_sources
@@ -962,6 +991,10 @@ class ChatService:
                     ):
                         assistant_metadata["action_approval"] = (
                             result["calendar_approval_result"]
+                        )
+                    if "calendar_create_draft" in result:
+                        assistant_metadata["calendar_create_draft"] = (
+                            result["calendar_create_draft"]
                         )
                     if isinstance(result.get("calendar_events"), list):
                         assistant_metadata["calendar_events"] = (

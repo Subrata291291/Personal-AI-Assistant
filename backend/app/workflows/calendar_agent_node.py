@@ -22,6 +22,11 @@ from app.services.calendar_service import CalendarService
 from app.services.action_approval_service import ActionApprovalService
 from app.workflows.calendar_tools import create_calendar_tools
 from app.workflows.chat_state import ChatContext, ChatState
+from app.workflows.calendar_create_draft import (
+    CalendarCreateDraft,
+    draft_missing_fields,
+    draft_to_event_arguments,
+)
 
 logger = logging.getLogger(__name__)
 CALENDAR_LIST_MAX_PAGES = 100
@@ -290,6 +295,25 @@ def _format_local_datetime(value: Any, timezone: str) -> str:
     except (ValueError, KeyError):
         return "time unavailable"
     return local.strftime("%Y-%m-%d %I:%M %p %Z")
+
+
+def _calendar_create_missing_details_prompt(fields: list[str]) -> str:
+    prompts = {
+        "title": "What title should I use for the event?",
+        "date": "What date should I use for the event?",
+        "event_date": "What date should I use for the event?",
+        "start_time": "What start time should I use?",
+        "end_time": "What end time should I use?",
+        "time_zone": "What timezone should I use?",
+        "calendar": "Which Calendar should I use?",
+    }
+    questions = list(dict.fromkeys(
+        prompts.get(field, "Please correct the invalid event detail.")
+        for field in fields
+    ))
+    if not questions:
+        return "Please provide the missing Calendar event details."
+    return " ".join(questions)
 
 
 class _CalendarDescriptionParser(HTMLParser):
@@ -1509,6 +1533,142 @@ def calendar_agent_node(
                     {"role": "assistant", "content": response},
                 ],
             }
+        draft_data = state.get("calendar_create_draft")
+        if isinstance(draft_data, dict):
+            try:
+                draft = CalendarCreateDraft.model_validate(draft_data)
+            except ValidationError:
+                response = (
+                    "I couldn’t safely validate the saved Calendar draft. "
+                    "Please provide the event details again. Nothing was created."
+                )
+                return {
+                    "assistant_response": response,
+                    "provider": "",
+                    "model": "",
+                    "calendar_create_draft": None,
+                    "messages": [
+                        {"role": "user", "content": state["user_message"]},
+                        {"role": "assistant", "content": response},
+                    ],
+                }
+
+            draft_json = draft.model_dump(mode="json", exclude_none=True)
+            if not draft.invalid_fields:
+                draft_json.pop("invalid_fields", None)
+            missing = draft_missing_fields(draft_json)
+            non_calendar_missing = [
+                field for field in missing if field != "calendar"
+            ]
+            if draft.invalid_fields or non_calendar_missing:
+                response = _calendar_create_missing_details_prompt(
+                    draft.invalid_fields or non_calendar_missing
+                )
+                return {
+                    "assistant_response": response,
+                    "provider": "",
+                    "model": "",
+                    "calendar_create_draft": draft_json,
+                    "messages": [
+                        {"role": "user", "content": state["user_message"]},
+                        {"role": "assistant", "content": response},
+                    ],
+                }
+
+            if not draft.calendar_id and draft.calendar_name:
+                try:
+                    user_uuid = UUID(str(user_id))
+                    connection_uuid = UUID(str(connection_id))
+
+                    async def list_all_calendars() -> list[dict[str, Any]]:
+                        calendars: list[dict[str, Any]] = []
+                        page_token = None
+                        seen_tokens: set[str] = set()
+                        with SessionLocal() as db:
+                            service = CalendarService(db)
+                            for _ in range(CALENDAR_LIST_MAX_PAGES):
+                                page = await service.list_calendars(
+                                    user_id=user_uuid,
+                                    connection_id=connection_uuid,
+                                    max_results=250,
+                                    page_token=page_token,
+                                )
+                                calendars.extend(page.get("calendars", []))
+                                next_token = page.get("next_page_token")
+                                if not next_token:
+                                    break
+                                if next_token in seen_tokens:
+                                    raise ValueError(
+                                        "Calendar list pagination repeated a token."
+                                    )
+                                seen_tokens.add(next_token)
+                                page_token = next_token
+                        return calendars
+
+                    listed_calendars = asyncio.run(list_all_calendars())
+                except Exception as exc:
+                    logger.warning(
+                        "Calendar name resolution failed | error_type=%s",
+                        type(exc).__name__,
+                    )
+                    response = (
+                        "I couldn’t resolve the requested Calendar. Please "
+                        "choose an accessible calendar from Calendar List."
+                    )
+                    return {
+                        "assistant_response": response,
+                        "provider": "",
+                        "model": "",
+                        "calendar_create_draft": draft_json,
+                        "messages": [
+                            {"role": "user", "content": state["user_message"]},
+                            {"role": "assistant", "content": response},
+                        ],
+                    }
+
+                matching_calendars = [
+                    calendar
+                    for calendar in listed_calendars
+                    if isinstance(calendar, dict)
+                    and isinstance(calendar.get("summary"), str)
+                    and calendar["summary"].strip().casefold()
+                    == draft.calendar_name.casefold()
+                ]
+                if len(matching_calendars) != 1:
+                    response = (
+                        f"I couldn’t uniquely resolve the calendar "
+                        f"{draft.calendar_name!r}. Please provide a calendar "
+                        "name that matches exactly one accessible calendar."
+                    )
+                    return {
+                        "assistant_response": response,
+                        "provider": "",
+                        "model": "",
+                        "calendar_create_draft": draft_json,
+                        "messages": [
+                            {"role": "user", "content": state["user_message"]},
+                            {"role": "assistant", "content": response},
+                        ],
+                    }
+                draft_json["calendar_id"] = matching_calendars[0]["id"]
+
+            if not draft_json.get("calendar_id"):
+                draft_json["calendar_id"] = "primary"
+            arguments = draft_to_event_arguments(draft_json)
+            if arguments is None:
+                response = _calendar_create_missing_details_prompt(
+                    ["start_time", "end_time"]
+                )
+                return {
+                    "assistant_response": response,
+                    "provider": "",
+                    "model": "",
+                    "calendar_create_draft": draft_json,
+                    "messages": [
+                        {"role": "user", "content": state["user_message"]},
+                        {"role": "assistant", "content": response},
+                    ],
+                }
         if not isinstance(arguments, dict):
             message = state["user_message"]
             times = re.findall(
@@ -1633,6 +1793,9 @@ def calendar_agent_node(
             "provider": "",
             "model": "",
             "calendar_create_event_proposal": serialized,
+            "calendar_create_draft": draft_json
+            if isinstance(draft_data, dict)
+            else None,
             "messages": [
                 {"role": "user", "content": state["user_message"]},
                 {"role": "assistant", "content": response},
