@@ -11,6 +11,7 @@ from app.workflows.memory_update_node import (
     _compact_time_range,
     _TIME_RANGE_PATTERN,
 )
+from app.workflows.prompt_normalization import normalize_prompt_for_routing
 
 
 logger = logging.getLogger(__name__)
@@ -104,12 +105,13 @@ def autonomous_memory_node(state: ChatState) -> dict[str, Any]:
         }
 
     user_id = UUID(state["user_id"])
-    calendar_request = _is_explicit_calendar_request(text)
-    ranges = list(_TIME_RANGE_PATTERN.finditer(text))
+    routing_text = normalize_prompt_for_routing(text)
+    calendar_request = _is_explicit_calendar_request(routing_text)
+    ranges = list(_TIME_RANGE_PATTERN.finditer(routing_text))
 
     if (
         not calendar_request
-        and _is_update_change(text)
+        and _is_update_change(routing_text)
         and len(ranges) >= 2
     ):
         old_time = ranges[0].group(0)

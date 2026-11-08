@@ -48,6 +48,7 @@ from app.services.action_approval_service import ActionApprovalService
 from app.db.session import SessionLocal
 from app.workflows.chat_state import ChatContext, ChatState
 from app.workflows.gmail_tools import execute_gmail_read
+from app.workflows.prompt_normalization import normalize_prompt_for_routing
 
 
 logger = logging.getLogger(__name__)
@@ -2189,6 +2190,10 @@ def _contextual_followup_messages(state: ChatState) -> list[dict[str, str]]:
 
 def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
     """Produce one strict, validated assistant intent decision."""
+    normalized_message = normalize_prompt_for_routing(state["user_message"])
+    if normalized_message != state["user_message"]:
+        state = {**state, "user_message": normalized_message}
+
     if _is_explicit_memory_update_request(state["user_message"]):
         return {
             "gmail_plan": {

@@ -26,6 +26,7 @@ from app.workflows import chat_nodes
 from app.workflows import gmail_agent_nodes
 from app.workflows import chat_graph
 from app.workflows import gmail_tools
+from app.workflows import autonomous_memory_node
 from app.workflows.calendar_agent_node import calendar_agent_node
 from app.workflows.memory_retrieval_node import memory_retrieval_node
 
@@ -893,6 +894,140 @@ def test_calendar_availability_uses_relative_and_explicit_dates_in_order():
     assert explicit_date["gmail_plan"]["calendar_arguments"]["time_max"] == (
         "2026-11-14T12:00:00+05:30"
     )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_tool", "expected_date"),
+    [
+        (
+            "1. Am I free tomorrow between 10 AM and 12 PM?",
+            "check_calendar_availability",
+            "2026-11-09",
+        ),
+        (
+            "2) Am I free on November 14th 2026 between 10 AM and 12 PM?",
+            "check_calendar_availability",
+            "2026-11-14",
+        ),
+        (
+            "3: Show my calendar events for tomorrow.",
+            "get_calendar_schedule",
+            "2026-11-09",
+        ),
+        (
+            "Am I free tomorrow between 10 AM and 12 PM?",
+            "check_calendar_availability",
+            "2026-11-09",
+        ),
+        (
+            "• Am I free tomorrow between 10 AM and 12 PM?",
+            "check_calendar_availability",
+            "2026-11-09",
+        ),
+    ],
+)
+def test_leading_list_markers_do_not_change_calendar_intent_or_entities(
+    message,
+    expected_tool,
+    expected_date,
+):
+    state = _state(
+        message,
+        user_timezone="Asia/Kolkata",
+        request_time="2026-11-08T04:30:00+00:00",
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == expected_tool
+    arguments = routed["gmail_plan"]["calendar_arguments"]
+    if expected_tool == "check_calendar_availability":
+        assert arguments["time_min"].startswith(f"{expected_date}T10:00:00")
+        assert arguments["time_max"].startswith(f"{expected_date}T12:00:00")
+    else:
+        assert arguments["date"] == expected_date
+    assert state["user_message"] == message
+
+
+def test_leading_list_markers_preserve_other_routes_and_event_proposals():
+    request_time = "2026-11-08T04:30:00+00:00"
+    cases = (
+        (
+            "1. Find emails from alice@example.com about invoices.",
+            "gmail",
+            "search_emails",
+            None,
+        ),
+        (
+            "1. What is in my episodic memory about morning meetings?",
+            "general",
+            "memory_retrieval",
+            None,
+        ),
+        (
+            "1. Explain how time zones work.",
+            "general",
+            "general",
+            None,
+        ),
+        (
+            "4. Schedule a Gym meeting tomorrow from 10 AM to 11 AM.",
+            "google_calendar",
+            "google_calendar",
+            "create_calendar_event_proposal",
+        ),
+    )
+
+    for message, expected_route, expected_intent, expected_calendar_tool in cases:
+        state = _state(
+            message,
+            user_timezone="Asia/Kolkata",
+            request_time=request_time,
+        )
+        routed = gmail_agent_nodes.gmail_intent_router_node(state)
+
+        assert routed["assistant_route"] == expected_route
+        assert routed["gmail_plan"]["intent"] == expected_intent
+        if expected_calendar_tool:
+            assert routed["gmail_plan"]["calendar_tool"] == (
+                expected_calendar_tool
+            )
+        assert state["user_message"] == message
+
+
+def test_routing_normalization_preserves_schedule_gym_text_and_inner_numbers():
+    original = "Schedule Gym tomorrow from 10 AM to 11 AM."
+    numbered = "5. Schedule Gym tomorrow from 10 AM to 11 AM."
+
+    assert gmail_agent_nodes.normalize_prompt_for_routing(numbered) == original
+    assert gmail_agent_nodes.normalize_prompt_for_routing(
+        "Check event 10K on November 14th 2026 at 10 AM."
+    ) == "Check event 10K on November 14th 2026 at 10 AM."
+
+
+def test_numbered_memory_update_routes_without_changing_original_content(
+    monkeypatch,
+):
+    message = (
+        "1. My gym meeting changed from 9 AM-10 AM to 10 AM-11 AM. "
+        "Update this information in my memory."
+    )
+    user_id = str(uuid4())
+    memory_id = uuid4()
+    monkeypatch.setattr(
+        autonomous_memory_node,
+        "_find_ambiguous_update_matches",
+        lambda *_args: [SimpleNamespace(id=memory_id)],
+    )
+
+    state = _state(message, user_id=user_id)
+    result = autonomous_memory_node.autonomous_memory_node(state)
+
+    assert result["assistant_route"] == "memory_update"
+    assert result["memory_decision_result"]["action"] == "UPDATE"
+    assert result["memory_decision_result"]["proposed_content"] == message
+    assert state["user_message"] == message
 
 
 def test_calendar_availability_ignores_prior_relative_context_when_explicit_date_is_given():
