@@ -25,6 +25,8 @@ from app.schemas.gmail_agent import (
     GmailReadPlan,
     GmailUnavailableActionPlan,
     IntegrationPlan,
+    GetLatestEmailPlan,
+    GetEmailPlan,
     MeetingExtractionResponse,
     SearchEmailsPlan,
     SummarizeAttentionPlan,
@@ -64,6 +66,7 @@ SUPPORTED_READ_INTENTS = {
     "summarize_attention",
     "summarize_today",
     "summarize_latest_thread",
+    "get_latest_email",
 }
 SUPPORTED_DRAFT_INTENTS = {
     "draft_email",
@@ -222,7 +225,7 @@ def _plan_prompt(state: ChatState) -> str:
         "gmail_send, gmail_reply, gmail_reply_all, gmail_forward, "
         "gmail_archive, gmail_delete, gmail_search, gmail_read, "
         "search_emails, get_email, get_thread, summarize_unread, "
-        "summarize_thread, summarize_important, "
+        "summarize_thread, get_latest_email, summarize_important, "
         "summarize_urgent, summarize_attention, summarize_today, and "
         "summarize_latest_thread. The current local date and time is "
         f"{local_now.isoformat(timespec='minutes')} ({timezone}). "
@@ -1727,12 +1730,66 @@ def _deterministic_integration_plan(
     return None
 
 
-def _deterministic_read_plan(user_message: str) -> dict[str, Any] | None:
+def _deterministic_read_plan(
+    user_message: str,
+    available_sources: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Resolve common, unambiguous Gmail requests without needless questions."""
     text = user_message.strip()
     lowered = text.casefold()
     if re.search(r"\b(?:draft|write|compose|reply|forward|send)\b", lowered):
         return None
+
+    latest_sender_match = re.search(
+        r"\b(?:open|show|get|read)\s+(?:me\s+)?(?:the\s+)?"
+        r"(?:latest|most\s+recent)\s+(?:email|message)\s+"
+        r"from\s+(.+?)(?:[?.!]*$)",
+        text,
+        re.IGNORECASE,
+    )
+    if latest_sender_match:
+        sender = latest_sender_match.group(1).strip().strip("\"'")
+        sender = re.split(
+            r"\s+(?:and\s+|then\s+|give\s+|show\s+|include\s+|with\s+)",
+            sender,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" .,!?:;")
+        if sender:
+            source_messages = (
+                (available_sources or {}).get("messages")
+                if isinstance((available_sources or {}).get("messages"), list)
+                else []
+            )
+            matching_sources = [
+                item
+                for item in source_messages
+                if isinstance(item, dict)
+                and isinstance(item.get("sender"), str)
+                and (
+                    sender.casefold() in item["sender"].casefold()
+                    or item["sender"].casefold() in sender.casefold()
+                )
+                and isinstance(item.get("message_id"), str)
+                and item["message_id"]
+            ]
+            if matching_sources:
+                matching_sources.sort(
+                    key=lambda item: (
+                        int(item["internal_date"])
+                        if str(item.get("internal_date") or "").isdigit()
+                        else 0
+                    ),
+                    reverse=True,
+                )
+                return GetEmailPlan(
+                    intent="get_email",
+                    message_id=matching_sources[0]["message_id"],
+                ).model_dump(mode="json")
+            return GetLatestEmailPlan(
+                intent="get_latest_email",
+                sender=sender,
+            ).model_dump(mode="json")
 
     if (
         re.search(r"\b(?:summari[sz]e|give me a summary|help me understand)\b", lowered)
@@ -2163,7 +2220,10 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             "assistant_route": "gmail",
         }
 
-    deterministic_plan = _deterministic_read_plan(state["user_message"])
+    deterministic_plan = _deterministic_read_plan(
+        state["user_message"],
+        state.get("available_gmail_sources"),
+    )
     if deterministic_plan is not None:
         return {
             "gmail_plan": deterministic_plan,

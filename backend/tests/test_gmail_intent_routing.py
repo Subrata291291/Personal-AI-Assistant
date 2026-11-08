@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from datetime import datetime
@@ -24,6 +25,7 @@ from app.workflows.chat_nodes import (
 from app.workflows import chat_nodes
 from app.workflows import gmail_agent_nodes
 from app.workflows import chat_graph
+from app.workflows import gmail_tools
 from app.workflows.calendar_agent_node import calendar_agent_node
 from app.workflows.memory_retrieval_node import memory_retrieval_node
 
@@ -2288,6 +2290,132 @@ def test_compose_plan_does_not_enter_gmail_search_clarification():
 
     assert result["gmail_plan"]["intent"] == "gmail_compose"
     assert result["gmail_plan"]["intent"] != "clarify"
+
+
+def test_latest_email_from_sender_routes_without_important_or_date_filters():
+    plan = gmail_agent_nodes._deterministic_read_plan(
+        "Open the latest email from Glassdoor Jobs and give me complete details.",
+    )
+
+    assert plan["intent"] == "get_latest_email"
+    assert plan["sender"] == "Glassdoor Jobs"
+    assert "is:important" not in json.dumps(plan)
+    assert "newer_than" not in json.dumps(plan)
+
+
+def test_latest_email_reuses_matching_source_message_id_from_previous_search():
+    plan = gmail_agent_nodes._deterministic_read_plan(
+        "Open the latest email from Glassdoor Jobs.",
+        {
+            "messages": [
+                {
+                    "message_id": "older-glassdoor",
+                    "sender": "Glassdoor Jobs <noreply@glassdoor.com>",
+                    "internal_date": "1762600000000",
+                },
+                {
+                    "message_id": "newer-glassdoor",
+                    "sender": "Glassdoor Jobs <noreply@glassdoor.com>",
+                    "internal_date": "1762609000000",
+                },
+                {
+                    "message_id": "other-sender",
+                    "sender": "Other Sender <other@example.com>",
+                    "internal_date": "1762700000000",
+                },
+            ],
+        },
+    )
+
+    assert plan == {
+        "intent": "get_email",
+        "message_id": "newer-glassdoor",
+    }
+
+
+def test_html_only_gmail_body_is_converted_safely():
+    compact = gmail_tools._compact_message(
+        {
+            "headers": {
+                "from": "Glassdoor Jobs <noreply@glassdoor.com>",
+                "to": "user@example.com",
+                "subject": "New opportunities",
+                "date": "Sun, 8 Nov 2026 10:00:00 +0530",
+            },
+            "body": {
+                "plain_text": "",
+                "html": (
+                    "<p>Hello</p><script>alert('bad')</script>"
+                    "<a href='https://example.com/jobs'>Apply</a>"
+                ),
+            },
+        }
+    )
+
+    assert "Hello" in compact["body"]
+    assert "Apply" in compact["body"]
+    assert "alert" not in compact["body"]
+    assert "<script>" not in compact["body"]
+
+
+def test_latest_gmail_lookup_searches_sender_and_fetches_full_message():
+    class FakeGmailService:
+        async def list_messages(self, **kwargs):
+            assert kwargs["query"] == 'from:"Glassdoor Jobs"'
+            return {
+                "messages": [
+                    {
+                        "id": "newer-message",
+                        "internal_date": "1762609000000",
+                        "sender": "Glassdoor Jobs <noreply@glassdoor.com>",
+                    },
+                    {
+                        "id": "other-message",
+                        "internal_date": "1762610000000",
+                        "sender": "Other Sender <other@example.com>",
+                    },
+                ]
+            }
+
+        async def get_message(self, **kwargs):
+            if kwargs["message_id"] == "other-message":
+                return {
+                    "headers": {
+                        "from": "Other Sender <other@example.com>",
+                        "subject": "Not Glassdoor",
+                    },
+                    "body": {"plain_text": "wrong sender"},
+                    "internal_date": kwargs["message_id"],
+                }
+            return {
+                "headers": {
+                    "from": "Glassdoor Jobs <noreply@glassdoor.com>",
+                    "to": "user@example.com",
+                    "subject": "New role",
+                    "date": "Sun, 8 Nov 2026 10:00:00 +0530",
+                },
+                "body": {
+                    "plain_text": "",
+                    "html": "<p>Complete email body</p>",
+                },
+                "internal_date": "1762609000000",
+            }
+
+    result = asyncio.run(
+        gmail_tools._execute_with_service(
+            service=FakeGmailService(),
+            intent="get_latest_email",
+            plan={"intent": "get_latest_email", "sender": "Glassdoor Jobs"},
+            user_id=UUID("00000000-0000-0000-0000-000000000001"),
+            connection_id=UUID("00000000-0000-0000-0000-000000000002"),
+            user_timezone="UTC",
+        )
+    )
+
+    assert result["result_size_estimate"] == 1
+    assert result["message"]["sender"].startswith("Glassdoor Jobs")
+    assert result["message"]["subject"] == "New role"
+    assert "Complete email body" in result["message"]["body"]
 
 
 def test_gmail_read_and_search_aliases_map_to_existing_read_tools(monkeypatch):

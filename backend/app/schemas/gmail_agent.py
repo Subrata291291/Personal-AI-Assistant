@@ -233,6 +233,14 @@ class GetEmailPlan(GmailPlanBase):
     )
 
 
+class GetLatestEmailPlan(GmailPlanBase):
+    intent: Literal["get_latest_email"]
+    sender: str = Field(
+        min_length=1,
+        max_length=320,
+    )
+
+
 class GetThreadPlan(GmailPlanBase):
     intent: Literal["get_thread"]
     thread_id: str = Field(
@@ -305,6 +313,7 @@ AssistantIntent: TypeAlias = Annotated[
     | SummarizeTodayPlan
     | SummarizeLatestThreadPlan
     | GetEmailPlan
+    | GetLatestEmailPlan
     | GetThreadPlan
     | SummarizeUnreadPlan
     | SummarizeThreadPlan,

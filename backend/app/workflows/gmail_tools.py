@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from html.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
 from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 from app.db.session import SessionLocal
 from app.schemas.gmail_agent import (
     GetEmailPlan,
+    GetLatestEmailPlan,
     GetThreadPlan,
     MeetingDiscoveryPlan,
     SearchEmailsPlan,
@@ -28,6 +30,37 @@ MAX_EMAIL_BODY_CHARS = 3_000
 MAX_SEARCH_TEXT_CHARS = 500
 MAX_AGENT_RESULT_CHARS = 24_000
 MAX_SOURCE_MESSAGES = 10
+
+
+class _HTMLTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._hidden_depth = 0
+
+    def handle_data(self, data: str) -> None:
+        if not self._hidden_depth and data.strip():
+            self.parts.append(data.strip())
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() in {"script", "style", "template"}:
+            self._hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in {"script", "style", "template"} and self._hidden_depth:
+            self._hidden_depth -= 1
+
+    def get_text(self) -> str:
+        return "\n".join(self.parts)
+
+
+def _html_to_readable_text(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    parser = _HTMLTextExtractor()
+    parser.feed(value)
+    parser.close()
+    return parser.get_text()
 
 
 def _bounded_text(value: Any, limit: int) -> str:
@@ -124,10 +157,7 @@ def _search_metadata_matches(
     if plan.subject and not contains_terms(headers["subject"], plan.subject):
         return False
     if plan.sender:
-        if not any(
-            contains_terms(headers[field], plan.sender)
-            for field in ("sender", "subject", "snippet", "body")
-        ):
+        if not contains_terms(headers["sender"], plan.sender):
             return False
     if plan.query and not re.search(
         r"\b(?:has|filename|is|in):",
@@ -251,6 +281,15 @@ def _thread_timeline(
 def _compact_message(message: dict[str, Any]) -> dict[str, Any]:
     headers = message.get("headers") or {}
     body = message.get("body") or {}
+    plain_body = _bounded_text(
+        body.get("plain_text"),
+        MAX_EMAIL_BODY_CHARS,
+    )
+    if not plain_body:
+        plain_body = _bounded_text(
+            _html_to_readable_text(body.get("html")),
+            MAX_EMAIL_BODY_CHARS,
+        )
     return {
         "sender": _bounded_text(headers.get("from"), 320),
         "recipient": _bounded_text(headers.get("to"), 500),
@@ -264,10 +303,7 @@ def _compact_message(message: dict[str, Any]) -> dict[str, Any]:
             for label in message.get("labels", [])[:20]
             if isinstance(label, str)
         ] if isinstance(message.get("labels"), list) else [],
-        "body": _bounded_text(
-            body.get("plain_text"),
-            MAX_EMAIL_BODY_CHARS,
-        ),
+        "body": plain_body,
     }
 
 
@@ -291,6 +327,7 @@ def _source_record(message: dict[str, Any]) -> dict[str, str] | None:
     return {
         "message_id": message_id,
         "thread_id": thread_id,
+        "internal_date": message.get("internal_date"),
         "sender": _bounded_text(
             headers.get("from") or message.get("sender"),
             320,
@@ -505,9 +542,16 @@ async def _execute_with_service(
                     and isinstance(item.get("id"), str)
                 ):
                     candidates.setdefault(item["id"], item)
+        ordered_candidates = sorted(
+            candidates.values(),
+            key=lambda item: int(item.get("internal_date") or 0)
+            if str(item.get("internal_date") or "").isdigit()
+            else 0,
+            reverse=True,
+        )
         results: list[dict[str, Any]] = []
         detail_checks = 0
-        for item in candidates.values():
+        for item in ordered_candidates:
             if _search_metadata_matches(item, validated):
                 results.append(item)
             elif detail_checks < validated.max_results:
@@ -557,6 +601,78 @@ async def _execute_with_service(
                 results,
             ),
             "result_size_estimate": len(results),
+        }
+
+    if intent == "get_latest_email":
+        validated = GetLatestEmailPlan.model_validate_json(
+            json.dumps(plan, ensure_ascii=False)
+        )
+        search_plan = SearchEmailsPlan(
+            intent="search_emails",
+            sender=validated.sender,
+            max_results=10,
+        )
+        response = await service.list_messages(
+            user_id=user_id,
+            connection_id=connection_id,
+            max_results=50,
+            query=f"from:{_quote_search_value(validated.sender)}",
+            folder="all",
+        )
+        candidates = [
+            item
+            for item in response.get("messages", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+        ]
+        candidates.sort(
+            key=lambda item: int(item.get("internal_date") or 0)
+            if str(item.get("internal_date") or "").isdigit()
+            else 0,
+            reverse=True,
+        )
+        if not candidates:
+            return {
+                "intent": intent,
+                "message": None,
+                "gmail_sources": _gmail_sources(str(connection_id), []),
+                "result_size_estimate": 0,
+            }
+        detail: dict[str, Any] | None = None
+        for candidate in candidates:
+            candidate_detail = await service.get_message(
+                user_id=user_id,
+                connection_id=connection_id,
+                message_id=candidate["id"],
+                include_html=True,
+            )
+            detail_headers = candidate_detail.get("headers") or {}
+            verified_sender = {
+                "sender": (
+                    detail_headers.get("from")
+                    or candidate_detail.get("sender")
+                    or candidate.get("sender")
+                ),
+            }
+            if _search_metadata_matches(verified_sender, search_plan):
+                detail = candidate_detail
+                break
+        if detail is None:
+            return {
+                "intent": intent,
+                "message": None,
+                "gmail_sources": _gmail_sources(str(connection_id), []),
+                "result_size_estimate": 0,
+            }
+        message = _compact_message(detail)
+        return {
+            "intent": intent,
+            "message": message,
+            "gmail_sources": _gmail_sources(
+                str(connection_id),
+                [detail],
+            ),
+            "result_size_estimate": 1,
         }
 
     if intent == "get_email":
