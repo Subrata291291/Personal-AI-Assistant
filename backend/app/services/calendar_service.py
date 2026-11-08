@@ -309,6 +309,56 @@ class CalendarService:
             "updated": raw.get("updated"),
         }
 
+    @staticmethod
+    def _event_overlaps_range(
+        event: dict[str, Any],
+        range_start: datetime,
+        range_end: datetime,
+        zone: ZoneInfo,
+    ) -> bool:
+        start = event.get("start")
+        end = event.get("end")
+        if not isinstance(start, dict):
+            # Preserve compatibility for provider/test data that lacks timing
+            # metadata; recognized timed and all-day events are filtered below.
+            return True
+
+        all_day_start = start.get("date")
+        if isinstance(all_day_start, date):
+            all_day_end = (
+                end.get("date")
+                if isinstance(end, dict)
+                else None
+            )
+            if not isinstance(all_day_end, date):
+                all_day_end = all_day_start + timedelta(days=1)
+            local_start_date = range_start.astimezone(zone).date()
+            local_end_date = range_end.astimezone(zone).date()
+            return (
+                all_day_start < local_end_date
+                and all_day_end > local_start_date
+            )
+
+        event_start = start.get("date_time")
+        event_end = (
+            end.get("date_time")
+            if isinstance(end, dict)
+            else None
+        )
+        if not isinstance(event_start, datetime):
+            return False
+        if event_start.tzinfo is None or event_start.utcoffset() is None:
+            return False
+        event_start_utc = event_start.astimezone(timezone.utc)
+        if isinstance(event_end, datetime) and (
+            event_end.tzinfo is not None
+            and event_end.utcoffset() is not None
+        ):
+            event_end_utc = event_end.astimezone(timezone.utc)
+        else:
+            event_end_utc = event_start_utc
+        return event_start_utc < range_end and event_end_utc > range_start
+
     async def list_events(
         self,
         user_id: UUID,
@@ -420,6 +470,18 @@ class CalendarService:
                 ) from exc
 
         events = [self._normalize_event(event) for event in raw_events]
+        if time_max is not None:
+            filter_zone = ZoneInfo(time_zone or "UTC")
+            events = [
+                event
+                for event in events
+                if self._event_overlaps_range(
+                    event,
+                    time_min,
+                    time_max,
+                    filter_zone,
+                )
+            ]
         if attendee:
             normalized_attendee = attendee.strip().casefold()
             events = [

@@ -816,6 +816,26 @@ def test_common_calendar_requests_route_to_read_only_calendar_tools():
         assert routed["gmail_plan"]["calendar_tool"] == expected_tool
 
 
+def test_calendar_natural_language_exact_date_routes_to_one_day_schedule():
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Show my calendar events for November 9, 2026.",
+            user_timezone="Asia/Kolkata",
+            request_time="2026-11-08T18:45:00+00:00",
+        )
+    )
+
+    plan = routed["gmail_plan"]
+    assert routed["assistant_route"] == "google_calendar"
+    assert plan["calendar_tool"] == "get_calendar_schedule"
+    assert plan["calendar_arguments"] == {
+        "date": "2026-11-09",
+        "period": "day",
+        "time_zone": "Asia/Kolkata",
+        "calendar_id": "primary",
+    }
+
+
 def test_calendar_relative_dates_use_one_request_time_in_user_timezone():
     request_time = "2026-11-06T18:45:00+00:00"
     today = gmail_agent_nodes.gmail_intent_router_node(

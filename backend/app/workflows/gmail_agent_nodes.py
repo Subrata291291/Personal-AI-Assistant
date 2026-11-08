@@ -1151,6 +1151,50 @@ def _deterministic_calendar_plan(
             },
         )
 
+    natural_exact_date_match = re.search(
+        r"\b(january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\s+"
+        r"(\d{1,2})(?:st|nd|rd|th)?(?:,\s*|\s+)(20\d{2})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if natural_exact_date_match and re.search(
+        r"\b(?:show|list|find|get|open|check|what|when|tell me|"
+        r"do i have|have|calendar|events?|meetings?|schedule)\b",
+        lowered,
+    ):
+        month_names = (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        )
+        try:
+            exact_date = date(
+                int(natural_exact_date_match.group(3)),
+                month_names.index(natural_exact_date_match.group(1).casefold()) + 1,
+                int(natural_exact_date_match.group(2)),
+            )
+        except ValueError:
+            return _calendar_plan("clarify")
+        return _calendar_plan(
+            "get_calendar_schedule",
+            {
+                "date": exact_date.isoformat(),
+                "period": "day",
+                "time_zone": timezone,
+                "calendar_id": "primary",
+            },
+        )
+
     month_read_request = re.search(
         r"\b(?:show|list|find|get|open|check|what|when|tell me|"
         r"do i have|have)\b",

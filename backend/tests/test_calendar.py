@@ -576,6 +576,117 @@ def test_all_day_event_retains_exclusive_date_boundaries():
     assert event["end"]["date"] == date(2026, 11, 6)
 
 
+def test_exact_kolkata_day_bounds_filter_before_after_multi_and_all_day_events():
+    zone = ZoneInfo("Asia/Kolkata")
+    range_start = datetime(2026, 11, 8, 18, 30, tzinfo=timezone.utc)
+    range_end = datetime(2026, 11, 9, 18, 30, tzinfo=timezone.utc)
+    event_cases = [
+        (
+            "before",
+            {
+                "start": {"date_time": datetime(2026, 11, 8, 17, 0, tzinfo=timezone.utc), "date": None},
+                "end": {"date_time": datetime(2026, 11, 8, 18, 30, tzinfo=timezone.utc), "date": None},
+            },
+            False,
+        ),
+        (
+            "after",
+            {
+                "start": {"date_time": datetime(2026, 11, 9, 18, 30, tzinfo=timezone.utc), "date": None},
+                "end": {"date_time": datetime(2026, 11, 9, 19, 30, tzinfo=timezone.utc), "date": None},
+            },
+            False,
+        ),
+        (
+            "multi-day",
+            {
+                "start": {"date_time": datetime(2026, 11, 8, 0, 0, tzinfo=timezone.utc), "date": None},
+                "end": {"date_time": datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc), "date": None},
+            },
+            True,
+        ),
+        (
+            "all-day",
+            {
+                "start": {"date": date(2026, 11, 9), "date_time": None},
+                "end": {"date": date(2026, 11, 10), "date_time": None},
+            },
+            True,
+        ),
+    ]
+
+    for _name, event_time, expected in event_cases:
+        event = {"start": event_time["start"], "end": event_time["end"]}
+        assert CalendarService._event_overlaps_range(
+            event,
+            range_start,
+            range_end,
+            zone,
+        ) is expected
+
+
+def test_calendar_list_events_sends_exact_rfc3339_range_and_filters_empty_results():
+    service, _ = make_service()
+    request = {}
+
+    async def fake_google_get(**kwargs):
+        request.update(kwargs)
+        return {
+            "items": [
+                {
+                    "id": "other-date",
+                    "start": {"dateTime": "2026-11-05T10:00:00+05:30"},
+                    "end": {"dateTime": "2026-11-05T11:00:00+05:30"},
+                },
+            ],
+            "timeZone": "Asia/Kolkata",
+        }
+
+    service._google_get = fake_google_get
+    result = asyncio.run(
+        service.list_events(
+            USER_ID,
+            CONNECTION_ID,
+            time_min=aware("2026-11-08T18:30:00Z"),
+            time_max=aware("2026-11-09T18:30:00Z"),
+            time_zone="Asia/Kolkata",
+        )
+    )
+
+    assert request["params"]["timeMin"] == "2026-11-08T18:30:00Z"
+    assert request["params"]["timeMax"] == "2026-11-09T18:30:00Z"
+    assert result["events"] == []
+
+
+def test_exact_day_schedule_sends_kolkata_rfc3339_boundaries():
+    service, _ = make_service()
+    request = {}
+
+    async def fake_list_events(**kwargs):
+        request.update(kwargs)
+        return {
+            "calendar_id": "primary",
+            "events": [],
+            "next_page_token": None,
+            "time_zone": "Asia/Kolkata",
+        }
+
+    service.list_events = fake_list_events
+    result = asyncio.run(
+        service.get_schedule(
+            USER_ID,
+            CONNECTION_ID,
+            date(2026, 11, 9),
+            "day",
+            "Asia/Kolkata",
+        )
+    )
+
+    assert request["time_min"] == aware("2026-11-08T18:30:00Z")
+    assert request["time_max"] == aware("2026-11-09T18:30:00Z")
+    assert result["events"] == []
+
+
 def test_schedule_uses_local_day_boundaries_across_dst():
     service, _ = make_service()
     request = {}
