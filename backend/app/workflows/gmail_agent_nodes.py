@@ -390,6 +390,48 @@ def _request_time(state: ChatState) -> datetime:
     return parsed
 
 
+def _extract_explicit_calendar_date(text: str) -> date | None:
+    iso_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    if iso_match:
+        try:
+            return date.fromisoformat(iso_match.group(1))
+        except ValueError:
+            pass
+
+    natural_match = re.search(
+        r"\b(january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\s+"
+        r"(\d{1,2})(?:st|nd|rd|th)?(?:,\s*|\s+)(20\d{2})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if natural_match:
+        month_names = (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        )
+        try:
+            return date(
+                int(natural_match.group(3)),
+                month_names.index(natural_match.group(1).casefold()) + 1,
+                int(natural_match.group(2)),
+            )
+        except ValueError:
+            return None
+
+    return None
+
+
 def _calendar_plan(
     tool: str,
     arguments: dict[str, Any] | None = None,
@@ -939,17 +981,13 @@ def _deterministic_calendar_plan(
     zone = ZoneInfo(timezone)
     request_now = _request_time(state).astimezone(zone)
     today = request_now.date()
+    explicit_date = _extract_explicit_calendar_date(text)
+    explicit_date_matches = re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", text)
     date_match = re.search(r"\b(today|tomorrow)\b", lowered)
     weekday_match = re.search(
         r"\b(?:(next|this)\s+)?"
         r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
         lowered,
-    )
-    explicit_date_matches = re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", text)
-    explicit_date_match = (
-        re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
-        if explicit_date_matches
-        else None
     )
     target_date = today + timedelta(days=1) if (
         date_match and date_match.group(1) == "tomorrow"
@@ -970,11 +1008,8 @@ def _deterministic_calendar_plan(
         if weekday_match.group(1) == "next" and days_ahead == 0:
             days_ahead = 7
         target_date = today + timedelta(days=days_ahead)
-    if explicit_date_match:
-        try:
-            target_date = date.fromisoformat(explicit_date_match.group(1))
-        except ValueError:
-            return _calendar_plan("clarify")
+    if explicit_date is not None:
+        target_date = explicit_date
 
     creation_request = bool(re.search(
         r"\b(?:set|put|create|add|book|schedule|cancel|delete|remove|update|edit|"
@@ -1325,14 +1360,14 @@ def _deterministic_calendar_plan(
             },
         )
 
-    if date_match or explicit_date_match:
+    if date_match or explicit_date is not None:
         if re.search(r"\b(?:schedule|meetings?|events?|calendar)\b", lowered):
             return _calendar_plan(
                 "get_today_schedule" if target_date == today and
-                not explicit_date_match else "get_calendar_schedule",
+                explicit_date is None else "get_calendar_schedule",
                 (
                     {"time_zone": timezone, "calendar_id": "primary"}
-                    if target_date == today and not explicit_date_match
+                    if target_date == today and explicit_date is None
                     else {
                         "date": target_date.isoformat(),
                         "period": "day",

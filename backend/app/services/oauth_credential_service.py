@@ -23,6 +23,8 @@ class OAuthCredentialService:
     of the caller/service layer.
     """
 
+    _refresh_locks: dict[str, asyncio.Lock] = {}
+
     def __init__(self, db: Session):
         self.repository = OAuthCredentialRepository(db)
 
@@ -262,8 +264,6 @@ class OAuthCredentialService:
 
         The caller owns transaction management.
         """
-        _refresh_locks: dict[str, asyncio.Lock] = {}
-
         lookup_started_at = perf_counter()
         credential = self.repository.get_by_connection(
             user_id=user_id,

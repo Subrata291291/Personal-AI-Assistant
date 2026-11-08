@@ -1,15 +1,18 @@
 import asyncio
+import logging
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
+from fastapi import HTTPException, Response
 from fastapi.testclient import TestClient
 
 from app.api import deps
 from app.api.v1.endpoints import calendar as calendar_endpoint
 from app.core.config import Settings
+from app.core.request_metrics import RequestMetrics, current_request_metrics
 from app.db.session import get_db
 from app.integrations.google.api_client import GoogleAPIClient
 from app.integrations.google.exceptions import GoogleAPIError
@@ -1333,6 +1336,54 @@ def test_stale_google_authorization_failure_is_surfaced_without_provider_data(
         "Google denied access to this Calendar resource."
     )
     assert "do-not-expose" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("endpoint_name", "service_method", "operation"),
+    [
+        ("list_calendars", "list_calendars", "list_calendars"),
+        ("list_calendar_events", "list_events", "list_events"),
+    ],
+)
+def test_unexpected_calendar_errors_log_trace_without_exception_message(
+    endpoint_name,
+    service_method,
+    operation,
+    monkeypatch,
+    caplog,
+):
+    message_marker = "synthetic credential data must not be logged"
+
+    async def fail(**_kwargs):
+        raise RuntimeError(message_marker)
+
+    monkeypatch.setattr(
+        calendar_endpoint,
+        "CalendarService",
+        lambda _db: SimpleNamespace(**{service_method: fail}),
+    )
+    metrics_token = current_request_metrics.set(
+        RequestMetrics(request_id="calendar-test-request-id")
+    )
+    try:
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(HTTPException) as raised:
+                asyncio.run(
+                    getattr(calendar_endpoint, endpoint_name)(
+                        response=Response(),
+                        current_user={"id": str(USER_ID)},
+                        connection_id=CONNECTION_ID,
+                        db=None,
+                    )
+                )
+    finally:
+        current_request_metrics.reset(metrics_token)
+
+    assert raised.value.status_code == 500
+    assert f"Unexpected Calendar {operation} failure" in caplog.text
+    assert "calendar-test-request-id" in caplog.text
+    assert "RuntimeError traceback" in caplog.text
+    assert "synthetic credential data must not be logged" not in caplog.text
 
 
 def test_freebusy_body_requires_uuid_and_aware_datetimes():

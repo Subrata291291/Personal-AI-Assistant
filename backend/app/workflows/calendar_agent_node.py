@@ -271,6 +271,27 @@ def _format_event_time(
     return local.strftime("%Y-%m-%d %I:%M %p %Z")
 
 
+def _format_local_datetime(value: Any, timezone: str) -> str:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(
+                value[:-1] + "+00:00" if value.endswith("Z") else value
+            )
+        except ValueError:
+            return "time unavailable"
+    else:
+        return "time unavailable"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return "time unavailable"
+    try:
+        local = parsed.astimezone(ZoneInfo(timezone))
+    except (ValueError, KeyError):
+        return "time unavailable"
+    return local.strftime("%Y-%m-%d %I:%M %p %Z")
+
+
 class _CalendarDescriptionParser(HTMLParser):
     _HIDDEN_TAGS = {"script", "style", "template", "noscript"}
     _BLOCK_TAGS = {
@@ -558,9 +579,17 @@ def _render_result(
                 if requested_calendar_ids == ["primary"]
                 else "The selected Google Calendars appear free"
             )
+            local_start = _format_local_datetime(
+                data.get("time_min"),
+                data.get("time_zone", timezone),
+            )
+            local_end = _format_local_datetime(
+                data.get("time_max"),
+                data.get("time_zone", timezone),
+            )
             return (
                 f"{scope} for the requested interval "
-                f"({data.get('time_min')} to {data.get('time_max')}, "
+                f"({local_start} to {local_end}, "
                 f"{data.get('time_zone', timezone)})."
             )
         interval_text = ", ".join(

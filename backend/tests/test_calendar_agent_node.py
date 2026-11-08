@@ -570,6 +570,28 @@ def test_partial_freebusy_data_never_claims_availability():
     assert "free" not in response.casefold()
 
 
+def test_freebusy_result_displays_local_date_and_times():
+    response = calendar_agent_node._render_result(
+        "check_calendar_availability",
+        {
+            "time_min": "2026-11-14T04:30:00Z",
+            "time_max": "2026-11-14T06:30:00Z",
+            "time_zone": "Asia/Kolkata",
+            "calendars": {
+                "primary": {
+                    "busy": [],
+                    "errors": [],
+                },
+            },
+        },
+        "Asia/Kolkata",
+        ["primary"],
+    )
+
+    assert "2026-11-14 10:00 AM IST" in response
+    assert "2026-11-14 12:00 PM IST" in response
+
+
 def test_freebusy_missing_grant_is_explained_without_tool_invocation(monkeypatch):
     factory = Mock()
     monkeypatch.setattr(calendar_agent_node, "create_calendar_tools", factory)

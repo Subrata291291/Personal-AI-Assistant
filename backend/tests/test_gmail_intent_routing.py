@@ -863,6 +863,81 @@ def test_calendar_relative_dates_use_one_request_time_in_user_timezone():
     )
 
 
+def test_calendar_availability_uses_relative_and_explicit_dates_in_order():
+    request_time = "2026-11-07T18:45:00+00:00"
+
+    tomorrow = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Am I free tomorrow between 10 AM and 12 PM?",
+            user_timezone="Asia/Kolkata",
+            request_time=request_time,
+        )
+    )
+    explicit_date = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Am I free on November 14th 2026 between 10 AM and 12 PM?",
+            user_timezone="Asia/Kolkata",
+            request_time=request_time,
+        )
+    )
+
+    assert tomorrow["gmail_plan"]["calendar_arguments"]["time_min"] == (
+        "2026-11-09T10:00:00+05:30"
+    )
+    assert tomorrow["gmail_plan"]["calendar_arguments"]["time_max"] == (
+        "2026-11-09T12:00:00+05:30"
+    )
+    assert explicit_date["gmail_plan"]["calendar_arguments"]["time_min"] == (
+        "2026-11-14T10:00:00+05:30"
+    )
+    assert explicit_date["gmail_plan"]["calendar_arguments"]["time_max"] == (
+        "2026-11-14T12:00:00+05:30"
+    )
+
+
+def test_calendar_availability_ignores_prior_relative_context_when_explicit_date_is_given():
+    state = _state(
+        "Am I free on November 14th 2026 between 10 AM and 12 PM?",
+        user_timezone="Asia/Kolkata",
+        request_time="2026-11-07T18:45:00+00:00",
+        messages=[
+            {"role": "user", "content": "Am I free tomorrow between 10 AM and 12 PM?"},
+            {"role": "assistant", "content": "Tomorrow is 2026-11-09."},
+        ],
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "check_calendar_availability"
+    assert routed["gmail_plan"]["calendar_arguments"]["time_min"] == (
+        "2026-11-14T10:00:00+05:30"
+    )
+    assert routed["gmail_plan"]["calendar_arguments"]["time_max"] == (
+        "2026-11-14T12:00:00+05:30"
+    )
+
+
+@pytest.mark.parametrize(
+    "message, expected_tool",
+    [
+        ("Am I free on November 14th 2026 between 12 PM and 10 AM?", "clarify"),
+        ("Am I free on November 14th 2026 between 11 PM and 12:30 AM?", "clarify"),
+        ("Am I free on November 14th 2026 between 10 AM and 12 PM?", "check_calendar_availability"),
+    ],
+)
+def test_calendar_availability_rejects_invalid_or_cross_day_intervals(message, expected_tool):
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            message,
+            user_timezone="Asia/Kolkata",
+            request_time="2026-11-08T18:45:00+00:00",
+        )
+    )
+
+    assert routed["gmail_plan"]["calendar_tool"] == expected_tool
+
+
 def test_calendar_date_ranges_afternoon_search_and_implicit_today_freebusy():
     date_range = gmail_agent_nodes.gmail_intent_router_node(
         _state(

@@ -74,6 +74,51 @@ def test_refresh_token_errors_are_classified_without_exposing_provider_data(
     assert "client-secret" not in str(raised.value)
 
 
+def test_expired_oauth_token_can_enter_refresh_path(monkeypatch):
+    user_id = uuid4()
+    connection_id = uuid4()
+    credential = SimpleNamespace(
+        access_token_encrypted="encrypted-access",
+        refresh_token_encrypted="encrypted-refresh",
+        expires_at=datetime(2000, 1, 1, tzinfo=timezone.utc),
+        token_type="Bearer",
+    )
+    repository = Mock()
+    repository.get_by_connection.return_value = credential
+    repository.get_by_connection_for_update.return_value = credential
+    service = OAuthCredentialService(db=None)
+    service.repository = repository
+    refresh = AsyncMock(return_value={
+        "access_token": "rotated-access",
+        "expires_in": 3600,
+        "token_type": "Bearer",
+    })
+    update_credentials = Mock(return_value={"token_type": "Bearer"})
+    service.update_credentials = update_credentials
+    monkeypatch.setattr(
+        "app.services.oauth_credential_service.decrypt_data",
+        lambda value: {
+            "encrypted-access": "expired-access",
+            "encrypted-refresh": "refresh-value",
+        }[value],
+    )
+    monkeypatch.setattr(
+        "app.services.oauth_credential_service.GoogleOAuthClient",
+        lambda: SimpleNamespace(refresh_access_token=refresh),
+    )
+
+    access_token = asyncio.run(
+        service.get_valid_access_token(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+    )
+
+    assert access_token == "rotated-access"
+    refresh.assert_awaited_once_with(refresh_token="refresh-value")
+    update_credentials.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("service", "expected_scopes", "forbidden_scopes"),
     [

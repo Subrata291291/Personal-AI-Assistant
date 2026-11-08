@@ -8,6 +8,8 @@ from pydantic import EmailStr
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, require_integration_enabled
+from app.core.error_logging import log_exception_traceback
+from app.core.request_metrics import request_id
 from app.db.session import get_db
 from app.integrations.google.exceptions import GoogleAPIError
 from app.schemas.calendar import (
@@ -25,6 +27,14 @@ router = APIRouter(
     dependencies=[Depends(require_integration_enabled("calendar"))],
 )
 logger = logging.getLogger(__name__)
+
+
+def _log_unexpected_calendar_error(operation: str, exc: Exception) -> None:
+    log_exception_traceback(
+        logger,
+        f"Unexpected Calendar {operation} failure | request_id={request_id()}",
+        exc,
+    )
 
 
 def _get_user_id(current_user: dict) -> UUID:
@@ -103,6 +113,7 @@ async def list_calendars(
     except HTTPException:
         raise
     except Exception as exc:
+        _log_unexpected_calendar_error("list_calendars", exc)
         _handle_calendar_error(exc)
 
 
@@ -154,6 +165,7 @@ async def list_calendar_events(
         _handle_calendar_error(exc)
     except Exception as exc:
         response_status = 500
+        _log_unexpected_calendar_error("list_events", exc)
         _handle_calendar_error(exc)
     finally:
         logger.info(
