@@ -175,6 +175,7 @@ class GoogleAPIClient:
     ):
         """Verify connection ownership and optionally serialize provider I/O."""
         connection_repository = UserConnectionRepository(db)
+        lock_started_at = perf_counter()
         if serialize:
             connection = (
                 connection_repository.get_active_google_connection_for_update(
@@ -186,6 +187,11 @@ class GoogleAPIClient:
             connection = connection_repository.get_active_google_connection(
                 user_id=user_id,
                 connection_id=connection_id,
+            )
+        if serialize:
+            record_timing(
+                "connection_lock_acquisition",
+                (perf_counter() - lock_started_at) * 1000,
             )
         if connection is None:
             db.rollback()
@@ -205,6 +211,29 @@ class GoogleAPIClient:
         except Exception:
             db.rollback()
             raise
+
+    @staticmethod
+    def _is_concurrent_read(method: str, url: str) -> bool:
+        """Classify the narrow set of provider reads allowed concurrently."""
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        path = parsed.path
+
+        if hostname in {"gmail.googleapis.com"}:
+            return method == "GET" and path.startswith("/gmail/v1/")
+        if hostname in {"calendar.googleapis.com"}:
+            if method == "GET":
+                return True
+            return method == "POST" and path.endswith("/freeBusy")
+        if hostname == "www.googleapis.com":
+            if method == "GET":
+                return path.startswith("/calendar/v3/")
+            return (
+                method == "POST"
+                and path.startswith("/calendar/v3/")
+                and path.endswith("/freeBusy")
+            )
+        return False
 
     def _validate_url(self, url: str) -> None:
 
@@ -323,7 +352,18 @@ class GoogleAPIClient:
                     )
                 finally:
                     duration_ms = (perf_counter() - started_at) * 1000
-                    record_timing("gmail_api", duration_ms)
+                    provider_host = urlsplit(url).hostname
+                    provider_path = urlsplit(url).path
+                    if (
+                        provider_host == "calendar.googleapis.com"
+                        or (
+                            provider_host == "www.googleapis.com"
+                            and provider_path.startswith("/calendar/v3/")
+                        )
+                    ):
+                        record_timing("google_calendar_api", duration_ms)
+                    elif provider_host == "gmail.googleapis.com":
+                        record_timing("gmail_api", duration_ms)
                     logger.info(
                         "google_api_request_completed | request_id=%s "
                         "| method=%s | duration_ms=%.2f | status=%s "
@@ -377,7 +417,13 @@ class GoogleAPIClient:
                     attempt + 1,
                     type(exc).__name__,
                 )
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                backoff_started_at = perf_counter()
+                backoff_seconds = 0.5 * (2 ** attempt)
+                await asyncio.sleep(backoff_seconds)
+                record_timing(
+                    "retry_backoff",
+                    (perf_counter() - backoff_started_at) * 1000,
+                )
                 continue
 
             if response.is_success:
@@ -427,7 +473,12 @@ class GoogleAPIClient:
                         attempt + 1,
                         status_code,
                     )
+                    backoff_started_at = perf_counter()
                     await asyncio.sleep(min(max(delay, 0), 10))
+                    record_timing(
+                        "retry_backoff",
+                        (perf_counter() - backoff_started_at) * 1000,
+                    )
                     continue
 
                 raise GoogleAPIError(
@@ -478,12 +529,12 @@ class GoogleAPIClient:
 
         if normalized_method not in self.ALLOWED_METHODS:
             raise ValueError("Unsupported HTTP method.")
-        if allow_concurrent_read and (
-            normalized_method != "GET"
-            or urlsplit(url).hostname != "gmail.googleapis.com"
+        if (
+            allow_concurrent_read
+            and not self._is_concurrent_read(normalized_method, url)
         ):
             raise ValueError(
-                "Concurrent connection access is only allowed for Gmail reads."
+                "Concurrent connection access is only allowed for Gmail or Calendar reads."
             )
         if read_context is not None and (
             normalized_method != "GET"
