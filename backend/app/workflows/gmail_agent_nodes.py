@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.core.request_metrics import request_id
 from langgraph.runtime import Runtime
 from pydantic import ValidationError
 
@@ -56,6 +57,9 @@ from app.workflows.calendar_create_draft import (
     extract_calendar_create_draft,
     extract_explicit_calendar_date as _extract_explicit_calendar_date,
     merge_calendar_create_draft,
+)
+from app.workflows.calendar_update_parser import (
+    _safe_timezone_for_logging,
 )
 
 
@@ -307,6 +311,10 @@ def _plan_prompt(state: ChatState) -> str:
         "Use approval_workflow "
         "only when the user asks to approve, reject, or execute an existing "
         "approval proposal; include operation as approve, reject, or execute. "
+        "Treat approval and separate Execute steps described as future workflow "
+        "instructions as part of the requested action, not as a command to execute "
+        "an existing proposal. Calendar Create or Update requests that ask to "
+        "prepare a proposal must use their Calendar proposal tool. "
         "Never create a proposal or execute an action from a planner decision. "
         "Use general for "
         "non-integration requests. Use google_drive, google_contacts, or tasks "
@@ -1022,6 +1030,19 @@ def _calendar_event_creation_request(text: str) -> bool:
     ))
 
 
+def _is_calendar_update_request(text: str) -> bool:
+    lowered = text.casefold()
+    return bool(re.search(
+        r"\b(?:move|reschedule|update|edit|change|modify)\b.{0,100}"
+        r"\b(?:my\s+)?(?:existing\s+)?(?:google\s+)?"
+        r"(?:calendar\s+)?(?:meetings?|events?|appointments?|sessions?|classes?|calendar)\b|"
+        r"\b(?:my\s+)?(?:calendar\s+)?"
+        r"(?:meetings?|events?|appointments?|sessions?|classes?)\b.{0,100}"
+        r"\b(?:move|reschedule|update|edit|change|modify)\b",
+        lowered,
+    ))
+
+
 def _deterministic_calendar_plan(
     state: ChatState,
 ) -> tuple[dict[str, Any], str] | None:
@@ -1044,13 +1065,7 @@ def _deterministic_calendar_plan(
         calendar_capabilities.get("write_execution_available", False),
     )
 
-    update_request = bool(re.search(
-        r"\b(?:move|reschedule|update|edit|change|modify)\b.{0,80}"
-        r"\b(?:meeting|event|appointment|session|class|calendar)\b|"
-        r"\b(?:meeting|event|appointment|session|class)\b.{0,80}"
-        r"\b(?:move|reschedule|update|edit|change|modify)\b",
-        lowered,
-    ))
+    update_request = _is_calendar_update_request(text)
     delete_request = bool(re.search(
         r"\b(?:delete|remove|cancel)\b.{0,80}"
         r"\b(?:meeting|event|appointment|session|class|calendar)\b|"
@@ -1756,6 +1771,21 @@ def _deterministic_assistant_plan(
         ).model_dump(mode="json")
         return plan, "google_calendar"
 
+    if _is_calendar_update_request(text):
+        calendar_capabilities = (
+            (state.get("assistant_capabilities") or {}).get(
+                "google_calendar",
+                {},
+            )
+        )
+        write_permission_granted = calendar_capabilities.get(
+            "write_permission_granted",
+            calendar_capabilities.get("write_execution_available", False),
+        )
+        if not write_permission_granted:
+            return _calendar_plan("update_calendar_event_proposal")
+        return None
+
     if _is_explicit_memory_update_request(text):
         return (
             {"intent": "memory_update", "memory_scope": "episodic"},
@@ -1856,21 +1886,29 @@ def _deterministic_assistant_plan(
     ):
         return None
 
-    approval_match = re.search(
-        r"\b(approve|reject|execute)\b.{0,60}\b"
-        r"(?:approval|proposal|approved send|email send)\b|"
-        r"\b(?:approval|proposal)\b.{0,60}\b(approve|reject|execute)\b",
+    approval_match = re.match(
+        r"^\s*(?:please\s+)?(?:i\s+(?:explicitly\s+)?)?"
+        r"(approve|reject|execute)\b",
         lowered,
     )
-    if approval_match:
-        operation = next(
-            group for group in approval_match.groups() if group is not None
-        )
+    approval_target = bool(re.search(
+        r"\b(?:proposal|approval|approved|send)\b",
+        lowered,
+    )) or isinstance(state.get("pending_calendar_create_proposal"), dict)
+    if approval_match and approval_target:
+        operation = approval_match.group(1)
         plan = ApprovalWorkflowPlan(
             intent="approval_workflow",
             operation=operation,
         ).model_dump(mode="json")
-        return plan, "gmail"
+        calendar_target = (
+            bool(re.search(r"\bcalendar\b", lowered))
+            or isinstance(
+                state.get("pending_calendar_create_proposal"),
+                dict,
+            )
+        )
+        return plan, "google_calendar" if calendar_target else "gmail"
 
     integration_plan = _deterministic_integration_plan(lowered)
     if integration_plan is not None:
@@ -2382,7 +2420,13 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             "calendar_create_draft": draft,
         }
 
-    if _is_mixed_gmail_calendar_request(state["user_message"]):
+    calendar_update_request = _is_calendar_update_request(
+        state["user_message"]
+    )
+    if (
+        not calendar_update_request
+        and _is_mixed_gmail_calendar_request(state["user_message"])
+    ):
         return {
             "gmail_plan": {
                 "intent": "clarify",
@@ -2390,7 +2434,10 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             },
             "assistant_route": "gmail",
         }
-    if _is_mixed_google_service_request(state["user_message"]):
+    if (
+        not calendar_update_request
+        and _is_mixed_google_service_request(state["user_message"])
+    ):
         return {
             "gmail_plan": {
                 "intent": "clarify",
@@ -2407,15 +2454,19 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             "assistant_route": route,
         }
 
-    if _ambiguous_source_request(state):
+    if not calendar_update_request and _ambiguous_source_request(state):
         return {
             "gmail_plan": _fallback_plan(),
             "assistant_route": "gmail",
         }
 
-    deterministic_plan = _deterministic_read_plan(
-        state["user_message"],
-        state.get("available_gmail_sources"),
+    deterministic_plan = (
+        None
+        if calendar_update_request
+        else _deterministic_read_plan(
+            state["user_message"],
+            state.get("available_gmail_sources"),
+        )
     )
     if deterministic_plan is not None:
         return {
@@ -2424,7 +2475,11 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
         }
 
     contextual_messages = _contextual_followup_messages(state)
-    if not _requires_intent_planning(state["user_message"]) and not contextual_messages:
+    if (
+        not calendar_update_request
+        and not _requires_intent_planning(state["user_message"])
+        and not contextual_messages
+    ):
         return {
             "gmail_plan": {"intent": "general"},
             "assistant_route": "general",
@@ -2514,29 +2569,80 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
     if _is_calendar_request(state["user_message"]) and (
         plan.intent != "google_calendar"
     ):
+        normalized_plan = IntegrationPlan(
+            intent="google_calendar",
+            calendar_tool="clarify",
+        ).model_dump(mode="json")
+        if _is_calendar_update_request(state["user_message"]):
+            logger.info(
+                "calendar_update_trace | request_id=%s "
+                "| boundary=planner_normalized | message_length=%d "
+                "| timezone_present=%s | planner_intent=%s "
+                "| planner_tool=%s | planner_arguments_null=%s "
+                "| planner_timezone=%s | selected_route=google_calendar "
+                "| module_path=%s",
+                request_id(),
+                len(state["user_message"]),
+                "Asia/Kolkata" in state["user_message"],
+                plan.intent,
+                normalized_plan.get("calendar_tool"),
+                not isinstance(normalized_plan.get("calendar_arguments"), dict),
+                _safe_timezone_for_logging(
+                    normalized_plan.get("calendar_arguments", {}).get(
+                        "time_zone"
+                    )
+                    if isinstance(
+                        normalized_plan.get("calendar_arguments"),
+                        dict,
+                    )
+                    else None
+                ),
+                __file__,
+            )
         return {
-            "gmail_plan": IntegrationPlan(
-                intent="google_calendar",
-                calendar_tool="clarify",
-            ).model_dump(mode="json"),
+            "gmail_plan": normalized_plan,
             "assistant_route": "google_calendar",
             "provider": response.provider,
             "model": response.model,
         }
 
+    normalized_plan = plan.model_dump(mode="json")
+    selected_route = (
+        plan.intent
+        if plan.intent in {
+            "google_drive",
+            "google_calendar",
+            "google_contacts",
+            "tasks",
+        }
+        else "daily_planning" if plan.intent == "daily_planning"
+        else "general" if plan.intent == "general" else "gmail"
+    )
+    if _is_calendar_update_request(state["user_message"]):
+        planner_arguments = normalized_plan.get("calendar_arguments")
+        logger.info(
+            "calendar_update_trace | request_id=%s "
+            "| boundary=planner_normalized | message_length=%d "
+            "| timezone_present=%s | planner_intent=%s "
+            "| planner_tool=%s | planner_arguments_null=%s "
+            "| planner_timezone=%s | selected_route=%s | module_path=%s",
+            request_id(),
+            len(state["user_message"]),
+            "Asia/Kolkata" in state["user_message"],
+            normalized_plan.get("intent"),
+            normalized_plan.get("calendar_tool"),
+            not isinstance(planner_arguments, dict),
+            _safe_timezone_for_logging(
+                planner_arguments.get("time_zone")
+                if isinstance(planner_arguments, dict)
+                else None
+            ),
+            selected_route,
+            __file__,
+        )
     return {
-        "gmail_plan": plan.model_dump(mode="json"),
-        "assistant_route": (
-            plan.intent
-            if plan.intent in {
-                "google_drive",
-                "google_calendar",
-                "google_contacts",
-                "tasks",
-            }
-            else "daily_planning" if plan.intent == "daily_planning"
-            else "general" if plan.intent == "general" else "gmail"
-        ),
+        "gmail_plan": normalized_plan,
+        "assistant_route": selected_route,
         "provider": response.provider,
         "model": response.model,
     }

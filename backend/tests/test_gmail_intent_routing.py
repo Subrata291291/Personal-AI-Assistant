@@ -1423,6 +1423,137 @@ def test_calendar_route_ignores_stale_conversation_events_and_clarifies():
     assert stale_event not in json.dumps(routed)
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "Update my existing Google Calendar event named "
+            "Personal AI Assistant - Calendar Test. Keep the same date, "
+            "title, timezone and calendar. Change the time from "
+            "10:00 AM-10:30 AM to 11:00 AM-11:30 AM on November 10, 2026. "
+            "Prepare a saved update proposal. Show me the original and "
+            "proposed event details. Wait for my explicit approval and "
+            "separate Execute action. Do not execute automatically."
+        ),
+        "Update my existing Calendar event named Planning and change its time.",
+        "Change the time of my Calendar event named Planning.",
+        "Move my meeting named Planning from 10 AM to 11 AM.",
+        (
+            "Update my Calendar event named Planning and send an invite "
+            "message to the attendee after I approve it."
+        ),
+    ],
+)
+def test_calendar_update_priority_preserves_update_plan_over_gmail_or_approval(
+    message,
+    monkeypatch,
+):
+    response = LLMResponse(
+        content=json.dumps({
+            "intent": "google_calendar",
+            "calendar_tool": "update_calendar_event_proposal",
+            "calendar_arguments": {
+                "calendar_id": "primary",
+                "event_query": "Personal AI Assistant - Calendar Test",
+                "changes": {"summary": "Updated Calendar Test"},
+            },
+        }),
+        provider="test",
+        model="test-model",
+        latency_ms=0,
+        finish_reason="stop",
+    )
+    calls = []
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda request: calls.append(request) or response,
+    )
+    state = _calendar_create_state(message)
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+
+    assert calls
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["intent"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "update_calendar_event_proposal"
+    )
+
+
+def test_calendar_update_routing_ignores_stale_completed_create_proposal(
+    monkeypatch,
+):
+    response = LLMResponse(
+        content=json.dumps({
+            "intent": "google_calendar",
+            "calendar_tool": "update_calendar_event_proposal",
+            "calendar_arguments": {
+                "calendar_id": "primary",
+                "event_query": "Personal AI Assistant - Calendar Test",
+                "changes": {"summary": "Updated Calendar Test"},
+            },
+        }),
+        provider="test",
+        model="test-model",
+        latency_ms=0,
+        finish_reason="stop",
+    )
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda _request: response,
+    )
+    state = _calendar_create_state(
+        "Update my Calendar event named Planning and change its time. Wait "
+        "for approval and a separate Execute action.",
+        pending_calendar_create_proposal={
+            "proposal_id": str(uuid4()),
+            "status": "completed",
+            "action_type": "calendar.create_event",
+        },
+        messages=[
+            {"role": "user", "content": "Create a Calendar event named Planning."},
+            {"role": "assistant", "content": "The Calendar event was created."},
+        ],
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "update_calendar_event_proposal"
+    )
+
+
+def test_direct_calendar_execute_and_genuine_gmail_send_keep_their_intents():
+    pending_calendar = {
+        "proposal_id": str(uuid4()),
+        "action_type": "calendar.create_event",
+        "status": "approved",
+    }
+    direct_execute = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Execute the approved Calendar proposal.",
+            pending_calendar_create_proposal=pending_calendar,
+        )
+    )
+    gmail_send = gmail_agent_nodes.gmail_intent_router_node(
+        _state("Send this email to alice@example.com.")
+    )
+
+    assert direct_execute["gmail_plan"] == {
+        "intent": "approval_workflow",
+        "operation": "execute",
+    }
+    assert direct_execute["assistant_route"] == "google_calendar"
+    assert gmail_send["assistant_route"] == "gmail"
+    assert gmail_send["gmail_plan"]["intent"] in {
+        "gmail_send",
+        "gmail_compose",
+    }
+
+
 def test_general_assistant_questions_do_not_route_to_calendar():
     routed = gmail_agent_nodes.gmail_intent_router_node(
         _state("Explain how time zones work.")

@@ -7,6 +7,7 @@ from threading import Event, Thread
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
+from app.core.request_metrics import request_id as correlation_request_id
 from app.core.error_logging import log_exception_traceback
 from app.memory.memory_pipeline import MemoryPipeline
 from app.services.user_settings_service import UserSettingsService
@@ -823,6 +824,18 @@ class ChatService:
                     "thread_id": str(uuid4()),
                 }
             }
+
+            lowered_content = normalized_content.casefold()
+            if "calendar" in lowered_content and "update" in lowered_content:
+                logger.info(
+                    "calendar_update_trace | request_id=%s "
+                    "| boundary=chatservice_dispatch | message_length=%d "
+                    "| timezone_present=%s | module_path=%s",
+                    correlation_request_id(),
+                    len(normalized_content),
+                    "Asia/Kolkata" in normalized_content,
+                    __file__,
+                )
 
             # 12. Start heartbeat immediately before LLM execution.
             (

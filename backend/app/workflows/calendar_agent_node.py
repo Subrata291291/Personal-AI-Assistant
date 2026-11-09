@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.core.request_metrics import request_id
 from langgraph.runtime import Runtime
 from pydantic import ValidationError
 
@@ -26,6 +27,10 @@ from app.workflows.calendar_create_draft import (
     CalendarCreateDraft,
     draft_missing_fields,
     draft_to_event_arguments,
+)
+from app.workflows.calendar_update_parser import (
+    merge_calendar_update_arguments,
+    _safe_timezone_for_logging,
 )
 
 logger = logging.getLogger(__name__)
@@ -239,12 +244,23 @@ def _clarification(state: ChatState) -> str:
             "Which date or date range should I check for overlapping "
             "Calendar events?"
         )
-    if re.search(r"\b(?:create|add|book|schedule|cancel|delete|remove|"
-                 r"update|edit|change|modify|move|reschedule|invite|rsvp)\b",
-                 lowered):
+    if re.search(r"\b(?:create|add|book|schedule)\b", lowered):
         return (
-            "I can read your Google Calendar, but Calendar changes are not "
-            "available. I have not created or modified anything."
+            "What event would you like to create? Please include its title, "
+            "date, and time."
+        )
+    if re.search(r"\b(?:cancel|delete|remove)\b", lowered):
+        return (
+            "Which Calendar event would you like to remove? Please include "
+            "its title, time, or event ID."
+        )
+    if re.search(
+        r"\b(?:move|reschedule|update|edit|change|modify|invite|rsvp)\b",
+        lowered,
+    ):
+        return (
+            "Which Calendar event do you mean, and what would you like to "
+            "change?"
         )
     return (
         "I couldn’t determine which Calendar information you want. Please "
@@ -828,11 +844,100 @@ def _resolve_relative_time_changes(
     return changes, zone.key
 
 
+def _is_calendar_update_request(text: str) -> bool:
+    return bool(re.search(
+        r"\b(?:move|reschedule|update|edit|change|modify)\b.{0,100}"
+        r"\b(?:my\s+)?(?:existing\s+)?(?:google\s+)?"
+        r"(?:calendar\s+)?(?:meetings?|events?|appointments?|sessions?|classes?|calendar)\b|"
+        r"\b(?:my\s+)?(?:calendar\s+)?"
+        r"(?:meetings?|events?|appointments?|sessions?|classes?)\b.{0,100}"
+        r"\b(?:move|reschedule|update|edit|change|modify)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+
+def _update_event_matches_request(
+    event: dict[str, Any],
+    event_query: str | None,
+    details: dict[str, Any],
+) -> bool:
+    if details.get("event_title_is_explicit"):
+        summary = event.get("summary")
+        if not isinstance(summary, str) or not isinstance(event_query, str):
+            return False
+        if " ".join(summary.casefold().split()) != " ".join(
+            event_query.casefold().split()
+        ):
+            return False
+
+    event_date = details.get("event_date")
+    original_start = details.get("original_start_time")
+    original_end = details.get("original_end_time")
+    if event_date is None and original_start is None and original_end is None:
+        return True
+
+    start = event.get("start")
+    end = event.get("end")
+    if not isinstance(start, dict) or not isinstance(end, dict):
+        return False
+    event_start = start.get("date_time")
+    event_end = end.get("date_time")
+    zone_name = details.get("time_zone")
+    if not isinstance(zone_name, str):
+        return False
+    try:
+        zone = ZoneInfo(zone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        return False
+
+    if event_date is not None:
+        all_day_date = start.get("date")
+        if isinstance(all_day_date, date):
+            return (
+                original_start is None
+                and original_end is None
+                and all_day_date == event_date
+            )
+        if not isinstance(event_start, datetime):
+            return False
+        if event_start.astimezone(zone).date() != event_date:
+            return False
+
+    if original_start is not None:
+        if not isinstance(event_start, datetime):
+            return False
+        local_start = event_start.astimezone(zone)
+        if (local_start.hour, local_start.minute) != (
+            original_start.hour,
+            original_start.minute,
+        ):
+            return False
+
+    if original_end is not None:
+        if not isinstance(event_end, datetime):
+            return False
+        local_end = event_end.astimezone(zone)
+        if (local_end.hour, local_end.minute) != (
+            original_end.hour,
+            original_end.minute,
+        ):
+            return False
+        if event_date is not None:
+            expected_end_date = event_date
+            if original_start is not None and original_end <= original_start:
+                expected_end_date += timedelta(days=1)
+            if local_end.date() != expected_end_date:
+                return False
+    return True
+
+
 def _prepare_event_mutation(
     state: ChatState,
     runtime: Runtime[ChatContext],
     arguments: object,
     action_type: str,
+    update_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     capabilities = (
         (state.get("assistant_capabilities") or {}).get("google_calendar", {})
@@ -890,8 +995,10 @@ def _prepare_event_mutation(
         )
     elif not isinstance(arguments, dict):
         response = (
-            "I couldn’t identify the Calendar event or requested changes. "
-            "Please specify the event and what should change."
+            "Please specify which Calendar event to update and what you "
+            "would like to change. Nothing was changed."
+            if action_type == "calendar.update_event"
+            else "I couldn’t identify the Calendar event. Please specify it."
         )
     else:
         response = ""
@@ -906,8 +1013,28 @@ def _prepare_event_mutation(
                 {"role": "assistant", "content": response},
             ],
         }
+    if action_type == "calendar.update_event" and update_details:
+        parse_errors = update_details.get("errors") or []
+        if parse_errors:
+            response = (
+                "I couldn’t safely interpret the requested Calendar "
+                f"date or time ({parse_errors[0]}). Please clarify it. "
+                "Nothing was changed."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
 
-    calendar_id = arguments.get("calendar_id", "primary")
+    calendar_name = arguments.get("calendar_name")
+    calendar_id = arguments.get("calendar_id")
+    if not calendar_id and not calendar_name:
+        calendar_id = "primary"
     event_id = arguments.get("event_id")
     event_query = arguments.get("event_query")
     changes = arguments.get("changes")
@@ -934,7 +1061,58 @@ def _prepare_event_mutation(
             and not (is_contextual_followup and query_in_recent_context)
         ):
             event_query = None
-    if event_id is None and event_query is None:
+    if action_type == "calendar.update_event":
+        missing_event = event_id is None and not (
+            isinstance(event_query, str) and event_query.strip()
+        )
+        missing_changes = not isinstance(changes, dict) or not changes
+        if missing_event or missing_changes:
+            if missing_event and missing_changes:
+                response = (
+                    "Please specify which Calendar event to update and what "
+                    "you would like to change. Nothing was changed."
+                )
+            elif missing_event:
+                response = (
+                    "Which Calendar event should I update? Please include "
+                    "its title, time, or event ID. Nothing was changed."
+                )
+            else:
+                details_missing = (
+                    update_details.get("missing_fields", [])
+                    if update_details
+                    else []
+                )
+                requested_times = [
+                    field for field in details_missing
+                    if field in {"proposed start time", "proposed end time"}
+                ]
+                if requested_times:
+                    response = (
+                        "Please specify the "
+                        + " and ".join(requested_times)
+                        + " for the Calendar Update. Nothing was changed."
+                    )
+                elif "timezone" in details_missing:
+                    response = (
+                        "Please specify the IANA timezone for the proposed "
+                        "Calendar times. Nothing was changed."
+                    )
+                else:
+                    response = (
+                        "What would you like to change about the Calendar "
+                        "event? Nothing was changed."
+                    )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+    elif event_id is None and event_query is None:
         response = (
             "Which Calendar event do you mean? Please include its title, "
             "time, or event ID in your latest message. Nothing was changed."
@@ -951,26 +1129,120 @@ def _prepare_event_mutation(
     try:
         with SessionLocal() as db:
             service = CalendarService(db)
+            if isinstance(calendar_name, str) and not calendar_id:
+                calendars: list[dict[str, Any]] = []
+                page_token = None
+                seen_page_tokens: set[str] = set()
+                calendar_list_complete = False
+                for _ in range(CALENDAR_LIST_MAX_PAGES):
+                    page = asyncio.run(
+                        service.list_calendars(
+                            user_id=UUID(str(user_id)),
+                            connection_id=UUID(str(connection_id)),
+                            max_results=250,
+                            page_token=page_token,
+                        )
+                    )
+                    page_calendars = page.get("calendars")
+                    if not isinstance(page_calendars, list):
+                        raise ValueError("Calendar returned invalid calendar results.")
+                    calendars.extend(
+                        item for item in page_calendars
+                        if isinstance(item, dict)
+                    )
+                    next_page_token = page.get("next_page_token")
+                    if not next_page_token:
+                        calendar_list_complete = True
+                        break
+                    if (
+                        not isinstance(next_page_token, str)
+                        or next_page_token in seen_page_tokens
+                    ):
+                        raise ValueError("Calendar returned invalid pagination.")
+                    seen_page_tokens.add(next_page_token)
+                    page_token = next_page_token
+                if not calendar_list_complete:
+                    response = (
+                        "I couldn’t safely complete the Calendar name "
+                        "lookup. Nothing was changed."
+                    )
+                    return {
+                        "assistant_response": response,
+                        "provider": "",
+                        "model": "",
+                        "messages": [
+                            {"role": "user", "content": state["user_message"]},
+                            {"role": "assistant", "content": response},
+                        ],
+                    }
+                matches = [
+                    item for item in calendars
+                    if isinstance(item.get("summary"), str)
+                    and item["summary"].strip().casefold()
+                    == calendar_name.strip().casefold()
+                ]
+                if len(matches) != 1 or not isinstance(matches[0].get("id"), str):
+                    response = (
+                        f"I couldn’t uniquely resolve the Calendar "
+                        f"{calendar_name!r}. Please choose an accessible "
+                        "calendar that matches exactly one name. Nothing was changed."
+                    )
+                    return {
+                        "assistant_response": response,
+                        "provider": "",
+                        "model": "",
+                        "messages": [
+                            {"role": "user", "content": state["user_message"]},
+                            {"role": "assistant", "content": response},
+                        ],
+                    }
+                calendar_id = matches[0]["id"]
             if not isinstance(event_id, str) or not event_id.strip():
                 if not isinstance(event_query, str) or not event_query.strip():
                     raise ValueError("An event ID or event search is required.")
+                lookup_time_min = (
+                    update_details.get("lookup_time_min")
+                    if update_details
+                    else None
+                )
+                lookup_time_max = (
+                    update_details.get("lookup_time_max")
+                    if update_details
+                    else None
+                )
                 matches = asyncio.run(
                     service.list_events(
                         user_id=UUID(str(user_id)),
                         connection_id=UUID(str(connection_id)),
                         calendar_id=calendar_id,
                         max_results=10,
+                        time_min=lookup_time_min,
+                        time_max=lookup_time_max,
                         query=event_query,
-                        time_zone=state.get("user_timezone", "UTC"),
+                        time_zone=(
+                            update_details.get("time_zone")
+                            if update_details
+                            else state.get("user_timezone", "UTC")
+                        ),
                     )
                 )
                 events = matches.get("events")
                 if not isinstance(events, list):
                     raise ValueError("Calendar returned invalid event results.")
+                if action_type == "calendar.update_event" and update_details:
+                    events = [
+                        event for event in events
+                        if isinstance(event, dict)
+                        and _update_event_matches_request(
+                            event,
+                            event_query,
+                            update_details,
+                        )
+                    ]
                 if not events:
                     response = (
-                        "Google Calendar returned no matching events for this "
-                        "live request. Nothing was changed."
+                        "I couldn’t find an existing Calendar event matching "
+                        "the requested title and date/time. Nothing was changed."
                     )
                     return {
                         "assistant_response": response,
@@ -1014,6 +1286,28 @@ def _prepare_event_mutation(
                     event_id=event_id,
                 )
             )
+            if (
+                action_type == "calendar.update_event"
+                and update_details
+                and not _update_event_matches_request(
+                    event,
+                    event_query if isinstance(event_query, str) else None,
+                    update_details,
+                )
+            ):
+                response = (
+                    "The selected Calendar event does not match the "
+                    "requested title and date/time. Nothing was changed."
+                )
+                return {
+                    "assistant_response": response,
+                    "provider": "",
+                    "model": "",
+                    "messages": [
+                        {"role": "user", "content": state["user_message"]},
+                        {"role": "assistant", "content": response},
+                    ],
+                }
             if event.get("recurrence") and not event.get("recurring_event_id"):
                 response = (
                     "This is a recurring Calendar series. Series-wide changes "
@@ -1035,7 +1329,11 @@ def _prepare_event_mutation(
                 if not isinstance(changes, dict):
                     raise ValueError("Event changes are required.")
                 changes = dict(changes)
-                event_timezone = state.get("user_timezone", "UTC")
+                event_timezone = (
+                    update_details.get("time_zone")
+                    if update_details
+                    else None
+                ) or state.get("user_timezone", "UTC")
                 changes, time_zone = _resolve_relative_time_changes(
                     event,
                     changes,
@@ -1238,6 +1536,34 @@ def calendar_agent_node(
         }
     tool_name = plan.get("calendar_tool")
     arguments = plan.get("calendar_arguments")
+    update_details = None
+    if (
+        plan.get("intent") == "google_calendar"
+        and _is_calendar_update_request(state["user_message"])
+    ):
+        logger.info(
+            "calendar_update_trace | request_id=%s "
+            "| boundary=calendar_agent_preparse | message_length=%d "
+            "| timezone_present=%s | planner_tool=%s "
+            "| planner_arguments_null=%s | planner_timezone=%s "
+            "| module_path=%s",
+            request_id(),
+            len(state["user_message"]),
+            "Asia/Kolkata" in state["user_message"],
+            plan.get("calendar_tool"),
+            not isinstance(plan.get("calendar_arguments"), dict),
+            _safe_timezone_for_logging(
+                (plan.get("calendar_arguments") or {}).get("time_zone")
+                if isinstance(plan.get("calendar_arguments"), dict)
+                else None
+            ),
+            __file__,
+        )
+        arguments, update_details = merge_calendar_update_arguments(
+            state["user_message"],
+            arguments,
+        )
+        tool_name = "update_calendar_event_proposal"
     next_event_details = (
         plan.get("intent") == "google_calendar"
         and _is_next_event_details_request(state["user_message"])
@@ -1451,6 +1777,22 @@ def calendar_agent_node(
             "calendar.update_event"
             if tool_name == "update_calendar_event_proposal"
             else "calendar.delete_event",
+            update_details=update_details,
+        )
+    if (
+        tool_name == "clarify"
+        and state.get("gmail_plan", {}).get("intent") == "google_calendar"
+        and re.search(
+            r"\b(?:move|reschedule|update|edit|change|modify)\b",
+            state["user_message"],
+            re.IGNORECASE,
+        )
+    ):
+        return _prepare_event_mutation(
+            state,
+            runtime,
+            arguments,
+            "calendar.update_event",
         )
     if tool_name == "clarify" or (
         not isinstance(arguments, dict)
@@ -1476,11 +1818,7 @@ def calendar_agent_node(
                     "account in Connected Apps. No event was created."
                 )
             else:
-                response = (
-                    "I can read your Google Calendar, but Calendar changes "
-                    "are not available. I have not created or modified "
-                    "anything."
-                )
+                response = _clarification(state)
         else:
             response = _clarification(state)
         return {

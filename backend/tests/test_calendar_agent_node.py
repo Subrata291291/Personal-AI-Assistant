@@ -3,11 +3,13 @@ from contextlib import nullcontext
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
+from app.llm.schemas import LLMResponse
 from app.workflows import calendar_agent_node
+from app.workflows import gmail_agent_nodes
 from app.workflows.calendar_agent_node import calendar_agent_node as run_node
 from app.workflows.chat_graph import chat_graph
 
@@ -15,6 +17,16 @@ from app.workflows.chat_graph import chat_graph
 USER_ID = "c0cd2d85-c90c-4c62-a886-c41bec1c41af"
 EVENT_CONNECTION_ID = "5a3d3426-f1fd-4cc9-ae83-08181848cde7"
 FREEBUSY_CONNECTION_ID = "20f915fe-3cc3-4860-888f-aa079789c322"
+UPDATE_MESSAGE = (
+    "Update my existing Google Calendar event using these details:\n"
+    "Event: Personal AI Assistant - Calendar Test\n"
+    "Date: November 10, 2026\n"
+    "Original time: 10:00 AM-10:30 AM\n"
+    "New time: 11:00 AM-11:30 AM\n"
+    "Timezone: Asia/Kolkata\n"
+    "Calendar: Primary\n"
+    "Keep the same date, title, timezone and calendar."
+)
 
 
 def _state(tool_name, arguments):
@@ -46,6 +58,103 @@ class FakeTool:
 
 def _runtime(**context):
     return SimpleNamespace(context=context)
+
+
+def _update_event(
+    event_id,
+    summary,
+    start,
+    end,
+):
+    return {
+        "id": event_id,
+        "summary": summary,
+        "description": None,
+        "location": None,
+        "start": {
+            "date_time": datetime.fromisoformat(start),
+            "date": None,
+            "time_zone": "Asia/Kolkata",
+        },
+        "end": {
+            "date_time": datetime.fromisoformat(end),
+            "date": None,
+            "time_zone": "Asia/Kolkata",
+        },
+        "attendees": [],
+        "etag": f'"etag-{event_id}"',
+    }
+
+
+def _run_mocked_calendar_update(
+    monkeypatch,
+    planner_arguments,
+    events,
+    *,
+    calendar_list=None,
+    user_message=UPDATE_MESSAGE,
+):
+    planner_response = LLMResponse(
+        content=json.dumps({
+            "intent": "google_calendar",
+            "calendar_tool": "clarify",
+            "calendar_arguments": planner_arguments,
+        }),
+        provider="test",
+        model="test-model",
+        latency_ms=0,
+        finish_reason="stop",
+    )
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda _request: planner_response,
+    )
+    events_by_id = {event["id"]: event for event in events}
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": events}),
+        validate_event_write_access=AsyncMock(
+            side_effect=lambda **kwargs: events_by_id[kwargs["event_id"]]
+        ),
+        list_calendars=AsyncMock(return_value=calendar_list or {
+            "calendars": [],
+            "next_page_token": None,
+        }),
+    )
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "CalendarService",
+        lambda _db: service,
+    )
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "SessionLocal",
+        lambda: nullcontext(object()),
+    )
+    state = {
+        "user_message": user_message,
+        "assistant_capabilities": {
+            "google_calendar": {
+                "write_permission_granted": True,
+                "update_feature_enabled": True,
+                "update_execution_available": True,
+                "write_execution_available": True,
+                "delete_execution_available": False,
+            },
+        },
+        "messages": [],
+        "user_timezone": "UTC",
+    }
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+    state.update(routed)
+    runtime = _runtime(
+        user_id=USER_ID,
+        calendar_write_connection_id=EVENT_CONNECTION_ID,
+        google_connection_available=True,
+        calendar_enabled=True,
+    )
+    result = run_node(state, runtime)
+    return routed, result, service, runtime
 
 
 def _event(event_id, summary, start, end):
@@ -696,8 +805,10 @@ def test_calendar_write_requests_are_refused_without_tool_execution(monkeypatch)
         ),
     )
 
-    assert "read your Google Calendar" in result["assistant_response"]
-    assert "not created or modified" in result["assistant_response"]
+    assert "What event would you like to create?" in (
+        result["assistant_response"]
+    )
+    assert "changes are not available" not in result["assistant_response"]
     factory.assert_not_called()
 
 
@@ -897,6 +1008,7 @@ def test_calendar_update_and_delete_requests_are_refused_without_execution(
 
     for text, tool_name in (
         ("Move my meeting to tomorrow.", "update_calendar_event_proposal"),
+        ("Move my gym session to 5 PM.", "clarify"),
         ("Delete my calendar event.", "delete_calendar_event_proposal"),
     ):
         state = _state(tool_name, {})
@@ -925,8 +1037,17 @@ def test_calendar_update_and_delete_requests_are_refused_without_execution(
     factory.assert_not_called()
 
 
-def test_calendar_update_proposal_can_be_prepared_while_flag_is_disabled(
+@pytest.mark.parametrize(
+    ("tool_name", "all_capabilities_enabled"),
+    [
+        ("update_calendar_event_proposal", False),
+        ("clarify", True),
+    ],
+)
+def test_calendar_update_proposal_preparation_preserves_approval_gate(
     monkeypatch,
+    tool_name,
+    all_capabilities_enabled,
 ):
     event = {
         "id": "event-1",
@@ -965,21 +1086,34 @@ def test_calendar_update_proposal_can_be_prepared_while_flag_is_disabled(
     )
     monkeypatch.setattr(calendar_agent_node, "SessionLocal", SessionContext)
 
-    state = _state(
-        "update_calendar_event_proposal",
-        {
-            "calendar_id": "primary",
-            "event_query": "gym session",
-            "changes": {"start_time": "17:00"},
-        },
-    )
+    state = _state(tool_name, {
+        "calendar_id": "primary",
+        "event_query": "gym session",
+        "changes": {"start_time": "17:00"},
+    })
     state["user_message"] = "Move my gym session to 5 PM."
+    calendar_capabilities = {
+        "write_permission_granted": True,
+        "update_execution_available": all_capabilities_enabled,
+        "update_feature_enabled": all_capabilities_enabled,
+    }
+    if all_capabilities_enabled:
+        calendar_capabilities.update({
+            "connected": True,
+            "google_connection_available": True,
+            "events_read": True,
+            "freebusy": True,
+            "api_available": True,
+            "api_complete": True,
+            "create_execution_available": True,
+            "delete_execution_available": False,
+            "write_execution_available": True,
+            "create_feature_enabled": True,
+            "delete_feature_enabled": False,
+            "write_available": True,
+        })
     state["assistant_capabilities"] = {
-        "google_calendar": {
-            "write_permission_granted": True,
-            "update_execution_available": False,
-            "update_feature_enabled": False,
-        },
+        "google_calendar": calendar_capabilities,
     }
     result = run_node(
         state,
@@ -1006,6 +1140,246 @@ def test_calendar_update_proposal_can_be_prepared_while_flag_is_disabled(
             "timeZone": "Asia/Kolkata",
         },
     }
+    assert result["calendar_action_proposal"]["parameters"]["expected_etag"] == (
+        '"etag-1"'
+    )
+    service.list_events.assert_awaited_once()
+    service.validate_event_write_access.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "planner_arguments",
+    [
+        None,
+        {"event_query": "Planning", "changes": {"location": "Room 2"}},
+    ],
+)
+def test_planner_clarify_recovers_original_update_details_and_prepares_proposal(
+    monkeypatch,
+    planner_arguments,
+):
+    matching_event = _update_event(
+        "event-match",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T10:30:00+05:30",
+    )
+    wrong_time = _update_event(
+        "event-wrong-time",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-10T14:00:00+05:30",
+        "2026-11-10T14:30:00+05:30",
+    )
+    wrong_date = _update_event(
+        "event-wrong-date",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-11T10:00:00+05:30",
+        "2026-11-11T10:30:00+05:30",
+    )
+
+    routed, result, service, runtime = _run_mocked_calendar_update(
+        monkeypatch,
+        planner_arguments,
+        [wrong_time, wrong_date, matching_event],
+    )
+
+    assert routed["gmail_plan"]["intent"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "clarify"
+    assert result["calendar_action_proposal"]["action_type"] == (
+        "calendar.update_event"
+    )
+    proposal = result["calendar_action_proposal"]["parameters"]
+    assert proposal["calendar_id"] == "primary"
+    assert proposal["event_id"] == "event-match"
+    assert proposal["expected_etag"] == '"etag-event-match"'
+    assert proposal["current_event"]["start"]["dateTime"] == (
+        "2026-11-10T10:00:00+05:30"
+    )
+    assert proposal["changes"]["start"]["dateTime"] == (
+        "2026-11-10T11:00:00+05:30"
+    )
+    assert proposal["changes"]["end"]["dateTime"] == (
+        "2026-11-10T11:30:00+05:30"
+    )
+    if planner_arguments and planner_arguments.get("changes", {}).get("location"):
+        assert proposal["changes"]["location"] == "Room 2"
+
+    lookup = service.list_events.await_args.kwargs
+    assert lookup["query"] == "Personal AI Assistant - Calendar Test"
+    assert lookup["calendar_id"] == "primary"
+    assert lookup["time_min"].isoformat() == "2026-11-10T00:00:00+05:30"
+    assert lookup["time_max"].isoformat() == "2026-11-11T00:00:00+05:30"
+    assert service.validate_event_write_access.await_args.kwargs == {
+        "user_id": UUID(USER_ID),
+        "connection_id": UUID(EVENT_CONNECTION_ID),
+        "calendar_id": "primary",
+        "event_id": "event-match",
+    }
+    assert runtime.context["calendar_write_connection_id"] == EVENT_CONNECTION_ID
+    assert "separately execute" in result["assistant_response"]
+
+
+def test_calendar_update_clarify_requests_only_missing_event_or_proposed_time(
+    monkeypatch,
+):
+    event_missing_message = UPDATE_MESSAGE.replace(
+        "Event: Personal AI Assistant - Calendar Test\n",
+        "",
+    )
+    time_missing_message = UPDATE_MESSAGE.replace(
+        "New time: 11:00 AM-11:30 AM\n",
+        "",
+    )
+
+    for message, expected in (
+        (event_missing_message, "Which Calendar event should I update"),
+        (time_missing_message, "proposed start time"),
+    ):
+        routed, result, service, _runtime_context = _run_mocked_calendar_update(
+            monkeypatch,
+            None,
+            [],
+            user_message=message,
+        )
+        assert routed["gmail_plan"]["calendar_tool"] == "clarify"
+        assert expected.casefold() in result["assistant_response"].casefold()
+        service.list_events.assert_not_awaited()
+        service.validate_event_write_access.assert_not_awaited()
+
+
+def test_calendar_update_disambiguates_multiple_matching_events(monkeypatch):
+    first_match = _update_event(
+        "event-one",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T10:30:00+05:30",
+    )
+    second_match = _update_event(
+        "event-two",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T10:30:00+05:30",
+    )
+
+    _routed, result, service, _runtime_context = _run_mocked_calendar_update(
+        monkeypatch,
+        None,
+        [first_match, second_match],
+    )
+
+    assert "multiple possible Calendar events" in result["assistant_response"]
+    assert "event-one" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_calendar_update_with_no_matching_event_is_not_prepared(monkeypatch):
+    wrong_date = _update_event(
+        "event-wrong-date",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-11T10:00:00+05:30",
+        "2026-11-11T10:30:00+05:30",
+    )
+
+    _routed, result, service, _runtime_context = _run_mocked_calendar_update(
+        monkeypatch,
+        None,
+        [wrong_date],
+    )
+
+    assert "couldn’t find an existing Calendar event" in (
+        result["assistant_response"]
+    )
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_calendar_update_resolves_named_calendar_using_selected_connection(
+    monkeypatch,
+):
+    event = _update_event(
+        "event-work",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T10:30:00+05:30",
+    )
+    message = UPDATE_MESSAGE.replace("Calendar: Primary", "Calendar: Work")
+
+    _routed, result, service, _runtime_context = _run_mocked_calendar_update(
+        monkeypatch,
+        None,
+        [event],
+        calendar_list={
+            "calendars": [{"id": "work-calendar-id", "summary": "Work"}],
+            "next_page_token": None,
+        },
+        user_message=message,
+    )
+
+    assert result["calendar_action_proposal"]["parameters"]["calendar_id"] == (
+        "work-calendar-id"
+    )
+    service.list_calendars.assert_awaited_once()
+    assert service.list_events.await_args.kwargs["calendar_id"] == (
+        "work-calendar-id"
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message", "expected", "not_expected"),
+    [
+        (
+            {"event_query": "Planning"},
+            "Update my Calendar event named Planning.",
+            "proposed start time",
+            "Which Calendar event",
+        ),
+        (
+            {"changes": {"summary": "Updated Planning"}},
+            "Update my Calendar event and change its title.",
+            "Which Calendar event should I update",
+            "What would you like to change",
+        ),
+        (
+            {},
+            "Update my Calendar event.",
+            "which Calendar event to update and what",
+            "changes are not available",
+        ),
+    ],
+)
+def test_clarify_update_asks_only_for_missing_details(
+    monkeypatch,
+    arguments,
+    message,
+    expected,
+    not_expected,
+):
+    session_factory = Mock()
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", session_factory)
+    state = _state("clarify", arguments)
+    state["user_message"] = message
+    state["assistant_capabilities"] = {
+        "google_calendar": {
+            "write_permission_granted": True,
+            "update_feature_enabled": True,
+            "update_execution_available": True,
+            "write_execution_available": True,
+        },
+    }
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            calendar_write_connection_id=EVENT_CONNECTION_ID,
+            calendar_enabled=True,
+            google_connection_available=True,
+        ),
+    )
+
+    assert expected.casefold() in result["assistant_response"].casefold()
+    assert not_expected.casefold() not in result["assistant_response"].casefold()
+    session_factory.assert_not_called()
 
 
 def test_relative_calendar_time_change_preserves_event_date_and_duration():
