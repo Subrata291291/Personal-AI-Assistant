@@ -37,6 +37,7 @@ class CalendarCreateEventParameters(BaseModel):
         default=None,
         max_length=5,
     )
+    recurrence: list[str] | None = Field(default=None, max_length=1)
     all_day: bool
 
     @field_validator("calendar_id", "summary", "description", "location")
@@ -97,6 +98,18 @@ class CalendarCreateEventParameters(BaseModel):
                 raise ValueError("Reminder minutes must be between 0 and 40320.")
             normalized.append({"method": method, "minutes": minutes})
         return normalized
+
+    @field_validator("recurrence")
+    @classmethod
+    def validate_recurrence(
+        cls,
+        value: list[str] | None,
+    ) -> list[str] | None:
+        if value is not None and value != ["RRULE:FREQ=DAILY"]:
+            raise ValueError(
+                "Only an unbounded daily recurrence is supported."
+            )
+        return value
 
     @model_validator(mode="after")
     def validate_times(self) -> Self:
@@ -269,17 +282,27 @@ class CalendarDeleteEventParameters(BaseModel):
     event_id: str = Field(min_length=1, max_length=1024)
     expected_etag: str = Field(min_length=1, max_length=1024)
     current_event: dict[str, JsonValue]
+    delete_entire_series: bool = False
 
     @model_validator(mode="after")
     def validate_delete(self) -> Self:
         _validate_calendar_identifiers(self.calendar_id, self.event_id)
         _validate_snapshot(self.current_event, self.expected_etag)
+        has_recurrence = bool(self.current_event.get("recurrence"))
+        if self.delete_entire_series and not has_recurrence:
+            raise ValueError(
+                "Deleting an entire series requires a recurring master snapshot."
+            )
+        if has_recurrence and not self.delete_entire_series:
+            raise ValueError(
+                "Deleting a recurring master requires explicit series scope."
+            )
         return self
 
 
 def _validate_calendar_identifiers(calendar_id: str, event_id: str) -> None:
     if calendar_id in {".", ".."} or not re.fullmatch(
-        r"[A-Za-z0-9._@+-]{1,1024}", calendar_id
+        r"[A-Za-z0-9._@+#-]{1,1024}", calendar_id
     ):
         raise ValueError("calendar_id is invalid.")
     if event_id in {".", ".."} or not re.fullmatch(
@@ -363,6 +386,7 @@ def _validate_snapshot(
         "end",
         "attendees",
         "etag",
+        "recurrence",
     }
     if (
         set(snapshot) - allowed
@@ -382,5 +406,12 @@ def _validate_snapshot(
         or any(not isinstance(item, str) for item in attendees)
     ):
         raise ValueError("Current event snapshot has invalid attendees.")
+    recurrence = snapshot.get("recurrence")
+    if recurrence is not None and (
+        not isinstance(recurrence, list)
+        or len(recurrence) > 10
+        or any(not isinstance(rule, str) or len(rule) > 1024 for rule in recurrence)
+    ):
+        raise ValueError("Current event snapshot has invalid recurrence.")
     if len(repr(snapshot).encode("utf-8")) > 16_000:
         raise ValueError("Current event snapshot is too large.")

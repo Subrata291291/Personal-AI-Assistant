@@ -20,6 +20,7 @@ class CalendarCreateDraft(BaseModel):
     location: str | None = Field(default=None, max_length=1024)
     attendees: list[str] | None = Field(default=None, max_length=50)
     reminders: list[dict[str, Any]] | None = None
+    recurrence: list[str] | None = Field(default=None, max_length=1)
     all_day: bool | None = None
     overnight: bool | None = None
     invalid_fields: list[str] = Field(default_factory=list)
@@ -66,7 +67,31 @@ _MONTH_NAMES = (
 _FIELD_NAMES = (
     "title", "date", "start time", "end time", "time zone", "timezone",
     "calendar", "description", "location", "attendees", "all day",
+    "frequency", "recurrence", "end date", "until", "approval", "execute",
+    "execution",
 )
+_FIELD_LABEL_PATTERN = "|".join(
+    re.escape(name) for name in sorted(_FIELD_NAMES, key=len, reverse=True)
+)
+
+
+def _normalize_labeled_text(text: str) -> str:
+    text = re.sub(
+        rf"\s+[-*•]\s*(?=(?:{_FIELD_LABEL_PATTERN})\s*:)",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"\s+(?:[-*•]\s*)?(?=(?:no\s+end\s+date|"
+        r"prepare\s+(?:an?\s+)?approval\b|"
+        r"wait\s+for\s+(?:explicit\s+)?approval\b|"
+        r"approval\s+and\s+separate(?:ly)?\s+execute|"
+        r"separate\s+execute)\b)",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def extract_explicit_calendar_date(text: str) -> date | None:
@@ -91,9 +116,10 @@ def extract_explicit_calendar_date(text: str) -> date | None:
 
 
 def _label_value(text: str, label: str) -> str | None:
+    normalized_text = _normalize_labeled_text(text)
     match = re.search(
-        rf"^\s*{re.escape(label)}\s*:\s*([^\r\n]*)",
-        text,
+        rf"^\s*[-*•]?\s*{re.escape(label)}\s*:\s*([^\r\n]*)",
+        normalized_text,
         re.IGNORECASE | re.MULTILINE,
     )
     if not match:
@@ -127,11 +153,11 @@ def _clock_text_without_dates_and_labels(text: str) -> str:
     cleaned = _ISO_DATE.sub(" ", text)
     cleaned = _MONTH_DATE.sub(" ", cleaned)
     field_pattern = re.compile(
-        rf"^\s*(?:{'|'.join(re.escape(name) for name in _FIELD_NAMES)})"
+        rf"^\s*[-*•]?\s*(?:{_FIELD_LABEL_PATTERN})"
         r"\s*:\s*[^\r\n]*",
         re.IGNORECASE | re.MULTILINE,
     )
-    return field_pattern.sub(" ", cleaned)
+    return field_pattern.sub(" ", _normalize_labeled_text(cleaned))
 
 
 def extract_calendar_create_draft(
@@ -146,7 +172,12 @@ def extract_calendar_create_draft(
 
     title = _label_value(text, "Title")
     if title or fallback_summary:
-        values["summary"] = title or fallback_summary
+        summary = title or fallback_summary
+        values["summary"] = (
+            summary.capitalize()
+            if title and summary.islower()
+            else summary
+        )
 
     date_text = _label_value(text, "Date")
     explicit_date = extract_explicit_calendar_date(
@@ -214,6 +245,27 @@ def extract_calendar_create_draft(
         field_value = _label_value(text, field_name.title())
         if field_value:
             values[field_name] = field_value
+
+    frequency = _label_value(text, "Frequency") or _label_value(
+        text,
+        "Recurrence",
+    )
+    if frequency is None and re.search(
+        r"\b(?:daily|every\s+day)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        frequency = "daily"
+    if frequency is not None:
+        normalized_frequency = re.sub(
+            r"[\s_-]+",
+            "",
+            frequency.casefold(),
+        )
+        if normalized_frequency in {"daily", "everyday"}:
+            values["recurrence"] = ["RRULE:FREQ=DAILY"]
+        else:
+            invalid_fields.append("recurrence")
 
     attendees = _label_value(text, "Attendees")
     if attendees:
@@ -337,6 +389,8 @@ def draft_to_event_arguments(draft: dict) -> dict | None:
     }
     if value.reminders is not None:
         arguments["reminders"] = value.reminders
+    if value.recurrence is not None:
+        arguments["recurrence"] = value.recurrence
     return arguments
 
 

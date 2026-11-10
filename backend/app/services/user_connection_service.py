@@ -256,6 +256,15 @@ class UserConnectionService:
             "permissions_need_consent": bool(google_connections)
             and not (events_read and freebusy),
             "write_permission_granted": write_permission_granted,
+            "create_feature_enabled": (
+                settings.CALENDAR_CREATE_EVENT_ENABLED
+            ),
+            "update_feature_enabled": (
+                settings.CALENDAR_UPDATE_EVENT_ENABLED
+            ),
+            "delete_feature_enabled": (
+                settings.CALENDAR_DELETE_EVENT_ENABLED
+            ),
             "create_execution_available": any(
                 item.get("calendar_create_execution_available", False)
                 for item in capabilities

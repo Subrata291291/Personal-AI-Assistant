@@ -232,3 +232,93 @@ def test_status_lookup_is_scoped_to_authenticated_user(api_client):
         "id": str(other_user_id),
     }
     assert _get_status(client, idempotency_key).status_code == 404
+
+
+def test_calendar_status_get_returns_reconciled_proposal_without_execution(
+    api_client,
+    monkeypatch,
+):
+    client, user_id = api_client
+    owner_id = user_id
+    proposal_id = uuid4()
+    now = datetime.now(timezone.utc)
+    proposal = ActionApprovalProposal.model_validate({
+        "proposal_id": proposal_id,
+        "message_id": uuid4(),
+        "source_message_id": uuid4(),
+        "user_id": user_id,
+        "conversation_id": uuid4(),
+        "action_type": "calendar.delete_event",
+        "parameters": {
+            "calendar_id": "primary",
+            "event_id": "series-master",
+            "expected_etag": '"etag-1"',
+            "current_event": {
+                "summary": "Gym",
+                "start": {
+                    "dateTime": "2026-11-11T10:00:00+05:30",
+                    "timeZone": "Asia/Kolkata",
+                },
+                "end": {
+                    "dateTime": "2026-11-11T11:00:00+05:30",
+                    "timeZone": "Asia/Kolkata",
+                },
+                "recurrence": ["RRULE:FREQ=DAILY"],
+                "etag": '"etag-1"',
+            },
+            "delete_entire_series": True,
+        },
+        "connection_id": CONNECTION_ID,
+        "created_at": now,
+        "expires_at": now + timedelta(minutes=15),
+        "status": "execution_uncertain",
+        "result": {
+            "outcome": "unconfirmed",
+            "reason": "event_still_exists",
+        },
+    })
+    reconciled = proposal.model_copy(update={
+        "status": "completed",
+        "result": {
+            "outcome": "deleted",
+            "google_event_id": "series-master",
+        },
+    })
+
+    class CalendarStatusService:
+        def get_proposal(self, *, user_id, proposal_id):
+            assert user_id == owner_id
+            assert proposal_id == proposal.proposal_id
+            return proposal
+
+    class CalendarExecutorStub:
+        SUPPORTED_ACTION_TYPES = {"calendar.delete_event"}
+        instances = []
+
+        def __init__(self, *, db, approval_service):
+            self.db = db
+            self.approval_service = approval_service
+            self.reconcile_calls = []
+            self.instances.append(self)
+
+        async def reconcile(self, *, user_id, proposal_id):
+            self.reconcile_calls.append((user_id, proposal_id))
+            return reconciled
+
+    service = CalendarStatusService()
+    CalendarExecutorStub.instances = []
+    app.dependency_overrides[get_action_approval_service] = lambda: service
+    monkeypatch.setattr(action_approvals, "CalendarActionExecutor", CalendarExecutorStub)
+    monkeypatch.setattr(action_approvals, "is_integration_enabled", lambda *_: True)
+
+    response = client.get(
+        f"/api/v1/action-approvals/{proposal_id}",
+        headers=_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["result"]["outcome"] == "deleted"
+    assert CalendarExecutorStub.instances[0].reconcile_calls == [
+        (user_id, proposal_id),
+    ]

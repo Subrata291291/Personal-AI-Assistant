@@ -20,21 +20,68 @@ _SAFE_TIME_ZONE_LOG_VALUE = re.compile(
 _TIME_ZONE = re.compile(
     r"\b(?:[A-Za-z0-9_+.-]+/)+[A-Za-z0-9_+.-]+\b"
 )
+_TITLE_PREFIX = re.compile(
+    r"\btitle\s+starts?\s+with\s+['\"“](?P<title>[^'\"”\r\n]+)['\"”]",
+    re.IGNORECASE,
+)
+_TITLE_CHANGE = re.compile(
+    r"\b(?:change|set|rename|update)\s+(?:only\s+)?"
+    r"(?:(?:the|its|my)\s+)?"
+    r"(?:(?:existing\s+)?(?:calendar\s+)?"
+    r"(?:meeting|event|appointment)\s+)?"
+    r"(?:event\s+)?(?:title|name)\s+(?:to|as)\s*"
+    r"(?:['\"“](?P<quoted>[^'\"”\r\n]+)['\"”]|(?P<plain>[^.!?\r\n]+))",
+    re.IGNORECASE,
+)
+_TITLE_ONLY_CHANGE = re.compile(
+    r"\b(?:change|set|rename|update|edit|modify)\s+only\s+"
+    r"(?:(?:the|its)\s+)?(?:event\s+)?(?:title|name)\b",
+    re.IGNORECASE,
+)
+_FIELD_CHANGE = re.compile(
+    r"\b(?:change|set|update|edit|modify)\s+(?:the\s+)?"
+    r"(?P<field>location|description)\s+(?:to|as)\s*"
+    r"(?:['\"“](?P<quoted>[^'\"”\r\n]+)['\"”]|"
+    r"(?P<plain>[^.!?\r\n]+))",
+    re.IGNORECASE,
+)
+_CLOCK_TEXT = (
+    r"\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?"
+)
+_NATURAL_ORIGINAL_TIME_RANGE = re.compile(
+    rf"\b(?:time\s+is|at)\s+(?P<start>{_CLOCK_TEXT})\s*"
+    rf"(?:to|[-–—])\s*"
+    rf"(?P<end>{_CLOCK_TEXT})",
+    re.IGNORECASE,
+)
+_START_DATE_TIME_RANGE = re.compile(
+    rf"\bstart\s+date\s*:\s*[^\r\n]*?\bat\s+"
+    rf"(?P<start>{_CLOCK_TEXT})\s*,?\s*end\s+"
+    rf"(?P<end>{_CLOCK_TEXT})",
+    re.IGNORECASE,
+)
 _UPDATE_LABELS = (
     "Original start time",
     "Original end time",
     "Proposed start time",
     "Proposed end time",
+    "Start time",
+    "End time",
     "Event title",
     "Event date",
+    "Proposed date",
+    "New date",
+    "Start date",
     "Original time",
     "Current time",
+    "Time",
     "New time",
     "Proposed time",
     "Current start time",
     "Current end time",
     "Timezone",
     "Time zone",
+    "Recurrence",
     "Calendar ID",
     "Calendar Id",
     "Event",
@@ -74,12 +121,17 @@ def _clean_title(value: str | None) -> str | None:
 
 
 def _extract_event_query(text: str) -> str | None:
+    title_prefix = _TITLE_PREFIX.search(text)
+    if title_prefix:
+        return _clean_title(title_prefix.group("title"))
+
     labeled = _label_value(text, "Event", "Event title", "Title")
     if labeled:
         return _clean_title(labeled)
 
     quoted = re.search(
         r"\b(?:event|meeting|appointment)\s+"
+        r"(?:(?:(?:recurring|calendar)\s+)?series\s+)?"
         r"(?:named|called|titled)\s+[\"“]([^\"”\r\n]+)[\"”]",
         text,
         re.IGNORECASE,
@@ -89,13 +141,77 @@ def _extract_event_query(text: str) -> str | None:
 
     unquoted = re.search(
         r"\b(?:event|meeting|appointment)\s+"
+        r"(?:(?:(?:recurring|calendar)\s+)?series\s+)?"
         r"(?:named|called|titled)\s+(.+?)"
-        r"(?=\s+(?:on|from|at|with|and\s+"
-        r"(?:change|move|reschedule|update|edit|modify))\b|[.?!\r\n]|$)",
+        r"(?=\s+(?:on|from|at|with)\b|\s+to\s+(?=\d)|"
+        r"\s+and\s+(?:change|move|reschedule|update|edit|modify)\b|"
+        r"[.?!\r\n]|$)",
         text,
         re.IGNORECASE,
     )
-    return _clean_title(unquoted.group(1)) if unquoted else None
+    if unquoted:
+        return _clean_title(unquoted.group(1))
+
+    recurring_series = re.search(
+        r"\brecurring\s+(?P<title>.+?)\s+series\b",
+        text,
+        re.IGNORECASE,
+    )
+    if recurring_series:
+        return _clean_title(recurring_series.group("title"))
+
+    generic_meeting = re.search(
+        r"\b(?:my|the)\s+(?:calendar\s+)?"
+        r"(?P<kind>meeting|appointment)\b"
+        r"(?:\s+(?:with|about|for)\s+(?P<person>.+?)"
+        r"(?=\s+(?:to|on|at|from)\b|[.?!\r\n]|$))?",
+        text,
+        re.IGNORECASE,
+    )
+    if generic_meeting:
+        person = generic_meeting.group("person")
+        return _clean_title(person) if person else generic_meeting.group("kind")
+
+    direct_title = re.search(
+        r"\b(?:delete|remove|cancel)\s+(?:my|the)\s+"
+        r"(?P<title>[^\r\n]+?)[ \t]*$",
+        text,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if direct_title:
+        title = re.sub(
+            r"\s+from\s+(?:my\s+)?(?:primary\s+)?"
+            r"(?:google\s+)?calendar\b.*$",
+            "",
+            direct_title.group("title"),
+            flags=re.IGNORECASE,
+        )
+        return _clean_title(title)
+    return None
+
+
+def _extract_title_change(text: str) -> str | None:
+    match = _TITLE_CHANGE.search(text)
+    if not match:
+        return None
+    return _clean_title(match.group("quoted") or match.group("plain"))
+
+
+def _extract_field_changes(text: str) -> dict[str, str]:
+    changes: dict[str, str] = {}
+    for match in _FIELD_CHANGE.finditer(text):
+        raw_value = match.group("quoted") or match.group("plain")
+        if match.group("plain"):
+            raw_value = re.split(
+                r"\s+(?:and\s+)?(?:preserve|keep|leave|prepare|wait\s+for)\b",
+                raw_value,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+        value = _clean_title(raw_value)
+        if value is not None:
+            changes[match.group("field").casefold()] = value
+    return changes
 
 
 def _parse_clock_values(text: str) -> list[time]:
@@ -171,13 +287,65 @@ def _safe_timezone_for_logging(value: object) -> str:
     return "<missing-or-invalid>"
 
 
-def parse_calendar_update_message(
+def _safe_diagnostic_token(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,64}",
+        value,
+    ):
+        return value
+    return "<invalid>"
+
+
+def log_calendar_update_diagnostic(
+    *,
+    boundary: str,
+    message_length: int,
+    timezone_present: bool,
+    module_path: str,
+    extracted_timezone: object = None,
+    planner_timezone: object = None,
+    merged_timezone: object = None,
+    validation_result: str = "-",
+    date_bounds_timezone: object = None,
+    planner_intent: str = "-",
+    planner_tool: str = "-",
+    planner_arguments_null: bool | None = None,
+    selected_route: str = "-",
+) -> None:
+    """Emit bounded diagnostics without logging user-provided message text."""
+    logger.warning(
+        "CALENDAR_UPDATE_DIAG_V2 | request_id=%s | boundary=%s "
+        "| message_length=%d | timezone_present=%s "
+        "| extracted_timezone=%s | planner_timezone=%s "
+        "| merged_timezone=%s | validation_result=%s "
+        "| date_bounds_timezone=%s | planner_intent=%s "
+        "| planner_tool=%s | planner_arguments_null=%s "
+        "| selected_route=%s | module_path=%s",
+        request_id(),
+        _safe_diagnostic_token(boundary),
+        message_length,
+        timezone_present,
+        _safe_timezone_for_logging(extracted_timezone),
+        _safe_timezone_for_logging(planner_timezone),
+        _safe_timezone_for_logging(merged_timezone),
+        _safe_diagnostic_token(validation_result),
+        _safe_timezone_for_logging(date_bounds_timezone),
+        _safe_diagnostic_token(planner_intent),
+        _safe_diagnostic_token(planner_tool),
+        planner_arguments_null,
+        _safe_diagnostic_token(selected_route),
+        module_path,
+    )
+
+
+def _parse_calendar_request_details(
     text: str,
     planner_time_zone: object | None = None,
+    reference_time: datetime | None = None,
 ) -> dict[str, Any]:
-    """Extract explicit event identity and before/after times for an Update."""
+    """Extract shared event identity and timing details."""
     event_query = _extract_event_query(text)
-    date_text = _label_value(text, "Date", "Event date")
+    date_text = _label_value(text, "Date", "Event date", "Start date")
     event_date = extract_explicit_calendar_date(
         date_text if date_text is not None else text
     )
@@ -204,21 +372,37 @@ def parse_calendar_update_message(
 
     original_start, original_end, original_error = _labeled_time_pair(
         text,
-        ("Original time", "Current time"),
+        ("Original time", "Current time", "Time"),
     )
     if original_error:
         errors.append(original_error)
+    if original_start is None and original_end is None:
+        time_range = _NATURAL_ORIGINAL_TIME_RANGE.search(text)
+        if time_range:
+            clocks = _parse_clock_values(
+                f"{time_range.group('start')} {time_range.group('end')}"
+            )
+            if len(clocks) == 2:
+                original_start, original_end = clocks
+        else:
+            time_range = _START_DATE_TIME_RANGE.search(text)
+            if time_range:
+                clocks = _parse_clock_values(
+                    f"{time_range.group('start')} {time_range.group('end')}"
+                )
+                if len(clocks) == 2:
+                    original_start, original_end = clocks
     if original_start is None:
         original_start, original_error = _labeled_single_time(
             text,
-            ("Original start time", "Current start time"),
+            ("Original start time", "Current start time", "Start time"),
         )
         if original_error:
             errors.append(original_error)
     if original_end is None:
         original_end, original_error = _labeled_single_time(
             text,
-            ("Original end time", "Current end time"),
+            ("Original end time", "Current end time", "End time"),
         )
         if original_error:
             errors.append(original_error)
@@ -243,6 +427,21 @@ def parse_calendar_update_message(
         )
         if proposed_error:
             errors.append(proposed_error)
+    if (
+        proposed_start is None
+        and proposed_end is None
+        and len(_parse_clock_values(text)) < 4
+    ):
+        moved_time = re.search(
+            rf"\b(?:move|reschedule|shift)\b.{{0,100}}?"
+            rf"\bto\s+(?P<time>{_CLOCK_TEXT})",
+            text,
+            re.IGNORECASE,
+        )
+        if moved_time:
+            clocks = _parse_clock_values(moved_time.group("time"))
+            if len(clocks) == 1:
+                proposed_start = clocks[0]
 
     if (
         original_start is None
@@ -254,6 +453,24 @@ def parse_calendar_update_message(
         clocks = _parse_clock_values(text)
         if len(clocks) == 4:
             original_start, original_end, proposed_start, proposed_end = clocks
+
+    proposed_date = None
+    proposed_date_text = _label_value(text, "New date", "Proposed date")
+    if proposed_date_text is not None:
+        proposed_date = extract_explicit_calendar_date(proposed_date_text)
+        if proposed_date is None:
+            errors.append("The proposed date is invalid or unsupported.")
+    elif proposed_start is not None and reference_time is not None and zone:
+        relative_target = re.search(
+            rf"\bto\s+{_CLOCK_TEXT}\s+(?P<date>today|tomorrow)\b",
+            text,
+            re.IGNORECASE,
+        )
+        if relative_target:
+            local_reference = reference_time.astimezone(zone)
+            proposed_date = local_reference.date() + timedelta(
+                days=1 if relative_target.group("date").casefold() == "tomorrow" else 0
+            )
 
     overnight = bool(re.search(
         r"\b(?:overnight|over\s+night|next\s+day|following\s+day)\b",
@@ -277,7 +494,13 @@ def parse_calendar_update_message(
             "An explicit IANA timezone is required to match the event date."
         )
 
-    changes = None
+    title_change = _extract_title_change(text)
+    changes: dict[str, Any] | None = (
+        {"summary": title_change} if title_change else None
+    )
+    explicit_field_changes = _extract_field_changes(text)
+    if explicit_field_changes:
+        changes = {**(changes or {}), **explicit_field_changes}
     if proposed_start is not None and proposed_end is not None:
         if event_date is None:
             errors.append("A date is required for the proposed time range.")
@@ -296,7 +519,9 @@ def parse_calendar_update_message(
                         )
                     end_date += timedelta(days=1)
                     end = _aware_local_datetime(end_date, proposed_end, zone)
-                changes = {
+                if changes is None:
+                    changes = {}
+                changes.update({
                     "start": {
                         "dateTime": start.isoformat(timespec="seconds"),
                         "timeZone": zone.key,
@@ -305,12 +530,24 @@ def parse_calendar_update_message(
                         "dateTime": end.isoformat(timespec="seconds"),
                         "timeZone": zone.key,
                     },
-                }
+                })
             except ValueError as exc:
                 errors.append(str(exc))
+    elif proposed_start is not None:
+        if changes is None:
+            changes = {}
+        changes["start_time"] = proposed_start.strftime("%H:%M")
+        if proposed_date is not None:
+            changes["start_date"] = proposed_date.isoformat()
 
     calendar_id = _label_value(text, "Calendar ID", "Calendar Id")
     calendar_name = _label_value(text, "Calendar")
+    if (
+        calendar_id is None
+        and calendar_name is None
+        and re.search(r"\bprimary\s+(?:google\s+)?calendar\b", text, re.IGNORECASE)
+    ):
+        calendar_id = "primary"
     if calendar_id is None and calendar_name:
         if calendar_name.casefold() in {"primary", "primary calendar"}:
             calendar_id = "primary"
@@ -328,29 +565,27 @@ def parse_calendar_update_message(
         missing_fields.append("event title")
     if event_date is None:
         missing_fields.append("event date")
-    if proposed_start is None:
-        missing_fields.append("proposed start time")
-    if proposed_end is None:
-        missing_fields.append("proposed end time")
+    if title_change is None:
+        if proposed_start is None:
+            missing_fields.append("proposed start time")
+        if proposed_end is None and proposed_start is None:
+            missing_fields.append("proposed end time")
     if (
         (proposed_start is not None or proposed_end is not None or event_date)
         and zone is None
     ):
         missing_fields.append("timezone")
 
-    logger.info(
-        "calendar_update_trace | request_id=%s "
-        "| boundary=parser_validation | message_length=%d "
-        "| timezone_present=%s | extracted_timezone=%s "
-        "| validation_result=%s | date_bounds_timezone=%s "
-        "| module_path=%s",
-        request_id(),
-        len(text),
-        time_zone is not None,
-        _safe_timezone_for_logging(time_zone),
-        "failed" if errors else "passed",
-        zone.key if zone is not None and lookup_time_min is not None else "-",
-        __file__,
+    log_calendar_update_diagnostic(
+        boundary="parser_validation",
+        message_length=len(text),
+        timezone_present=time_zone is not None,
+        extracted_timezone=time_zone,
+        validation_result="failed" if errors else "passed",
+        date_bounds_timezone=(
+            zone.key if zone is not None and lookup_time_min is not None else None
+        ),
+        module_path=__file__,
     )
 
     return {
@@ -368,9 +603,93 @@ def parse_calendar_update_message(
         "changes": changes,
         "overnight": overnight,
         "preserve_summary": bool(_PRESERVE_TITLE.search(text)),
+        "event_title_is_explicit": bool(
+            _label_value(text, "Event", "Event title", "Title")
+            or re.search(
+                r"\b(?:delete|remove|cancel)\s+(?:my|the)\s+"
+                r"(?!event\b|meeting\b|appointment\b|series\b)",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"\b(?:event|meeting|appointment)\s+"
+                r"(?:(?:(?:recurring|calendar)\s+)?series\s+)?"
+                r"(?:named|called|titled)\s+",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"\brecurring\s+.+?\s+series\b",
+                text,
+                re.IGNORECASE,
+            )
+            or _TITLE_PREFIX.search(text)
+        ),
+        "event_title_is_prefix": bool(_TITLE_PREFIX.search(text)),
+        "only_title_change": bool(_TITLE_ONLY_CHANGE.search(text)),
         "missing_fields": missing_fields,
         "errors": errors,
     }
+
+
+def parse_calendar_delete_request(
+    text: str,
+    planner_time_zone: object | None = None,
+) -> dict[str, Any]:
+    """Extract event identity and exact occurrence details for a Delete."""
+    details = _parse_calendar_request_details(text, planner_time_zone)
+    lowered = text.casefold()
+    details["delete_entire_series"] = bool(re.search(
+        r"\b(?:entire|whole|complete|full|all)\b.{0,50}"
+        r"\b(?:recurring\s+)?series\b|"
+        r"\b(?:all\s+future\s+occurrences|entire\s+recurrence)\b",
+        lowered,
+    ))
+    if re.search(
+        r"\brrule\s*[:=]\s*(?:freq\s*=\s*)?daily\b|"
+        r"\bdaily\b.{0,30}\brecurr(?:ence|ing)\b",
+        lowered,
+    ):
+        details["expected_recurrence"] = ["RRULE:FREQ=DAILY"]
+    else:
+        details["expected_recurrence"] = None
+    details["expected_recurring_unbounded"] = bool(re.search(
+        r"\bno\s+end\s+date\b|"
+        r"\bwithout\s+(?:an?\s+)?end\s+date\b|"
+        r"\bunbounded\b",
+        lowered,
+    ))
+
+    missing_fields: list[str] = []
+    if not details.get("event_query"):
+        missing_fields.append("event title")
+    if details.get("event_date") is None:
+        missing_fields.append("event date")
+    if details.get("original_start_time") is None:
+        missing_fields.append("start time")
+    if details.get("original_end_time") is None:
+        missing_fields.append("end time")
+    if details.get("time_zone") is None:
+        missing_fields.append("timezone")
+    if details["expected_recurrence"] is None:
+        missing_fields.append("recurrence")
+    if not details["expected_recurring_unbounded"]:
+        missing_fields.append("no end date")
+    details["missing_fields"] = missing_fields
+    return details
+
+
+def parse_calendar_update_message(
+    text: str,
+    planner_time_zone: object | None = None,
+    reference_time: datetime | None = None,
+) -> dict[str, Any]:
+    """Extract explicit event identity and before/after times for an Update."""
+    return _parse_calendar_request_details(
+        text,
+        planner_time_zone,
+        reference_time,
+    )
 
 
 def _valid_query(value: object) -> bool:
@@ -394,6 +713,7 @@ def _valid_planner_changes(value: object) -> dict[str, Any] | None:
         "attendees",
         "start_time",
         "duration_delta_minutes",
+        "start_date",
     }
     if set(value) - allowed or (("start" in value) != ("end" in value)):
         return None
@@ -406,6 +726,11 @@ def _valid_planner_changes(value: object) -> dict[str, Any] | None:
         isinstance(value["duration_delta_minutes"], bool)
         or not isinstance(value["duration_delta_minutes"], int)
         or not -1440 <= value["duration_delta_minutes"] <= 1440
+    ):
+        return None
+    if "start_date" in value and (
+        not isinstance(value["start_date"], str)
+        or extract_explicit_calendar_date(value["start_date"]) is None
     ):
         return None
     for key in ("summary", "description", "location"):
@@ -425,29 +750,38 @@ def _valid_planner_changes(value: object) -> dict[str, Any] | None:
 def merge_calendar_update_arguments(
     text: str,
     planner_arguments: object,
+    *,
+    default_time_zone: object | None = None,
+    reference_time: datetime | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Merge planner arguments with explicit values recovered from the request."""
     planner = dict(planner_arguments) if isinstance(planner_arguments, dict) else {}
+    planner_time_zone = planner.get("time_zone")
+    has_explicit_time_zone = bool(
+        _label_value(text, "Timezone", "Time zone")
+        or _TIME_ZONE.search(text)
+    )
+    if default_time_zone is not None and not has_explicit_time_zone:
+        planner_time_zone = default_time_zone
+    elif planner_time_zone is None:
+        planner_time_zone = default_time_zone
     details = parse_calendar_update_message(
         text,
-        planner_time_zone=planner.get("time_zone"),
+        planner_time_zone=planner_time_zone,
+        reference_time=reference_time,
     )
     merged = dict(planner)
     if details["time_zone"] is not None:
         merged["time_zone"] = details["time_zone"]
 
-    logger.info(
-        "calendar_update_trace | request_id=%s "
-        "| boundary=argument_merge | message_length=%d "
-        "| timezone_present=%s | extracted_timezone=%s "
-        "| planner_timezone=%s | merged_timezone=%s | module_path=%s",
-        request_id(),
-        len(text),
-        bool(_TIME_ZONE.search(text)),
-        _safe_timezone_for_logging(details["time_zone"]),
-        _safe_timezone_for_logging(planner.get("time_zone")),
-        _safe_timezone_for_logging(merged.get("time_zone")),
-        __file__,
+    log_calendar_update_diagnostic(
+        boundary="argument_merge",
+        message_length=len(text),
+        timezone_present=bool(_TIME_ZONE.search(text)),
+        extracted_timezone=details["time_zone"],
+        planner_timezone=planner.get("time_zone"),
+        merged_timezone=merged.get("time_zone"),
+        module_path=__file__,
     )
 
     parsed_query = details["event_query"]
@@ -471,7 +805,14 @@ def merge_calendar_update_arguments(
         merged["calendar_name"] = details["calendar_name"]
 
     planner_changes = _valid_planner_changes(planner.get("changes")) or {}
+    if details["only_title_change"]:
+        planner_changes = {}
     parsed_changes = details["changes"] or {}
+    planner_changes = {
+        key: value
+        for key, value in planner_changes.items()
+        if key in parsed_changes
+    }
     merged_changes = {**planner_changes, **parsed_changes}
     if parsed_changes and ("start" in parsed_changes or "end" in parsed_changes):
         merged_changes.pop("start_time", None)
@@ -502,15 +843,6 @@ def merge_calendar_update_arguments(
                     )
                 except (ValueError, ZoneInfoNotFoundError) as exc:
                     details["errors"].append(str(exc))
-    details["event_title_is_explicit"] = bool(
-        _label_value(text, "Event", "Event title", "Title")
-        or re.search(
-            r"\b(?:event|meeting|appointment)\s+"
-            r"(?:named|called|titled)\s+",
-            text,
-            re.IGNORECASE,
-        )
-    )
     details["planner_arguments_valid"] = bool(
         _valid_query(planner_query) or planner_changes
     )

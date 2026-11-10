@@ -48,6 +48,9 @@ class ChatState(TypedDict):
 
     assistant_capabilities: NotRequired[dict[str, Any]]
 
+    pending_calendar_action: NotRequired[dict[str, Any]]
+    calendar_action_request: NotRequired[str]
+
     pending_calendar_create_proposal: NotRequired[dict[str, Any]]
     calendar_create_draft: NotRequired[dict[str, Any] | None]
 

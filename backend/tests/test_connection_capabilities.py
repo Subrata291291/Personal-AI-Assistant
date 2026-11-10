@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
 
-from app.services.user_connection_service import UserConnectionService
+from app.services.user_connection_service import UserConnectionService, settings
 
 
 def test_list_connections_reports_service_capabilities_from_granted_scopes():
@@ -274,6 +274,9 @@ def test_user_calendar_capabilities_aggregate_only_owned_connections():
         "google_connection_available": True,
         "permissions_need_consent": False,
         "write_permission_granted": False,
+        "create_feature_enabled": settings.CALENDAR_CREATE_EVENT_ENABLED,
+        "update_feature_enabled": settings.CALENDAR_UPDATE_EVENT_ENABLED,
+        "delete_feature_enabled": settings.CALENDAR_DELETE_EVENT_ENABLED,
         "create_execution_available": False,
         "update_execution_available": False,
         "delete_execution_available": False,
@@ -459,6 +462,9 @@ def test_aggregate_calendar_capabilities_combine_independent_owned_grants():
         "google_connection_available": True,
         "permissions_need_consent": False,
         "write_permission_granted": False,
+        "create_feature_enabled": settings.CALENDAR_CREATE_EVENT_ENABLED,
+        "update_feature_enabled": settings.CALENDAR_UPDATE_EVENT_ENABLED,
+        "delete_feature_enabled": settings.CALENDAR_DELETE_EVENT_ENABLED,
         "create_execution_available": False,
         "update_execution_available": False,
         "delete_execution_available": False,

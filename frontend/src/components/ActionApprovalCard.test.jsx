@@ -173,6 +173,22 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
       .toHaveTextContent('Proposed: June 10, 2026 5:00 PM')
   })
 
+  it('clearly identifies a series-wide Calendar Delete proposal', () => {
+    const proposal = createCalendarMutationProposal('calendar.delete_event')
+    proposal.parameters.delete_entire_series = true
+    proposal.parameters.current_event = {
+      ...proposal.parameters.current_event,
+      recurrence: ['RRULE:FREQ=DAILY'],
+    }
+
+    renderProposalCard(proposal)
+
+    expect(screen.getByRole('region', { name: 'Event to delete' }))
+      .toHaveTextContent('Entire recurring series, including all future occurrences (no end date)')
+    expect(screen.getByRole('region', { name: 'Event to delete' }))
+      .toHaveTextContent('Daily')
+  })
+
   it('reconciles an uncertain send and never offers a blind retry', async () => {
     actionApprovalService.execute.mockRejectedValue(
       new Error('The request outcome is uncertain.'),
@@ -265,6 +281,61 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
     expect(actionApprovalService.execute).toHaveBeenCalledTimes(1)
   })
 
+  it('updates the displayed status from the Calendar status-check response', async () => {
+    const proposal = createCalendarMutationProposal(
+      'calendar.delete_event',
+      'execution_uncertain',
+    )
+    actionApprovalService.getProposal.mockResolvedValue({
+      ...proposal,
+      status: 'completed',
+      result: {
+        outcome: 'deleted',
+        google_event_id: 'series-master',
+      },
+    })
+    renderProposalCard(proposal)
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Check Calendar change status',
+    }))
+
+    expect(await screen.findByText(
+      /Google Calendar confirmed the event was deleted/,
+    )).toBeInTheDocument()
+    expect(actionApprovalService.getProposal)
+      .toHaveBeenCalledWith(proposal.proposal_id)
+    expect(actionApprovalService.execute).not.toHaveBeenCalled()
+  })
+
+  it('displays the latest ambiguous Delete verification without clearing uncertainty', async () => {
+    const proposal = createCalendarMutationProposal(
+      'calendar.delete_event',
+      'execution_uncertain',
+    )
+    actionApprovalService.getProposal.mockResolvedValue({
+      ...proposal,
+      status: 'execution_uncertain',
+      result: {
+        outcome: 'unconfirmed',
+        reason: 'read_failed',
+        checked_now: true,
+      },
+    })
+    renderProposalCard(proposal)
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Check Calendar change status',
+    }))
+
+    expect(await screen.findByText(
+      /Google Calendar status could not be verified/,
+    )).toBeInTheDocument()
+    expect(actionApprovalService.getProposal)
+      .toHaveBeenCalledWith(proposal.proposal_id)
+    expect(actionApprovalService.execute).not.toHaveBeenCalled()
+  })
+
   it('shows and executes a Calendar update proposal after approval', async () => {
     const proposal = createCalendarMutationProposal('calendar.update_event')
     actionApprovalService.approve.mockResolvedValue({
@@ -308,6 +379,42 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
     })
     expect(await screen.findByText(/confirmed the event was updated/))
       .toBeInTheDocument()
+  })
+
+  it('renders the stored recurring event snapshot and title-only proposal', () => {
+    const proposal = createCalendarMutationProposal('calendar.update_event')
+    proposal.parameters.current_event = {
+      summary: 'A recurring google workout',
+      start: {
+        dateTime: '2026-11-10T10:00:00+05:30',
+        timeZone: 'Asia/Kolkata',
+      },
+      end: {
+        dateTime: '2026-11-10T11:00:00+05:30',
+        timeZone: 'Asia/Kolkata',
+      },
+      attendees: [],
+      recurrence: ['RRULE:FREQ=WEEKLY'],
+      etag: '"etag-1"',
+    }
+    proposal.parameters.changes = { summary: 'Gym' }
+    proposal.parameters.time_zone = 'Asia/Kolkata'
+    renderProposalCard(proposal)
+
+    const original = screen.getByRole('region', { name: 'Original event' })
+    const proposed = screen.getByRole('region', { name: 'Proposed event' })
+    expect(original).toHaveTextContent('A recurring google workout')
+    expect(original).toHaveTextContent('November 10, 2026')
+    expect(original).toHaveTextContent('10:00 AM')
+    expect(original).toHaveTextContent('11:00 AM')
+    expect(original).toHaveTextContent('Asia/Kolkata')
+    expect(original).toHaveTextContent('RRULE:FREQ=WEEKLY')
+    expect(proposed).toHaveTextContent('Gym')
+    expect(proposed).toHaveTextContent('RRULE:FREQ=WEEKLY')
+    expect(screen.getByRole('region', { name: 'Proposed changes' }))
+      .toHaveTextContent('Original: A recurring google workout')
+    expect(screen.getByRole('region', { name: 'Proposed changes' }))
+      .toHaveTextContent('Proposed: Gym')
   })
 
   it('shows and executes a Calendar delete proposal after approval', async () => {
@@ -546,27 +653,30 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
     expect(actionApprovalService.execute).toHaveBeenCalledTimes(1)
   })
 
-  it('displays saved Calendar event times in the event timezone', () => {
+  it('renders the recurring Gym Create proposal returned by chat', () => {
     const proposal = {
       ...createCalendarProposal(),
       execution_available: false,
       parameters: {
         ...createCalendarProposal().parameters,
         summary: 'Gym',
-        start: '2026-11-08T10:00:00+05:30',
-        end: '2026-11-08T11:00:00+05:30',
+        start: '2026-11-11T10:00:00+05:30',
+        end: '2026-11-11T11:00:00+05:30',
         time_zone: 'Asia/Kolkata',
+        recurrence: ['RRULE:FREQ=DAILY'],
       },
     }
     renderProposalCard(proposal)
 
+    expect(screen.getByText('Review proposed action')).toBeInTheDocument()
     expect(screen.getByText('Title')).toBeInTheDocument()
     expect(screen.getByText('Gym')).toBeInTheDocument()
-    expect(screen.getByText('November 8, 2026')).toBeInTheDocument()
+    expect(screen.getByText('November 11, 2026')).toBeInTheDocument()
     expect(screen.getByText('10:00 AM')).toBeInTheDocument()
     expect(screen.getByText('11:00 AM')).toBeInTheDocument()
     expect(screen.getAllByText('Asia/Kolkata').length).toBeGreaterThan(0)
     expect(screen.getByText('primary')).toBeInTheDocument()
+    expect(screen.getByText('Daily')).toBeInTheDocument()
   })
 
   it('shows all-day Calendar events without misleading time fields', () => {

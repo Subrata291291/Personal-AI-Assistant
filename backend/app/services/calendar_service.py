@@ -35,7 +35,7 @@ class CalendarService:
     MAX_LIST_RESULTS = 2500
     MAX_PAGE_TOKEN_LENGTH = 4096
     MAX_CALENDARS_PER_PAGE = 250
-    _RESOURCE_ID = re.compile(r"[A-Za-z0-9._@+-]{1,1024}\Z")
+    _RESOURCE_ID = re.compile(r"[A-Za-z0-9._@+#-]{1,1024}\Z")
     _EMAIL = re.compile(r"[^@\s]{1,254}@[^@\s]{1,254}\Z")
 
     def __init__(self, db: Session):

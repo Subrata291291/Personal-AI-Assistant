@@ -10,7 +10,6 @@ from typing import Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app.core.request_metrics import request_id
 from langgraph.runtime import Runtime
 from pydantic import ValidationError
 
@@ -58,9 +57,7 @@ from app.workflows.calendar_create_draft import (
     extract_explicit_calendar_date as _extract_explicit_calendar_date,
     merge_calendar_create_draft,
 )
-from app.workflows.calendar_update_parser import (
-    _safe_timezone_for_logging,
-)
+from app.workflows.calendar_update_parser import log_calendar_update_diagnostic
 
 
 logger = logging.getLogger(__name__)
@@ -739,6 +736,8 @@ def _calendar_pending_time_revision(
     revised_parameters = revised.model_dump(mode="json")
     if revised_parameters.get("reminders") is None:
         revised_parameters.pop("reminders")
+    if revised_parameters.get("recurrence") is None:
+        revised_parameters.pop("recurrence")
     return _calendar_plan(
         "create_calendar_event_proposal",
         revised_parameters,
@@ -747,11 +746,34 @@ def _calendar_pending_time_revision(
 
 
 def _calendar_create_title(text: str) -> str | None:
+    explicit_title = extract_calendar_create_draft(
+        text,
+        default_time_zone=None,
+        use_default_time_zone=False,
+    ).get("summary")
+    if explicit_title:
+        return explicit_title
+    if re.search(
+        r"(?:^|\n|\s[-*•]\s*)"
+        r"(?:title|frequency|recurrence|start\s+time|end\s+time|"
+        r"time\s*zone|timezone|calendar)\s*:",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
+
     title = re.sub(
         r"^\s*(?:please\s+)?(?:set|put|add|create|book|schedule)\b"
         r"(?:\s+(?:in|on|to)\s+(?:my\s+|the\s+)?(?:google\s+)?calendar\b)?",
         "",
         text,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"^\s*(?:a\s+|an\s+|the\s+)?recurring\s+"
+        r"(?:(?:google\s+)?calendar\s+)?",
+        "",
+        title,
         flags=re.IGNORECASE,
     )
     title = re.sub(
@@ -763,6 +785,7 @@ def _calendar_create_title(text: str) -> str | None:
     )
     title = re.sub(
         r"\b(?:timing|from|between|at|starting|starts|on|today|tomorrow|"
+        r"daily|every\s+day|frequency|recurrence|"
         r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
         r"morning|afternoon|evening|tonight|all\s+day)\b.*$",
         "",
@@ -797,7 +820,7 @@ def _calendar_create_title(text: str) -> str | None:
         flags=re.IGNORECASE,
     )
     title = re.sub(r"\b(?:to|and|my|the|in|on)\b", " ", title, flags=re.IGNORECASE)
-    title = re.sub(r"^(?:a|an|the)\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^(?:a|an|the)\b\s*", "", title, flags=re.IGNORECASE)
     title = " ".join(title.split()).strip(" -,:.")
     return title[:250].capitalize() if title else None
 
@@ -845,19 +868,20 @@ def _calendar_create_followup_seed(state: ChatState) -> dict[str, Any] | None:
     ):
         return None
 
-    original_request = next(
+    original_request_index = next(
         (
-            item["content"]
-            for item in reversed(history)
-            if isinstance(item, dict)
-            and item.get("role") == "user"
-            and isinstance(item.get("content"), str)
-            and _calendar_event_creation_request(item["content"])
+            index
+            for index in range(len(history) - 1, -1, -1)
+            if isinstance(history[index], dict)
+            and history[index].get("role") == "user"
+            and isinstance(history[index].get("content"), str)
+            and _calendar_event_creation_request(history[index]["content"])
         ),
         None,
     )
-    if not isinstance(original_request, str):
+    if original_request_index is None:
         return None
+    original_request = history[original_request_index]["content"]
 
     timezone = _validated_timezone(state)
     initial_fields = extract_calendar_create_draft(
@@ -874,7 +898,27 @@ def _calendar_create_followup_seed(state: ChatState) -> dict[str, Any] | None:
         if relative_date is not None:
             initial_fields["event_date"] = relative_date
     try:
-        return merge_calendar_create_draft(None, initial_fields)
+        draft = merge_calendar_create_draft(None, initial_fields)
+        for item in history[original_request_index + 1:]:
+            if (
+                not isinstance(item, dict)
+                or item.get("role") != "user"
+                or not isinstance(item.get("content"), str)
+            ):
+                continue
+            followup = item["content"]
+            updates = extract_calendar_create_draft(
+                followup,
+                default_time_zone=timezone,
+                use_default_time_zone=False,
+            )
+            if not updates.get("event_date"):
+                relative_date = _relative_calendar_date(followup, state)
+                if relative_date is not None:
+                    updates["event_date"] = relative_date
+            if updates:
+                draft = merge_calendar_create_draft(draft, updates)
+        return draft
     except ValidationError:
         return None
 
@@ -908,7 +952,6 @@ def _calendar_create_draft_plan(
     state: ChatState,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     current_message = state["user_message"].strip()
-    existing_draft = _calendar_create_followup_seed(state)
     new_create_request = _calendar_event_creation_request(current_message) or (
         bool(re.search(
             r"^\s*(?:please\s+)?(?:schedule|book)\s+(?:a\s+)?"
@@ -917,6 +960,14 @@ def _calendar_create_draft_plan(
             current_message,
             re.IGNORECASE,
         ))
+    )
+    current_intent = _calendar_intent(current_message)
+    if current_intent not in {None, "CREATE_EVENT"}:
+        return None
+    existing_draft = (
+        None
+        if new_create_request
+        else _calendar_create_followup_seed(state)
     )
     if not new_create_request and existing_draft is None:
         return None
@@ -940,6 +991,14 @@ def _calendar_create_draft_plan(
         ),
         use_default_time_zone=existing_draft is None,
     )
+    if existing_draft is not None and not existing_draft.get("summary"):
+        title_reply = _calendar_create_title(current_message)
+        if title_reply and not re.search(
+            r"\b(?:tomorrow|today|at|from|until|to)\b",
+            current_message,
+            re.IGNORECASE,
+        ):
+            updates.setdefault("summary", title_reply)
     if existing_draft is None:
         if not updates.get("event_date"):
             relative_date = _relative_calendar_date(current_message, state)
@@ -947,12 +1006,17 @@ def _calendar_create_draft_plan(
                 updates["event_date"] = relative_date
         if not updates.get("calendar_id") and not updates.get("calendar_name"):
             updates["calendar_id"] = "primary"
-    elif not updates and not re.search(
-        r"\b(?:retain|keep|provided|previous|details|proposal)\b",
-        current_message,
-        re.IGNORECASE,
-    ):
-        return None
+    else:
+        if not updates.get("event_date"):
+            relative_date = _relative_calendar_date(current_message, state)
+            if relative_date is not None:
+                updates["event_date"] = relative_date
+        if not updates and not re.search(
+            r"\b(?:retain|keep|provided|previous|details|proposal)\b",
+            current_message,
+            re.IGNORECASE,
+        ):
+            return None
 
     try:
         draft = merge_calendar_create_draft(existing_draft, updates)
@@ -1025,7 +1089,10 @@ def _calendar_event_creation_request(text: str) -> bool:
         r"\b(?:set|put|create|add|book|schedule)\b.{0,60}"
         r"\b(?:meetings?|events?|appointments?|sessions?|classes?|calendar)\b|"
         r"\b(?:meetings?|events?|appointments?|sessions?|classes?)\b.{0,60}"
-        r"\b(?:set|put|create|add|book|schedule)\b",
+        r"\b(?:set|put|create|add|book|schedule)\b|"
+        r"^\s*(?:please\s+)?add\s+(?:an?\s+)?"
+        r"[A-Za-z0-9][A-Za-z0-9 '&-]{0,80}\s+"
+        r"(?:today|tomorrow|on\b|from\b|at\b)",
         lowered,
     ))
 
@@ -1033,20 +1100,88 @@ def _calendar_event_creation_request(text: str) -> bool:
 def _is_calendar_update_request(text: str) -> bool:
     lowered = text.casefold()
     return bool(re.search(
-        r"\b(?:move|reschedule|update|edit|change|modify)\b.{0,100}"
+        r"\b(?:move|reschedule|update|edit|change|rename|modify)\b.{0,100}"
         r"\b(?:my\s+)?(?:existing\s+)?(?:google\s+)?"
         r"(?:calendar\s+)?(?:meetings?|events?|appointments?|sessions?|classes?|calendar)\b|"
         r"\b(?:my\s+)?(?:calendar\s+)?"
-        r"(?:meetings?|events?|appointments?|sessions?|classes?)\b.{0,100}"
-        r"\b(?:move|reschedule|update|edit|change|modify)\b",
+        r"(?:meetings?|events?|appointments?|sessions?|classes?|calendar\s+\w+)\b.{0,100}"
+        r"\b(?:move|reschedule|update|edit|change|rename|modify)\b|"
+        r"\brename\b.{0,100}\b(?:my\s+)?(?:calendar|event|meeting)\b",
         lowered,
     ))
+
+
+def _calendar_intent(text: str) -> str | None:
+    lowered = text.casefold()
+    if re.search(
+        r"\b(?:proposal|execution)\s+status\b|"
+        r"\bcheck\s+(?:the\s+)?status\b",
+        lowered,
+    ):
+        return "GET_PROPOSAL_STATUS"
+    if re.search(
+        r"\b(?:verify|check)\b.{0,80}\b(?:event|exists|created)\b|"
+        r"\b(?:does|did)\b.{0,80}\bexist\b",
+        lowered,
+    ):
+        return "VERIFY_EVENT"
+    first_action = re.search(
+        r"\b(?:delete|remove|cancel|move|reschedule|update|edit|change|"
+        r"rename|modify|create|add|book|schedule)\b",
+        lowered,
+    )
+    if first_action:
+        action = first_action.group(0)
+        if action in {"delete", "remove", "cancel"}:
+            return "DELETE_EVENT" if _is_calendar_request(text) else None
+        if action in {
+            "move", "reschedule", "update", "edit", "change", "rename",
+            "modify",
+        }:
+            return (
+                "UPDATE_EVENT"
+                if _is_calendar_request(text)
+                and _is_calendar_update_request(text)
+                else None
+            )
+        if _calendar_event_creation_request(text):
+            return "CREATE_EVENT"
+    if re.search(
+        r"\b(?:free|available|availability|freebusy)\b",
+        lowered,
+    ):
+        return "CHECK_AVAILABILITY"
+    if not _is_calendar_request(text):
+        return None
+    if re.search(
+        r"\b(?:show|list|find|search|get|open|view|what|when|tell me)\b",
+        lowered,
+    ):
+        return "READ_EVENTS"
+    return None
 
 
 def _deterministic_calendar_plan(
     state: ChatState,
 ) -> tuple[dict[str, Any], str] | None:
     current_message = state["user_message"].strip()
+    current_intent = _calendar_intent(current_message)
+    if current_intent == "DELETE_EVENT":
+        return _calendar_plan("delete_calendar_event_proposal")
+    if current_intent == "UPDATE_EVENT":
+        calendar_capabilities = (
+            (state.get("assistant_capabilities") or {}).get(
+                "google_calendar",
+                {},
+            )
+        )
+        write_permission_granted = calendar_capabilities.get(
+            "write_permission_granted",
+            calendar_capabilities.get("write_execution_available", False),
+        )
+        if not write_permission_granted:
+            return _calendar_plan("update_calendar_event_proposal")
+        return None
     pending_revision = _calendar_pending_time_revision(state)
     if pending_revision is not None:
         return pending_revision
@@ -1342,9 +1477,86 @@ def _deterministic_calendar_plan(
             },
         )
 
+    month_pattern = (
+        r"january|february|march|april|may|june|july|august|"
+        r"september|october|november|december"
+    )
+    natural_date_range_match = re.search(
+        rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s*"
+        rf"(?:-|–|—|through|thru|to)\s*"
+        rf"({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
+        rf"(?:,\s*|\s+)(20\d{{2}})\b",
+        text,
+        re.IGNORECASE,
+    )
+    title_contains_match = re.search(
+        r"\btitle(?:s)?\s+contain(?:s)?\s+[\"“](.+?)[\"”]",
+        text,
+        re.IGNORECASE,
+    )
+    if natural_date_range_match and re.search(
+        r"\b(?:show|list|find|get|open|check|search|what|when|tell me|"
+        r"do i have|have|calendar|events?|meetings?|schedule)\b",
+        lowered,
+    ):
+        month_names = (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        )
+        try:
+            range_start_date = date(
+                int(natural_date_range_match.group(5)),
+                month_names.index(
+                    natural_date_range_match.group(1).casefold(),
+                ) + 1,
+                int(natural_date_range_match.group(2)),
+            )
+            range_end_date = date(
+                int(natural_date_range_match.group(5)),
+                month_names.index(
+                    natural_date_range_match.group(3).casefold(),
+                ) + 1,
+                int(natural_date_range_match.group(4)),
+            )
+        except ValueError:
+            return _calendar_plan("clarify")
+        if range_end_date < range_start_date:
+            return _calendar_plan("clarify")
+        range_start = _calendar_local_datetime(
+            range_start_date,
+            datetime_time.min,
+            timezone,
+        )
+        range_end = _calendar_local_datetime(
+            range_end_date + timedelta(days=1),
+            datetime_time.min,
+            timezone,
+        )
+        if range_start is None or range_end is None:
+            return _calendar_plan("clarify")
+        arguments = {
+            "time_min": range_start.isoformat(),
+            "time_max": range_end.isoformat(),
+            "time_zone": timezone,
+            "max_results": 100,
+            "calendar_id": "primary",
+        }
+        if title_contains_match:
+            arguments["query"] = title_contains_match.group(1).strip()[:500]
+        return _calendar_plan("list_calendar_events", arguments)
+
     natural_exact_date_match = re.search(
-        r"\b(january|february|march|april|may|june|july|august|"
-        r"september|october|november|december)\s+"
+        rf"\b({month_pattern})\s+"
         r"(\d{1,2})(?:st|nd|rd|th)?(?:,\s*|\s+)(20\d{2})\b",
         text,
         re.IGNORECASE,
@@ -1758,12 +1970,32 @@ def _deterministic_assistant_plan(
     if resumed_calendar is not None:
         return resumed_calendar
 
+    current_calendar_intent = _calendar_intent(text)
+    if current_calendar_intent == "DELETE_EVENT":
+        return _calendar_plan("delete_calendar_event_proposal")
+    if current_calendar_intent == "UPDATE_EVENT":
+        calendar_capabilities = (
+            (state.get("assistant_capabilities") or {}).get(
+                "google_calendar",
+                {},
+            )
+        )
+        if not calendar_capabilities.get(
+            "write_permission_granted",
+            calendar_capabilities.get("write_execution_available", False),
+        ):
+            return _calendar_plan("update_calendar_event_proposal")
+
     pending_calendar = state.get("pending_calendar_create_proposal")
-    if isinstance(pending_calendar, dict) and re.search(
-        r"\b(?:save(?:\s+it)?|approve(?:\s+it)?|yes(?:\s+please)?|"
-        r"confirm(?:\s+it)?|looks?\s+good)\b",
-        lowered,
-        re.IGNORECASE,
+    if (
+        current_calendar_intent != "UPDATE_EVENT"
+        and isinstance(pending_calendar, dict)
+        and re.search(
+            r"\b(?:save(?:\s+it)?|approve(?:\s+it)?|yes(?:\s+please)?|"
+            r"confirm(?:\s+it)?|looks?\s+good)\b",
+            lowered,
+            re.IGNORECASE,
+        )
     ):
         plan = ApprovalWorkflowPlan(
             intent="approval_workflow",
@@ -2143,9 +2375,9 @@ def _is_calendar_request(user_message: str) -> bool:
         lowered,
     ))
     has_action = bool(re.search(
-        r"\b(?:show|list|find|get|open|check|what|when|do i have|"
+        r"\b(?:show|list|find|search|get|open|check|what|when|do i have|"
         r"am i|are we|is there|tell me|schedule|add|create|book|"
-        r"cancel|delete|remove|update|edit|change|modify|move|"
+        r"cancel|delete|remove|update|edit|change|rename|modify|move|"
         r"reschedule|invite|rsvp|set|put|status|has|created|exists?)\b",
         lowered,
     ))
@@ -2370,6 +2602,94 @@ def _contextual_followup_messages(state: ChatState) -> list[dict[str, str]]:
     return context
 
 
+def _is_explicit_new_intent(text: str) -> bool:
+    if _calendar_intent(text) is not None:
+        return True
+    if _is_calendar_update_request(text):
+        return True
+    return bool(re.search(
+        r"\b(?:send|reply|forward|draft|search|find|delete|archive|trash|"
+        r"create|add|update|change|rename|move|schedule|book)\b.{0,100}"
+        r"\b(?:gmail|e-?mail|inbox|drive|file|task|reminder|contact)\b|"
+        r"\b(?:gmail|e-?mail|inbox|drive|file|task|reminder|contact)\b.{0,100}"
+        r"\b(?:send|reply|forward|draft|search|find|delete|archive|trash|"
+        r"create|add|update|change|rename|move|schedule|book)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+
+def _pending_calendar_continuation(
+    state: ChatState,
+) -> dict[str, Any] | None:
+    pending = state.get("pending_calendar_action")
+    if not isinstance(pending, dict):
+        return None
+
+    text = state["user_message"].strip()
+    lowered = text.casefold()
+    if re.match(
+        r"^(?:never\s*mind|nevermind|stop|forget\s+(?:it|that)|"
+        r"cancel(?:\s+(?:that|this|it|the\s+request|"
+        r"the\s+calendar\s+request))?)\s*[.!]*$",
+        lowered,
+    ):
+        return {
+            "gmail_plan": {"intent": "calendar_action_cancelled"},
+            "assistant_route": "google_calendar",
+        }
+    if _is_explicit_new_intent(text):
+        return None
+
+    operation = pending.get("operation")
+    tool = {
+        "create": "create_calendar_event_proposal",
+        "update": "update_calendar_event_proposal",
+        "delete": "delete_calendar_event_proposal",
+    }.get(operation)
+    original_request = pending.get("original_request")
+    if (
+        tool is None
+        or not isinstance(original_request, str)
+        or not original_request.strip()
+    ):
+        return None
+
+    arguments = pending.get("known_event_details")
+    if isinstance(arguments, dict):
+        arguments = dict(arguments)
+        if (
+            pending.get("calendar_id")
+            and not arguments.get("calendar_id")
+            and not arguments.get("calendar_name")
+        ):
+            arguments["calendar_id"] = pending["calendar_id"]
+    plan, _route = _calendar_plan(
+        tool,
+        arguments if isinstance(arguments, dict) else None,
+    )
+    result: dict[str, Any] = {
+        "gmail_plan": plan,
+        "assistant_route": "google_calendar",
+        "calendar_action_request": (
+            f"{original_request}\n"
+            f"Clarification supplied by the user: {text}"
+        ),
+    }
+    draft = pending.get("calendar_create_draft")
+    if operation == "create" and isinstance(draft, dict):
+        create_state = {
+            **state,
+            "calendar_create_draft": draft,
+        }
+        create_continuation = _calendar_create_draft_plan(create_state)
+        if create_continuation is not None:
+            plan, draft = create_continuation
+            result["gmail_plan"] = plan
+        result["calendar_create_draft"] = draft
+    return result
+
+
 def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
     """Produce one strict, validated assistant intent decision."""
     normalized_message = normalize_prompt_for_routing(state["user_message"])
@@ -2411,6 +2731,18 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             "assistant_route": "capabilities",
         }
 
+    pending_continuation = _pending_calendar_continuation(state)
+    if pending_continuation is not None:
+        return pending_continuation
+
+    current_calendar_intent = _calendar_intent(state["user_message"])
+    if current_calendar_intent == "DELETE_EVENT":
+        plan, _route = _calendar_plan("delete_calendar_event_proposal")
+        return {
+            "gmail_plan": plan,
+            "assistant_route": "google_calendar",
+        }
+
     calendar_create = _calendar_create_draft_plan(state)
     if calendar_create is not None:
         plan, draft = calendar_create
@@ -2449,6 +2781,26 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
     deterministic_plan = _deterministic_assistant_plan(state)
     if deterministic_plan is not None:
         plan, route = deterministic_plan
+        if calendar_update_request:
+            planner_arguments = plan.get("calendar_arguments")
+            log_calendar_update_diagnostic(
+                boundary="planner_normalized",
+                message_length=len(state["user_message"]),
+                timezone_present="Asia/Kolkata" in state["user_message"],
+                planner_intent=str(plan.get("intent", "-")),
+                planner_tool=str(plan.get("calendar_tool", "-")),
+                planner_arguments_null=not isinstance(
+                    planner_arguments,
+                    dict,
+                ),
+                planner_timezone=(
+                    planner_arguments.get("time_zone")
+                    if isinstance(planner_arguments, dict)
+                    else None
+                ),
+                selected_route=route,
+                module_path=__file__,
+            )
         return {
             "gmail_plan": plan,
             "assistant_route": route,
@@ -2525,6 +2877,9 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             "Gmail intent planning failed | error_type=%s",
             type(exc).__name__,
         )
+        if calendar_update_request:
+            plan, route = _calendar_plan("update_calendar_event_proposal")
+            return {"gmail_plan": plan, "assistant_route": route}
         return {
             "gmail_plan": _calendar_fallback(state) or _fallback_plan(),
             "assistant_route": (
@@ -2542,6 +2897,9 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             response.finish_reason,
             response.usage.completion_tokens if response.usage else None,
         )
+        if calendar_update_request:
+            plan, route = _calendar_plan("update_calendar_event_proposal")
+            return {"gmail_plan": plan, "assistant_route": route}
         return {
             "gmail_plan": _calendar_fallback(state) or _fallback_plan(),
             "assistant_route": (
@@ -2557,6 +2915,16 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
         logger.warning(
             "Gmail intent plan did not match the supported schema."
         )
+        if calendar_update_request:
+            normalized_plan, route = _calendar_plan(
+                "update_calendar_event_proposal"
+            )
+            return {
+                "gmail_plan": normalized_plan,
+                "assistant_route": route,
+                "provider": response.provider,
+                "model": response.model,
+            }
         return {
             "gmail_plan": _calendar_fallback(state) or _fallback_plan(),
             "assistant_route": (
@@ -2564,6 +2932,38 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
                 if _calendar_fallback(state) is not None
                 else "gmail"
             ),
+        }
+
+    if calendar_update_request:
+        normalized_plan, route = _calendar_plan(
+            "update_calendar_event_proposal",
+            (
+                plan.calendar_arguments
+                if plan.intent == "google_calendar"
+                else None
+            ),
+        )
+        planner_arguments = normalized_plan.get("calendar_arguments")
+        log_calendar_update_diagnostic(
+            boundary="planner_normalized",
+            message_length=len(state["user_message"]),
+            timezone_present="Asia/Kolkata" in state["user_message"],
+            planner_intent="google_calendar",
+            planner_tool="update_calendar_event_proposal",
+            planner_arguments_null=not isinstance(planner_arguments, dict),
+            planner_timezone=(
+                planner_arguments.get("time_zone")
+                if isinstance(planner_arguments, dict)
+                else None
+            ),
+            selected_route=route,
+            module_path=__file__,
+        )
+        return {
+            "gmail_plan": normalized_plan,
+            "assistant_route": route,
+            "provider": response.provider,
+            "model": response.model,
         }
 
     if _is_calendar_request(state["user_message"]) and (
@@ -2574,30 +2974,24 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             calendar_tool="clarify",
         ).model_dump(mode="json")
         if _is_calendar_update_request(state["user_message"]):
-            logger.info(
-                "calendar_update_trace | request_id=%s "
-                "| boundary=planner_normalized | message_length=%d "
-                "| timezone_present=%s | planner_intent=%s "
-                "| planner_tool=%s | planner_arguments_null=%s "
-                "| planner_timezone=%s | selected_route=google_calendar "
-                "| module_path=%s",
-                request_id(),
-                len(state["user_message"]),
-                "Asia/Kolkata" in state["user_message"],
-                plan.intent,
-                normalized_plan.get("calendar_tool"),
-                not isinstance(normalized_plan.get("calendar_arguments"), dict),
-                _safe_timezone_for_logging(
-                    normalized_plan.get("calendar_arguments", {}).get(
-                        "time_zone"
-                    )
-                    if isinstance(
-                        normalized_plan.get("calendar_arguments"),
-                        dict,
-                    )
+            planner_arguments = normalized_plan.get("calendar_arguments")
+            log_calendar_update_diagnostic(
+                boundary="planner_normalized",
+                message_length=len(state["user_message"]),
+                timezone_present="Asia/Kolkata" in state["user_message"],
+                planner_intent=normalized_plan.get("intent", "-"),
+                planner_tool=normalized_plan.get("calendar_tool", "-"),
+                planner_arguments_null=not isinstance(
+                    planner_arguments,
+                    dict,
+                ),
+                planner_timezone=(
+                    planner_arguments.get("time_zone")
+                    if isinstance(planner_arguments, dict)
                     else None
                 ),
-                __file__,
+                selected_route="google_calendar",
+                module_path=__file__,
             )
         return {
             "gmail_plan": normalized_plan,
@@ -2620,25 +3014,23 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
     )
     if _is_calendar_update_request(state["user_message"]):
         planner_arguments = normalized_plan.get("calendar_arguments")
-        logger.info(
-            "calendar_update_trace | request_id=%s "
-            "| boundary=planner_normalized | message_length=%d "
-            "| timezone_present=%s | planner_intent=%s "
-            "| planner_tool=%s | planner_arguments_null=%s "
-            "| planner_timezone=%s | selected_route=%s | module_path=%s",
-            request_id(),
-            len(state["user_message"]),
-            "Asia/Kolkata" in state["user_message"],
-            normalized_plan.get("intent"),
-            normalized_plan.get("calendar_tool"),
-            not isinstance(planner_arguments, dict),
-            _safe_timezone_for_logging(
+        log_calendar_update_diagnostic(
+            boundary="planner_normalized",
+            message_length=len(state["user_message"]),
+            timezone_present="Asia/Kolkata" in state["user_message"],
+            planner_intent=normalized_plan.get("intent", "-"),
+            planner_tool=normalized_plan.get("calendar_tool", "-"),
+            planner_arguments_null=not isinstance(
+                planner_arguments,
+                dict,
+            ),
+            planner_timezone=(
                 planner_arguments.get("time_zone")
                 if isinstance(planner_arguments, dict)
                 else None
             ),
-            selected_route,
-            __file__,
+            selected_route=selected_route,
+            module_path=__file__,
         )
     return {
         "gmail_plan": normalized_plan,

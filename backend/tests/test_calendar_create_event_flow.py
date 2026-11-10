@@ -118,6 +118,58 @@ def test_calendar_create_proposal_preflights_access_and_returns_payload(
     access_check.assert_not_awaited()
 
 
+def test_daily_recurrence_is_preserved_in_create_proposal_and_request_body(
+    monkeypatch,
+):
+    access_check = AsyncMock()
+    parameters_payload = {
+        **PARAMETERS,
+        "recurrence": ["RRULE:FREQ=DAILY"],
+    }
+    state = _calendar_state(True)
+    state["gmail_plan"]["calendar_arguments"] = parameters_payload
+    monkeypatch.setattr(
+        calendar_node_module,
+        "CalendarService",
+        lambda _db: SimpleNamespace(
+            validate_create_event_access=access_check,
+        ),
+    )
+    monkeypatch.setattr(
+        calendar_node_module,
+        "SessionLocal",
+        SessionContext,
+    )
+    context = SimpleNamespace(
+        context={
+            "user_id": str(USER_ID),
+            "calendar_write_connection_id": str(CONNECTION_ID),
+            "google_connection_available": True,
+        }
+    )
+
+    result = calendar_node_module.calendar_agent_node(state, context)
+
+    saved_proposal_parameters = result["calendar_create_event_proposal"]
+    assert saved_proposal_parameters["recurrence"] == [
+        "RRULE:FREQ=DAILY"
+    ]
+    parameters = CalendarCreateEventParameters.model_validate(
+        saved_proposal_parameters
+    )
+    identity = build_calendar_operation_identity(
+        proposal_id=PROPOSAL_ID,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        action_type="calendar.create_event",
+        parameters=parameters.model_dump(mode="json"),
+    )
+    body = CalendarActionExecutor._event_body(identity, parameters)
+    assert body["summary"] == "Design review"
+    assert body["recurrence"] == ["RRULE:FREQ=DAILY"]
+    access_check.assert_not_awaited()
+
+
 def test_revised_calendar_proposal_carries_superseded_proposal_id(
     monkeypatch,
 ):
@@ -265,18 +317,20 @@ def test_calendar_executor_rechecks_write_access_before_claim(
         True,
     )
     parameters = CalendarCreateEventParameters.model_validate(PARAMETERS)
+    identity_parameters = parameters.model_dump(mode="json")
+    identity_parameters.pop("recurrence")
     identity = build_calendar_operation_identity(
         proposal_id=PROPOSAL_ID,
         user_id=USER_ID,
         connection_id=CONNECTION_ID,
         action_type="calendar.create_event",
-        parameters=parameters.model_dump(mode="json"),
+        parameters=identity_parameters,
     )
     proposal = SimpleNamespace(
         proposal_id=PROPOSAL_ID,
         action_type="calendar.create_event",
         status="approved",
-        parameters=parameters.model_dump(mode="json"),
+        parameters=identity_parameters,
         connection_id=CONNECTION_ID,
         operation_id=identity.operation_id,
         payload_fingerprint=identity.payload_fingerprint,

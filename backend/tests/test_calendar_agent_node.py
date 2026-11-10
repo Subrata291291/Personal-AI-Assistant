@@ -1,3 +1,4 @@
+import asyncio
 import json
 from contextlib import nullcontext
 from datetime import datetime
@@ -27,6 +28,14 @@ UPDATE_MESSAGE = (
     "Calendar: Primary\n"
     "Keep the same date, title, timezone and calendar."
 )
+NATURAL_TITLE_UPDATE_MESSAGE = (
+    "Update the existing Google Calendar event whose title starts with "
+    "'A recurring google' and whose time is 10:00 AM–11:00 AM on "
+    "November 10, 2026. Change only its title to Gym. Preserve the date, "
+    "start time, end time, timezone, calendar, and recurrence. Prepare a "
+    "saved Update proposal and wait for explicit approval and separate "
+    "Execute."
+)
 
 
 def _state(tool_name, arguments):
@@ -43,6 +52,90 @@ def _state(tool_name, arguments):
         "model": "",
         "messages": [],
     }
+
+
+def test_recurring_series_delete_does_not_fall_back_to_occurrence(
+    monkeypatch,
+):
+    standalone_event = _series_event("standalone-event")
+    master = _series_event(
+        "standalone-event",
+        recurrence=["RRULE:FREQ=DAILY"],
+    )
+
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        [standalone_event],
+        master,
+    )
+
+    assert "could not verify its recurring master" in (
+        result["assistant_response"]
+    )
+    assert "calendar_action_proposal" not in result
+    service.get_event.assert_not_awaited()
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_connected_google_calendar_is_not_treated_as_named_calendar():
+    message = (
+        "Search my connected Google Calendar's primary calendar for all "
+        'events whose titles contain "Personal AI Assistant".'
+    )
+
+    assert calendar_agent_node._requested_calendar_name(message) is None
+
+
+def test_list_all_calendar_events_follows_each_page_token():
+    class PaginatedTool:
+        def __init__(self):
+            self.arguments = []
+
+        async def ainvoke(self, arguments):
+            self.arguments.append(arguments)
+            page_number = len(self.arguments)
+            return json.dumps({
+                "ok": True,
+                "data": {
+                    "calendar_id": "primary",
+                    "events": [{"id": f"event-{page_number}"}],
+                    "next_page_token": (
+                        "next-page" if page_number == 1 else None
+                    ),
+                },
+            })
+
+    tool = PaginatedTool()
+    result = json.loads(asyncio.run(
+        calendar_agent_node._list_all_calendar_events(
+            tool,
+            {
+                "calendar_id": "primary",
+                "query": "Personal AI Assistant",
+                "max_results": 100,
+            },
+        )
+    ))
+
+    assert result["ok"] is True
+    assert [event["id"] for event in result["data"]["events"]] == [
+        "event-1",
+        "event-2",
+    ]
+    assert result["data"]["next_page_token"] is None
+    assert tool.arguments == [
+        {
+            "calendar_id": "primary",
+            "query": "Personal AI Assistant",
+            "max_results": 100,
+        },
+        {
+            "calendar_id": "primary",
+            "query": "Personal AI Assistant",
+            "max_results": 100,
+            "page_token": "next-page",
+        },
+    ]
 
 
 class FakeTool:
@@ -65,6 +158,8 @@ def _update_event(
     summary,
     start,
     end,
+    *,
+    time_zone="Asia/Kolkata",
 ):
     return {
         "id": event_id,
@@ -74,12 +169,12 @@ def _update_event(
         "start": {
             "date_time": datetime.fromisoformat(start),
             "date": None,
-            "time_zone": "Asia/Kolkata",
+            "time_zone": time_zone,
         },
         "end": {
             "date_time": datetime.fromisoformat(end),
             "date": None,
-            "time_zone": "Asia/Kolkata",
+            "time_zone": time_zone,
         },
         "attendees": [],
         "etag": f'"etag-{event_id}"',
@@ -93,6 +188,9 @@ def _run_mocked_calendar_update(
     *,
     calendar_list=None,
     user_message=UPDATE_MESSAGE,
+    user_timezone="UTC",
+    event_pages=None,
+    request_time=None,
 ):
     planner_response = LLMResponse(
         content=json.dumps({
@@ -112,7 +210,11 @@ def _run_mocked_calendar_update(
     )
     events_by_id = {event["id"]: event for event in events}
     service = SimpleNamespace(
-        list_events=AsyncMock(return_value={"events": events}),
+        list_events=(
+            AsyncMock(side_effect=event_pages)
+            if event_pages is not None
+            else AsyncMock(return_value={"events": events})
+        ),
         validate_event_write_access=AsyncMock(
             side_effect=lambda **kwargs: events_by_id[kwargs["event_id"]]
         ),
@@ -143,8 +245,10 @@ def _run_mocked_calendar_update(
             },
         },
         "messages": [],
-        "user_timezone": "UTC",
+        "user_timezone": user_timezone,
     }
+    if request_time is not None:
+        state["request_time"] = request_time
     routed = gmail_agent_nodes.gmail_intent_router_node(state)
     state.update(routed)
     runtime = _runtime(
@@ -155,6 +259,80 @@ def _run_mocked_calendar_update(
     )
     result = run_node(state, runtime)
     return routed, result, service, runtime
+
+
+def test_calendar_update_lookup_follows_pages_before_resolving_unique_match(
+    monkeypatch,
+):
+    wrong_event = _update_event(
+        "event-wrong-date",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-11T10:00:00+05:30",
+        "2026-11-11T10:30:00+05:30",
+    )
+    matching_event = _update_event(
+        "event-match",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T10:30:00+05:30",
+    )
+
+    routed, result, service, _runtime_context = _run_mocked_calendar_update(
+        monkeypatch,
+        None,
+        [wrong_event, matching_event],
+        event_pages=[
+            {"events": [wrong_event], "next_page_token": "page-2"},
+            {"events": [matching_event], "next_page_token": None},
+        ],
+    )
+
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "update_calendar_event_proposal"
+    )
+    assert result["calendar_action_proposal"]["parameters"]["event_id"] == (
+        "event-match"
+    )
+    assert result["calendar_action_proposal"]["parameters"]["expected_etag"] == (
+        '"etag-event-match"'
+    )
+    assert service.list_events.await_count == 2
+    assert service.list_events.await_args_list[1].kwargs["page_token"] == (
+        "page-2"
+    )
+
+
+def test_natural_move_to_tomorrow_preserves_event_duration_and_etag(
+    monkeypatch,
+):
+    event = _update_event(
+        "event-planning",
+        "Planning",
+        "2026-11-08T10:00:00+05:30",
+        "2026-11-08T11:00:00+05:30",
+    )
+
+    routed, result, _service, _runtime_context = _run_mocked_calendar_update(
+        monkeypatch,
+        None,
+        [event],
+        user_message="Move my meeting named Planning to 4 PM tomorrow.",
+        user_timezone="Asia/Kolkata",
+        request_time="2026-11-08T04:30:00+00:00",
+    )
+
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "update_calendar_event_proposal"
+    )
+    proposal = result["calendar_action_proposal"]["parameters"]
+    assert proposal["event_id"] == "event-planning"
+    assert proposal["expected_etag"] == '"etag-event-planning"'
+    assert proposal["changes"]["start"]["dateTime"] == (
+        "2026-11-09T16:00:00+05:30"
+    )
+    assert proposal["changes"]["end"]["dateTime"] == (
+        "2026-11-09T17:00:00+05:30"
+    )
 
 
 def _event(event_id, summary, start, end):
@@ -1151,7 +1329,13 @@ def test_calendar_update_proposal_preparation_preserves_approval_gate(
     "planner_arguments",
     [
         None,
-        {"event_query": "Planning", "changes": {"location": "Room 2"}},
+        {
+            "event_query": "Planning",
+            "changes": {
+                "summary": "Unrequested title",
+                "location": "Unrequested room",
+            },
+        },
     ],
 )
 def test_planner_clarify_recovers_original_update_details_and_prepares_proposal(
@@ -1184,7 +1368,9 @@ def test_planner_clarify_recovers_original_update_details_and_prepares_proposal(
     )
 
     assert routed["gmail_plan"]["intent"] == "google_calendar"
-    assert routed["gmail_plan"]["calendar_tool"] == "clarify"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "update_calendar_event_proposal"
+    )
     assert result["calendar_action_proposal"]["action_type"] == (
         "calendar.update_event"
     )
@@ -1201,8 +1387,8 @@ def test_planner_clarify_recovers_original_update_details_and_prepares_proposal(
     assert proposal["changes"]["end"]["dateTime"] == (
         "2026-11-10T11:30:00+05:30"
     )
-    if planner_arguments and planner_arguments.get("changes", {}).get("location"):
-        assert proposal["changes"]["location"] == "Room 2"
+    assert "summary" not in proposal["changes"]
+    assert "location" not in proposal["changes"]
 
     lookup = service.list_events.await_args.kwargs
     assert lookup["query"] == "Personal AI Assistant - Calendar Test"
@@ -1217,6 +1403,177 @@ def test_planner_clarify_recovers_original_update_details_and_prepares_proposal(
     }
     assert runtime.context["calendar_write_connection_id"] == EVENT_CONNECTION_ID
     assert "separately execute" in result["assistant_response"]
+
+
+def test_natural_prefix_title_only_update_preserves_recurring_event_details(
+    monkeypatch,
+):
+    wrong_title = _update_event(
+        "event-wrong-title",
+        "Gym recurring google class",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T11:00:00+05:30",
+    )
+    wrong_time = _update_event(
+        "event-wrong-time",
+        "A recurring google workout",
+        "2026-11-10T11:00:00+05:30",
+        "2026-11-10T12:00:00+05:30",
+    )
+    wrong_date = _update_event(
+        "event-wrong-date",
+        "A recurring google workout",
+        "2026-11-11T10:00:00+05:30",
+        "2026-11-11T11:00:00+05:30",
+    )
+    matching_event = _update_event(
+        "event-recurring-instance",
+        "A recurring google workout",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T11:00:00+05:30",
+    )
+    matching_event.update({
+        "recurrence": ["RRULE:FREQ=WEEKLY"],
+        "recurring_event_id": "recurring-series",
+        "original_start_time": matching_event["start"],
+    })
+
+    routed, result, service, _runtime_context = _run_mocked_calendar_update(
+        monkeypatch,
+        {
+            "event_query": "wrong planner target",
+            "time_zone": "America/Los_Angeles",
+            "changes": {
+                "summary": "Wrong planner title",
+                "location": "Unrequested room",
+                "start": {
+                    "dateTime": "2026-11-10T12:00:00+05:30",
+                    "timeZone": "Asia/Kolkata",
+                },
+                "end": {
+                    "dateTime": "2026-11-10T13:00:00+05:30",
+                    "timeZone": "Asia/Kolkata",
+                },
+            },
+        },
+        [wrong_title, wrong_time, wrong_date, matching_event],
+        user_message=NATURAL_TITLE_UPDATE_MESSAGE,
+        user_timezone="Asia/Kolkata",
+    )
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "update_calendar_event_proposal"
+    )
+    assert result["calendar_action_proposal"]["action_type"] == (
+        "calendar.update_event"
+    )
+    parameters = result["calendar_action_proposal"]["parameters"]
+    assert parameters["calendar_id"] == "primary"
+    assert parameters["event_id"] == "event-recurring-instance"
+    assert parameters["expected_etag"] == '"etag-event-recurring-instance"'
+    assert parameters["current_event"]["summary"] == (
+        "A recurring google workout"
+    )
+    assert parameters["current_event"]["start"] == {
+        "dateTime": "2026-11-10T10:00:00+05:30",
+        "timeZone": "Asia/Kolkata",
+    }
+    assert parameters["current_event"]["end"] == {
+        "dateTime": "2026-11-10T11:00:00+05:30",
+        "timeZone": "Asia/Kolkata",
+    }
+    assert parameters["current_event"]["recurrence"] == [
+        "RRULE:FREQ=WEEKLY"
+    ]
+    assert parameters["changes"] == {"summary": "Gym"}
+    assert "Before → after" in result["assistant_response"]
+    assert "approve and separately execute" in result["assistant_response"]
+    assert service.list_events.await_args.kwargs["query"] == (
+        "A recurring google"
+    )
+    assert service.validate_event_write_access.await_args.kwargs["event_id"] == (
+        "event-recurring-instance"
+    )
+
+
+@pytest.mark.parametrize(
+    ("events", "expected_response"),
+    [
+        (
+            [
+                _update_event(
+                    "event-one",
+                    "A recurring google workout",
+                    "2026-11-10T10:00:00+05:30",
+                    "2026-11-10T11:00:00+05:30",
+                ),
+                _update_event(
+                    "event-two",
+                    "A recurring google class",
+                    "2026-11-10T10:00:00+05:30",
+                    "2026-11-10T11:00:00+05:30",
+                ),
+            ],
+            "multiple possible Calendar events",
+        ),
+        (
+            [
+                _update_event(
+                    "event-nonmatching-prefix",
+                    "Gym recurring google workout",
+                    "2026-11-10T10:00:00+05:30",
+                    "2026-11-10T11:00:00+05:30",
+                ),
+            ],
+            "couldn’t find an existing Calendar event",
+        ),
+    ],
+)
+def test_natural_prefix_update_requires_a_unique_matching_event(
+    monkeypatch,
+    events,
+    expected_response,
+):
+    _routed, result, service, _runtime_context = _run_mocked_calendar_update(
+        monkeypatch,
+        None,
+        events,
+        user_message=NATURAL_TITLE_UPDATE_MESSAGE,
+        user_timezone="Asia/Kolkata",
+    )
+
+    assert expected_response in result["assistant_response"]
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_recurring_series_delete_rejects_master_with_wrong_start_date(
+    monkeypatch,
+):
+    occurrence = _series_event("series-occurrence", occurrence=True)
+    wrong_master = _series_event(
+        "series-master",
+        recurrence=["RRULE:FREQ=DAILY"],
+    )
+    wrong_master["start"]["date_time"] = datetime.fromisoformat(
+        "2026-11-10T10:00:00+05:30"
+    )
+    wrong_master["end"]["date_time"] = datetime.fromisoformat(
+        "2026-11-10T11:00:00+05:30"
+    )
+
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        [occurrence],
+        wrong_master,
+    )
+
+    assert "did not verify as the requested recurring series" in (
+        result["assistant_response"]
+    )
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
 
 
 def test_calendar_update_clarify_requests_only_missing_event_or_proposed_time(
@@ -1241,7 +1598,9 @@ def test_calendar_update_clarify_requests_only_missing_event_or_proposed_time(
             [],
             user_message=message,
         )
-        assert routed["gmail_plan"]["calendar_tool"] == "clarify"
+        assert routed["gmail_plan"]["calendar_tool"] == (
+            "update_calendar_event_proposal"
+        )
         assert expected.casefold() in result["assistant_response"].casefold()
         service.list_events.assert_not_awaited()
         service.validate_event_write_access.assert_not_awaited()
@@ -1324,6 +1683,328 @@ def test_calendar_update_resolves_named_calendar_using_selected_connection(
     )
 
 
+SERIES_DELETE_MESSAGE = (
+    "Delete the entire recurring Gym series from my primary Google Calendar. "
+    "Find the original recurring master event, not an individual occurrence. "
+    "Verify that it is the daily recurring series from November 11, 2026, at "
+    "10:00 AM to 11:00 AM Asia/Kolkata, with no end date. Show me the event "
+    "details and prepare a saved Delete proposal for the entire recurring "
+    "series. Wait for my explicit approval and separate Execute action. "
+    "Do not delete anything automatically."
+)
+
+
+def _series_event(event_id, *, occurrence=False, recurrence=None, summary="Gym"):
+    event = _update_event(
+        event_id,
+        summary,
+        "2026-11-11T10:00:00+05:30",
+        "2026-11-11T11:00:00+05:30",
+    )
+    if occurrence:
+        event["recurring_event_id"] = "series-master"
+    if recurrence is not None:
+        event["recurrence"] = recurrence
+    return event
+
+
+def _run_mocked_calendar_delete(
+    monkeypatch,
+    occurrences,
+    master,
+    *,
+    master_error=None,
+    user_message=SERIES_DELETE_MESSAGE,
+):
+    class SessionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": occurrences}),
+        get_event=AsyncMock(
+            return_value=master,
+            side_effect=master_error,
+        ),
+        validate_event_write_access=AsyncMock(return_value=master),
+    )
+    monkeypatch.setattr(
+        calendar_agent_node,
+        "CalendarService",
+        lambda _db: service,
+    )
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", SessionContext)
+    state = _state("clarify", {})
+    state["user_message"] = user_message
+    state["assistant_capabilities"] = {
+        "google_calendar": {"write_permission_granted": True},
+    }
+    runtime = _runtime(
+        user_id=USER_ID,
+        calendar_write_connection_id=EVENT_CONNECTION_ID,
+        google_connection_available=True,
+        calendar_enabled=True,
+    )
+    return run_node(state, runtime), service
+
+
+def test_delete_exact_natural_title_resolves_one_event_without_internal_ids(
+    monkeypatch,
+):
+    event = _update_event(
+        "event-exact-title",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T10:30:00+05:30",
+    )
+
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        [event],
+        event,
+        user_message="Delete my Personal AI Assistant - Calendar Test.",
+    )
+
+    proposal = result["calendar_action_proposal"]["parameters"]
+    assert proposal["event_id"] == "event-exact-title"
+    assert proposal["calendar_id"] == "primary"
+    assert proposal["expected_etag"] == '"etag-event-exact-title"'
+    assert proposal["current_event"]["summary"] == (
+        "Personal AI Assistant - Calendar Test"
+    )
+    assert service.list_events.await_args.kwargs["query"] == (
+        "Personal AI Assistant - Calendar Test"
+    )
+
+
+@pytest.mark.parametrize(
+    ("events", "expected_response"),
+    [
+        ([], "couldn’t find an existing Calendar event"),
+        (
+            [
+                _update_event(
+                    "event-one",
+                    "Personal AI Assistant - Calendar Test",
+                    "2026-11-10T10:00:00+05:30",
+                    "2026-11-10T10:30:00+05:30",
+                ),
+                _update_event(
+                    "event-two",
+                    "Personal AI Assistant - Calendar Test",
+                    "2026-11-10T10:00:00+05:30",
+                    "2026-11-10T10:30:00+05:30",
+                ),
+            ],
+            "multiple possible Calendar events",
+        ),
+    ],
+)
+def test_delete_without_unique_exact_match_never_prepares_proposal(
+    monkeypatch,
+    events,
+    expected_response,
+):
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        events,
+        events[0] if events else None,
+        user_message="Delete my Personal AI Assistant - Calendar Test.",
+    )
+
+    assert expected_response in result["assistant_response"]
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_recurring_series_delete_prepares_conditional_master_proposal(
+    monkeypatch,
+):
+    occurrence = _series_event("series-occurrence", occurrence=True)
+    master = _series_event(
+        "series-master",
+        recurrence=["RRULE:FREQ=DAILY"],
+    )
+
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        [occurrence],
+        master,
+    )
+
+    proposal = result["calendar_action_proposal"]["parameters"]
+    assert result["calendar_action_proposal"]["action_type"] == (
+        "calendar.delete_event"
+    )
+    assert proposal["calendar_id"] == "primary"
+    assert proposal["event_id"] == "series-master"
+    assert proposal["expected_etag"] == '"etag-series-master"'
+    assert proposal["current_event"]["summary"] == "Gym"
+    assert proposal["current_event"]["start"] == {
+        "dateTime": "2026-11-11T10:00:00+05:30",
+        "timeZone": "Asia/Kolkata",
+    }
+    assert proposal["current_event"]["end"] == {
+        "dateTime": "2026-11-11T11:00:00+05:30",
+        "timeZone": "Asia/Kolkata",
+    }
+    assert proposal["current_event"]["recurrence"] == ["RRULE:FREQ=DAILY"]
+    assert proposal["delete_entire_series"] is True
+    assert "entire daily recurring series" in result["assistant_response"]
+    assert "no end date" in result["assistant_response"]
+    assert "separately execute" in result["assistant_response"]
+    assert service.list_events.await_args.kwargs["calendar_id"] == "primary"
+    assert service.list_events.await_args.kwargs["query"] == "Gym"
+    assert service.list_events.await_args.kwargs["time_min"].isoformat() == (
+        "2026-11-11T00:00:00+05:30"
+    )
+    service.get_event.assert_awaited_once_with(
+        user_id=UUID(USER_ID),
+        connection_id=UUID(EVENT_CONNECTION_ID),
+        calendar_id="primary",
+        event_id="series-master",
+    )
+    service.validate_event_write_access.assert_awaited_once_with(
+        user_id=UUID(USER_ID),
+        connection_id=UUID(EVENT_CONNECTION_ID),
+        calendar_id="primary",
+        event_id="series-master",
+    )
+
+
+@pytest.mark.parametrize(
+    ("occurrences", "response"),
+    [
+        ([], "couldn’t find an existing Calendar event"),
+        (
+            [
+                _series_event("occurrence-one", occurrence=True),
+                _series_event("occurrence-two", occurrence=True),
+            ],
+            "multiple possible Calendar events",
+        ),
+    ],
+)
+def test_recurring_series_delete_requires_one_exact_occurrence(
+    monkeypatch,
+    occurrences,
+    response,
+):
+    master = _series_event(
+        "series-master",
+        recurrence=["RRULE:FREQ=DAILY"],
+    )
+
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        occurrences,
+        master,
+    )
+
+    assert response in result["assistant_response"]
+    assert "calendar_action_proposal" not in result
+    service.get_event.assert_not_awaited()
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_recurring_series_delete_rejects_wrong_occurrence_date_or_time(
+    monkeypatch,
+):
+    wrong_date = _series_event("wrong-date", occurrence=True)
+    wrong_date["start"]["date_time"] = datetime.fromisoformat(
+        "2026-11-12T10:00:00+05:30"
+    )
+    wrong_date["end"]["date_time"] = datetime.fromisoformat(
+        "2026-11-12T11:00:00+05:30"
+    )
+    wrong_time = _series_event("wrong-time", occurrence=True)
+    wrong_time["start"]["date_time"] = datetime.fromisoformat(
+        "2026-11-11T12:00:00+05:30"
+    )
+    wrong_time["end"]["date_time"] = datetime.fromisoformat(
+        "2026-11-11T13:00:00+05:30"
+    )
+    master = _series_event(
+        "series-master",
+        recurrence=["RRULE:FREQ=DAILY"],
+    )
+
+    for event in (wrong_date, wrong_time):
+        result, service = _run_mocked_calendar_delete(
+            monkeypatch,
+            [event],
+            master,
+        )
+        assert "couldn’t find an existing Calendar event" in (
+            result["assistant_response"]
+        )
+        assert "calendar_action_proposal" not in result
+        service.get_event.assert_not_awaited()
+        service.validate_event_write_access.assert_not_awaited()
+
+
+def test_recurring_series_delete_rejects_nonmatching_master(monkeypatch):
+    occurrence = _series_event("series-occurrence", occurrence=True)
+    wrong_master = _series_event(
+        "series-master",
+        recurrence=["RRULE:FREQ=WEEKLY"],
+    )
+
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        [occurrence],
+        wrong_master,
+    )
+
+    assert "did not verify as the requested recurring series" in (
+        result["assistant_response"]
+    )
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_recurring_series_delete_rejects_master_with_end_date(monkeypatch):
+    occurrence = _series_event("series-occurrence", occurrence=True)
+    bounded_master = _series_event(
+        "series-master",
+        recurrence=["RRULE:FREQ=DAILY;UNTIL=20261231T000000Z"],
+    )
+
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        [occurrence],
+        bounded_master,
+    )
+
+    assert "did not verify as the requested recurring series" in (
+        result["assistant_response"]
+    )
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_recurring_series_delete_fails_closed_when_master_is_missing(
+    monkeypatch,
+):
+    occurrence = _series_event("series-occurrence", occurrence=True)
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        [occurrence],
+        None,
+        master_error=ValueError("provider event not found"),
+    )
+
+    assert "couldn’t verify the recurring Calendar master" in (
+        result["assistant_response"]
+    )
+    assert "calendar_action_proposal" not in result
+    service.get_event.assert_awaited_once()
+    service.validate_event_write_access.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     ("arguments", "message", "expected", "not_expected"),
     [
@@ -1336,7 +2017,7 @@ def test_calendar_update_resolves_named_calendar_using_selected_connection(
         (
             {"changes": {"summary": "Updated Planning"}},
             "Update my Calendar event and change its title.",
-            "Which Calendar event should I update",
+            "Please specify which Calendar event to update",
             "What would you like to change",
         ),
         (

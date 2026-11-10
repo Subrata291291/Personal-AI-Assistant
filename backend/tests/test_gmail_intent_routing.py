@@ -352,6 +352,18 @@ def test_calendar_and_gmail_requests_route_to_their_service():
             "google_calendar",
             "delete_calendar_event_proposal",
         ),
+        (
+            "Delete the entire recurring Gym series from my primary Google "
+            "Calendar. Find the original recurring master event, not an "
+            "individual occurrence. Verify that it is the daily recurring "
+            "series from November 11, 2026, at 10:00 AM to 11:00 AM "
+            "Asia/Kolkata, with no end date. Show me the event details and "
+            "prepare a saved Delete proposal for the entire recurring series. "
+            "Wait for my explicit approval and separate Execute action. "
+            "Do not delete anything automatically.",
+            "google_calendar",
+            "delete_calendar_event_proposal",
+        ),
         ("Search my emails.", "gmail", "search_emails"),
         ("Find emails from Google.", "gmail", "search_emails"),
     )
@@ -822,6 +834,33 @@ def test_common_calendar_requests_route_to_read_only_calendar_tools():
         assert routed["assistant_route"] == "google_calendar"
         assert routed["gmail_plan"]["intent"] == "google_calendar"
         assert routed["gmail_plan"]["calendar_tool"] == expected_tool
+
+
+def test_calendar_title_search_routes_full_natural_date_range_to_primary():
+    message = (
+        "Search my connected Google Calendar's primary calendar for all "
+        'events whose titles contain "Personal AI Assistant".\n'
+        "Date range: November 1–December 1, 2026.\n"
+        "Timezone: Asia/Kolkata.\n"
+        "Use a live, read-only Google Calendar search. Retrieve all pages "
+        "of results."
+    )
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        message,
+        user_timezone="Asia/Kolkata",
+        request_time=datetime.fromisoformat("2026-11-10T12:00:00+05:30"),
+    ))
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "list_calendar_events"
+    assert routed["gmail_plan"]["calendar_arguments"] == {
+        "time_min": "2026-11-01T00:00:00+05:30",
+        "time_max": "2026-12-02T00:00:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "max_results": 100,
+        "calendar_id": "primary",
+        "query": "Personal AI Assistant",
+    }
 
 
 def test_calendar_natural_language_exact_date_routes_to_one_day_schedule():
@@ -2028,6 +2067,57 @@ def test_calendar_create_preserves_explicit_12_and_24_hour_times(
     assert parameters["time_zone"] == "Asia/Kolkata"
 
 
+def test_recurring_gym_create_parses_labeled_request_without_prompt_leakage():
+    malformed_title = (
+        "A recurring google with these details: - title: gym "
+        "- frequency: every day - start time: 10:00 AM "
+        "- end time: 11:00 AM - timezone: Asia/Kolkata "
+        "- calendar: Primary"
+    )
+    extracted_malformed_title = extract_calendar_create_draft(
+        malformed_title,
+        default_time_zone="Asia/Kolkata",
+        fallback_summary=gmail_agent_nodes._calendar_create_title(
+            malformed_title
+        ),
+    )
+    assert extracted_malformed_title["summary"] == "Gym"
+    assert extracted_malformed_title["recurrence"] == [
+        "RRULE:FREQ=DAILY"
+    ]
+
+    message = (
+        "Create a recurring Google Calendar event with these details: "
+        "- title: Gym - frequency: every day - date: November 10, 2026 "
+        "- start time: 10:00 AM - end time: 11:00 AM "
+        "- timezone: Asia/Kolkata - calendar: Primary - no end date. "
+        "Prepare an approval proposal and wait for separate approval "
+        "and Execute."
+    )
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        message,
+        user_timezone="Asia/Kolkata",
+        request_time=datetime(2026, 11, 8, 4, 30, tzinfo=ZoneInfo("UTC")),
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+    ))
+
+    parameters = routed["gmail_plan"]["calendar_arguments"]
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
+    assert parameters["summary"] == "Gym"
+    assert parameters["start"] == "2026-11-10T10:00:00+05:30"
+    assert parameters["end"] == "2026-11-10T11:00:00+05:30"
+    assert parameters["time_zone"] == "Asia/Kolkata"
+    assert parameters["calendar_id"] == "primary"
+    assert parameters["recurrence"] == ["RRULE:FREQ=DAILY"]
+    assert parameters["description"] == "Workout session"
+    assert "approval" not in parameters["summary"].casefold()
+    assert "execute" not in str(parameters).casefold()
+
+
 def test_calendar_create_time_change_followup_preserves_date_and_title():
     history = [
         {
@@ -2096,6 +2186,124 @@ def test_calendar_create_single_time_followup_preserves_other_endpoint():
     parameters = routed["gmail_plan"]["calendar_arguments"]
     assert parameters["start"] == "2026-11-08T10:00:00+05:30"
     assert parameters["end"] == "2026-11-08T12:00:00+05:30"
+
+
+def test_pending_calendar_delete_resumes_from_title_only_reply():
+    pending = {
+        "operation": "delete",
+        "original_request": "Delete my Personal AI Assistant - Calendar Test.",
+        "known_event_details": {"calendar_id": "primary"},
+    }
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Personal AI Assistant - Calendar Test",
+        pending_calendar_action=pending,
+    ))
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "delete_calendar_event_proposal"
+    )
+    assert routed["calendar_action_request"].endswith(
+        "Clarification supplied by the user: "
+        "Personal AI Assistant - Calendar Test"
+    )
+
+
+def test_pending_calendar_action_can_be_canceled_without_provider_routing():
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Never mind",
+        pending_calendar_action={
+            "operation": "delete",
+            "original_request": "Delete my Calendar Test.",
+        },
+    ))
+
+    assert routed == {
+        "gmail_plan": {"intent": "calendar_action_cancelled"},
+        "assistant_route": "google_calendar",
+    }
+
+
+def test_pending_calendar_create_merges_a_missing_end_time_reply():
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "11 AM",
+        user_timezone="Asia/Kolkata",
+        pending_calendar_action={
+            "operation": "create",
+            "original_request": "Add gym in my calendar tomorrow at 10 AM.",
+            "calendar_id": "primary",
+            "known_event_details": {},
+            "calendar_create_draft": {
+                "summary": "Gym",
+                "event_date": "2026-11-11",
+                "start_time": "10:00",
+                "time_zone": "Asia/Kolkata",
+                "calendar_id": "primary",
+            },
+        },
+    ))
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
+    assert routed["gmail_plan"]["calendar_arguments"]["end"] == (
+        "2026-11-11T11:00:00+05:30"
+    )
+
+
+def test_generic_create_request_does_not_infer_article_as_event_title():
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Create a meeting tomorrow at 10 AM.",
+        user_timezone="Asia/Kolkata",
+    ))
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["calendar_create_draft"].get("summary") is None
+
+
+def test_pending_calendar_update_reuses_update_parser_for_title_reply():
+    pending = {
+        "operation": "update",
+        "original_request": "Update my meeting.",
+        "calendar_id": "primary",
+        "known_event_details": {},
+    }
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Change title to Project Discussion.",
+        pending_calendar_action=pending,
+    ))
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "update_calendar_event_proposal"
+    )
+    assert "Update my meeting." in routed["calendar_action_request"]
+
+
+@pytest.mark.parametrize(
+    ("message", "intent"),
+    [
+        ("Move my meeting to 4 PM tomorrow.", "UPDATE_EVENT"),
+        ("Rename my Calendar Test to Project Discussion.", "UPDATE_EVENT"),
+        ("Create a meeting tomorrow at 10 AM.", "CREATE_EVENT"),
+    ],
+)
+def test_new_calendar_intent_is_not_overridden_by_pending_action(
+    message,
+    intent,
+):
+    pending = {
+        "operation": "delete",
+        "original_request": "Delete my Personal AI Assistant - Calendar Test.",
+    }
+
+    assert gmail_agent_nodes._calendar_intent(message) == intent
+    assert gmail_agent_nodes._pending_calendar_continuation(_state(
+        message,
+        pending_calendar_action=pending,
+    )) is None
 
 
 def test_calendar_create_without_end_time_asks_for_clarification():
@@ -3125,3 +3333,121 @@ def test_reply_and_forward_intents_require_a_known_source():
         assert plan["intent"] == expected_intent
         assert plan["source_message_id"] == "known-message"
         assert plan["source_thread_id"] == "known-thread"
+
+
+def test_current_delete_overrides_stale_calendar_create_context(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda request: calls.append(request),
+    )
+    pending = {
+        "proposal_id": "pending-create",
+        "parameters": {"summary": "Old Gym"},
+        "status": "pending_approval",
+    }
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Delete my Personal AI Assistant - Calendar Test.",
+        messages=[
+            {"role": "user", "content": "Add gym tomorrow at 10 AM."},
+            {"role": "assistant", "content": "Review the Create proposal."},
+        ],
+        pending_calendar_create_proposal=pending,
+        calendar_create_draft={"summary": "Old Gym"},
+    ))
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "delete_calendar_event_proposal"
+    )
+    assert "calendar_create_draft" not in routed
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_intent"),
+    (
+        ("Add gym tomorrow at 10 AM.", "CREATE_EVENT"),
+        ("Move my meeting to 4 PM tomorrow.", "UPDATE_EVENT"),
+        (
+            "Delete my Personal AI Assistant - Calendar Test.",
+            "DELETE_EVENT",
+        ),
+        (
+            "Update my Calendar event named Delete Calendar Test.",
+            "UPDATE_EVENT",
+        ),
+        (
+            "Delete my Calendar event named Update Calendar Test.",
+            "DELETE_EVENT",
+        ),
+        ("Show my calendar for tomorrow.", "READ_EVENTS"),
+        ("Check my calendar availability tomorrow.", "CHECK_AVAILABILITY"),
+        ("Check the Calendar proposal status.", "GET_PROPOSAL_STATUS"),
+        ("Verify the Calendar event exists.", "VERIFY_EVENT"),
+    ),
+)
+def test_calendar_intent_classifier_is_mutually_exclusive(text, expected_intent):
+    assert gmail_agent_nodes._calendar_intent(text) == expected_intent
+
+
+def test_calendar_update_routes_by_current_message_not_stale_approval(monkeypatch):
+    response = LLMResponse(
+        content=json.dumps({
+            "intent": "approval_workflow",
+            "operation": "approve",
+        }),
+        provider="test",
+        model="test-model",
+        latency_ms=0,
+        finish_reason="stop",
+    )
+    calls = []
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda request: calls.append(request) or response,
+    )
+    pending = {
+        "proposal_id": "pending-create",
+        "parameters": {"summary": "Old Gym"},
+        "status": "pending_approval",
+    }
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(_calendar_create_state(
+        "Move my meeting to 4 PM tomorrow.",
+        pending_calendar_create_proposal=pending,
+        calendar_create_draft={"summary": "Old Gym"},
+    ))
+
+    assert calls
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "update_calendar_event_proposal"
+    )
+    assert routed["gmail_plan"]["intent"] == "google_calendar"
+    assert "approval_workflow" != routed["gmail_plan"]["intent"]
+    assert calls[0].messages[-1].content.endswith(
+        "Move my meeting to 4 PM tomorrow."
+    )
+
+
+def test_add_gym_natural_language_routes_to_create_and_requests_missing_end():
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Add gym tomorrow at 10 AM.",
+        user_timezone="Asia/Kolkata",
+        request_time="2026-11-08T04:30:00+00:00",
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+    ))
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "create_calendar_event_proposal"
+    )
+    assert routed["calendar_create_draft"]["summary"] == "Gym"
+    assert routed["calendar_create_draft"]["start_time"] == "10:00"
+    assert routed["calendar_create_draft"].get("end_time") is None

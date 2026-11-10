@@ -43,6 +43,22 @@ class CalendarExecutionStatePersistenceError(Exception):
     """Raised when a provider result cannot be durably recorded."""
 
 
+def _calendar_identity_parameters(
+    parameters: (
+        CalendarCreateEventParameters
+        | CalendarUpdateEventParameters
+        | CalendarDeleteEventParameters
+    ),
+) -> dict[str, Any]:
+    serialized = parameters.model_dump(mode="json")
+    if (
+        isinstance(parameters, CalendarCreateEventParameters)
+        and parameters.recurrence is None
+    ):
+        serialized.pop("recurrence")
+    return serialized
+
+
 class CalendarActionExecutor:
     SUPPORTED_ACTION_TYPES = frozenset({
         "calendar.create_event",
@@ -104,7 +120,7 @@ class CalendarActionExecutor:
             user_id=user_id,
             connection_id=proposal.connection_id,
             action_type=proposal.action_type,
-            parameters=parameters.model_dump(mode="json"),
+            parameters=_calendar_identity_parameters(parameters),
         )
         if (
             identity.operation_id != proposal.operation_id
@@ -122,9 +138,11 @@ class CalendarActionExecutor:
                 calendar_id=parameters.calendar_id,
                 event_id=parameters.event_id,
             )
+            current_snapshot = self._event_snapshot(current_event)
+            if "recurrence" not in parameters.current_event:
+                current_snapshot.pop("recurrence", None)
             if (
-                self._event_snapshot(current_event)
-                != parameters.current_event
+                current_snapshot != parameters.current_event
                 or current_event.get("etag") != parameters.expected_etag
             ):
                 self.approval_service.claim_calendar_execution(
@@ -197,7 +215,7 @@ class CalendarActionExecutor:
             return {"dateTime": event_time.isoformat()}
 
         attendees = event.get("attendees") or []
-        return {
+        snapshot = {
             "summary": event.get("summary"),
             "description": event.get("description"),
             "location": event.get("location"),
@@ -211,6 +229,10 @@ class CalendarActionExecutor:
             ),
             "etag": event.get("etag"),
         }
+        recurrence = event.get("recurrence")
+        if isinstance(recurrence, list):
+            snapshot["recurrence"] = recurrence
+        return snapshot
 
     async def _mutate_event(
         self,
@@ -364,7 +386,7 @@ class CalendarActionExecutor:
                 params={},
             )
         except GoogleAPIError as exc:
-            if exc.status_code == 404:
+            if exc.status_code in {404, 410}:
                 return None
             raise
         if not isinstance(raw_event, dict):
@@ -402,7 +424,10 @@ class CalendarActionExecutor:
             read_failed = False
 
         if isinstance(parameters, CalendarDeleteEventParameters):
-            if event is None and not read_failed:
+            if (
+                (event is None or event.get("status") == "cancelled")
+                and not read_failed
+            ):
                 return self._finish(
                     user_id=user_id,
                     proposal_id=proposal.proposal_id,
@@ -657,6 +682,8 @@ class CalendarActionExecutor:
                 "useDefault": False,
                 "overrides": parameters.reminders,
             }
+        if parameters.recurrence is not None:
+            event["recurrence"] = parameters.recurrence
         return event
 
     async def _reconcile_after_attempt(
@@ -809,7 +836,7 @@ class CalendarActionExecutor:
             user_id=user_id,
             connection_id=proposal.connection_id,
             action_type=proposal.action_type,
-            parameters=parameters.model_dump(mode="json"),
+            parameters=_calendar_identity_parameters(parameters),
         )
         event = await self._read_back(
             user_id=user_id,
@@ -879,13 +906,22 @@ class CalendarActionExecutor:
                 proposal_id=proposal.proposal_id,
                 reconciliation_status="pending",
             )
-            return self.approval_service.get_proposal(
+            latest = self.approval_service.get_proposal(
                 user_id,
                 proposal.proposal_id,
             )
+            if isinstance(parameters, CalendarDeleteEventParameters):
+                return latest.model_copy(update={
+                    "result": {
+                        "outcome": "unconfirmed",
+                        "reason": "read_failed",
+                        "checked_now": True,
+                    },
+                })
+            return latest
 
         if isinstance(parameters, CalendarDeleteEventParameters):
-            if event is None:
+            if event is None or event.get("status") == "cancelled":
                 return self._finish(
                     user_id=user_id,
                     proposal_id=proposal.proposal_id,
@@ -928,10 +964,22 @@ class CalendarActionExecutor:
             proposal_id=proposal.proposal_id,
             reconciliation_status=reconciliation_status,
         )
-        return self.approval_service.get_proposal(
+        latest = self.approval_service.get_proposal(
             user_id,
             proposal.proposal_id,
         )
+        if (
+            isinstance(parameters, CalendarDeleteEventParameters)
+            and event is not None
+        ):
+            return latest.model_copy(update={
+                "result": {
+                    "outcome": "unconfirmed",
+                    "reason": "event_still_exists",
+                    "checked_now": True,
+                },
+            })
+        return latest
 
     @staticmethod
     def _verify_event_fields(
@@ -983,6 +1031,8 @@ class CalendarActionExecutor:
         }
         if actual_emails != expected_emails:
             raise ValueError("Provider attendees do not match.")
+        if (event.get("recurrence") or None) != parameters.recurrence:
+            raise ValueError("Provider event recurrence does not match.")
 
     @staticmethod
     def _utc_datetime(value: object) -> datetime:

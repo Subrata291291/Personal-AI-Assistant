@@ -138,7 +138,10 @@ def test_update_proposal_binds_snapshot_and_expected_etag():
         "calendar_id": "primary",
         "event_id": "event-123",
         "expected_etag": '"etag-1"',
-        "current_event": CURRENT_EVENT,
+        "current_event": {
+            **CURRENT_EVENT,
+            "recurrence": ["RRULE:FREQ=DAILY"],
+        },
         "changes": {"summary": "Updated design review"},
     })
 
@@ -149,7 +152,10 @@ def test_update_proposal_binds_snapshot_and_expected_etag():
             "calendar_id": "primary",
             "event_id": "event-123",
             "expected_etag": '"etag-2"',
-            "current_event": CURRENT_EVENT,
+            "current_event": {
+                **CURRENT_EVENT,
+                "recurrence": ["RRULE:FREQ=DAILY"],
+            },
             "changes": {"summary": "Updated design review"},
         })
 
@@ -160,7 +166,10 @@ def test_update_requires_start_and_end_together():
             "calendar_id": "primary",
             "event_id": "event-123",
             "expected_etag": '"etag-1"',
-            "current_event": CURRENT_EVENT,
+            "current_event": {
+                **CURRENT_EVENT,
+                "recurrence": ["RRULE:FREQ=DAILY"],
+            },
             "changes": {
                 "start": {
                     "dateTime": "2026-06-10T12:00:00+00:00",
@@ -207,6 +216,40 @@ def test_delete_proposal_requires_exact_etag_snapshot():
     assert parameters.event_id == "event-123"
 
 
+def test_series_delete_proposal_requires_and_persists_master_recurrence():
+    with pytest.raises(ValidationError, match="entire series"):
+        CalendarDeleteEventParameters.model_validate({
+            "calendar_id": "primary",
+            "event_id": "event-123",
+            "expected_etag": '"etag-1"',
+            "current_event": CURRENT_EVENT,
+            "delete_entire_series": True,
+        })
+
+    snapshot = {
+        **CURRENT_EVENT,
+        "recurrence": ["RRULE:FREQ=DAILY"],
+    }
+    parameters = CalendarDeleteEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "series-master",
+        "expected_etag": '"etag-1"',
+        "current_event": snapshot,
+        "delete_entire_series": True,
+    })
+
+    assert parameters.delete_entire_series is True
+    assert parameters.current_event["recurrence"] == ["RRULE:FREQ=DAILY"]
+
+    with pytest.raises(ValidationError, match="explicit series scope"):
+        CalendarDeleteEventParameters.model_validate({
+            "calendar_id": "primary",
+            "event_id": "series-master",
+            "expected_etag": '"etag-1"',
+            "current_event": snapshot,
+        })
+
+
 def test_approved_update_uses_conditional_patch_and_confirms_readback(
     monkeypatch,
 ):
@@ -235,6 +278,43 @@ def test_approved_update_uses_conditional_patch_and_confirms_readback(
         proposal_id=PROPOSAL_ID,
     )
     api.request_mutation.assert_awaited_once()
+    request = api.request_mutation.call_args.kwargs
+    assert request["method"] == "PATCH"
+    assert request["url"].endswith(
+        "/calendars/primary/events/event-123"
+    )
+    assert request["headers"] == {"If-Match": '"etag-1"'}
+    assert request["json_data"] == {"summary": "Updated design review"}
+    assert "recurrence" not in request["json_data"]
+
+
+def test_title_only_update_preserves_recurrence_for_legacy_saved_snapshot(
+    monkeypatch,
+):
+    parameters = CalendarUpdateEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "event-123",
+        "expected_etag": '"etag-1"',
+        "current_event": CURRENT_EVENT,
+        "changes": {"summary": "Updated design review"},
+    }).model_dump(mode="json")
+    readback = _normalized_event("Updated design review", '"etag-2"')
+    readback["recurrence"] = ["RRULE:FREQ=WEEKLY"]
+    executor, _approval, api, _proposal, completed = _executor(
+        monkeypatch,
+        "calendar.update_event",
+        parameters,
+        readback,
+    )
+    executor.calendar_service.validate_event_write_access.return_value[
+        "recurrence"
+    ] = ["RRULE:FREQ=WEEKLY"]
+
+    result = asyncio.run(
+        executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+    )
+
+    assert result is completed
     request = api.request_mutation.call_args.kwargs
     assert request["method"] == "PATCH"
     assert request["headers"] == {"If-Match": '"etag-1"'}
@@ -286,6 +366,43 @@ def test_approved_delete_uses_conditional_delete_and_confirms_absence(
     assert request["json_data"] is None
 
 
+def test_approved_series_delete_uses_master_id_and_conditional_etag(
+    monkeypatch,
+):
+    snapshot = {
+        **CURRENT_EVENT,
+        "recurrence": ["RRULE:FREQ=DAILY"],
+    }
+    parameters = CalendarDeleteEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "series-master",
+        "expected_etag": '"etag-1"',
+        "current_event": snapshot,
+        "delete_entire_series": True,
+    }).model_dump(mode="json")
+    executor, _approval, api, _proposal, completed = _executor(
+        monkeypatch,
+        "calendar.delete_event",
+        parameters,
+        None,
+    )
+    executor.calendar_service.validate_event_write_access.return_value[
+        "recurrence"
+    ] = ["RRULE:FREQ=DAILY"]
+
+    result = asyncio.run(
+        executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+    )
+
+    assert result is completed
+    request = api.request_mutation.call_args.kwargs
+    assert request["method"] == "DELETE"
+    assert request["url"].endswith(
+        "/calendars/primary/events/series-master"
+    )
+    assert request["headers"] == {"If-Match": '"etag-1"'}
+
+
 def test_uncertain_delete_reconciles_verified_absence_as_completed(
     monkeypatch,
 ):
@@ -328,6 +445,269 @@ def test_uncertain_delete_reconciles_verified_absence_as_completed(
         approval.calendar_operation_repository.update_uncertain_reconciliation
     )
     update_reconciliation.assert_not_called()
+
+
+def test_uncertain_recurring_master_delete_confirms_cancelled_master(
+    monkeypatch,
+):
+    parameters = CalendarDeleteEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "series-master",
+        "expected_etag": '"etag-1"',
+        "current_event": {
+            **CURRENT_EVENT,
+            "recurrence": ["RRULE:FREQ=DAILY"],
+        },
+        "delete_entire_series": True,
+    }).model_dump(mode="json")
+    cancelled_master = {
+        **_normalized_event(),
+        "id": "series-master",
+        "status": "cancelled",
+    }
+    executor, approval, api, proposal, completed = _executor(
+        monkeypatch,
+        "calendar.delete_event",
+        parameters,
+        cancelled_master,
+    )
+    proposal.status = "execution_uncertain"
+    executor._finish = Mock(return_value=completed)
+
+    result = asyncio.run(
+        executor._reconcile_update_or_delete(
+            user_id=USER_ID,
+            proposal=proposal,
+        )
+    )
+
+    assert result is completed
+    executor._read_event_for_reconciliation.assert_awaited_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        calendar_id="primary",
+        event_id="series-master",
+    )
+    executor._finish.assert_called_once_with(
+        user_id=USER_ID,
+        proposal_id=PROPOSAL_ID,
+        expected_state="execution_uncertain",
+        state="completed",
+        classification="confirmed",
+        reconciliation="confirmed",
+        result={
+            "outcome": "deleted",
+            "google_event_id": "series-master",
+        },
+    )
+    api.request_mutation.assert_not_awaited()
+    update_reconciliation = (
+        approval.calendar_operation_repository.update_uncertain_reconciliation
+    )
+    update_reconciliation.assert_not_called()
+
+
+def test_execution_reconciliation_confirms_cancelled_recurring_master(
+    monkeypatch,
+):
+    parameters = CalendarDeleteEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "series-master",
+        "expected_etag": '"etag-1"',
+        "current_event": {
+            **CURRENT_EVENT,
+            "recurrence": ["RRULE:FREQ=DAILY"],
+        },
+        "delete_entire_series": True,
+    })
+    cancelled_master = {
+        **_normalized_event(),
+        "id": "series-master",
+        "status": "cancelled",
+    }
+    executor, _approval, api, proposal, completed = _executor(
+        monkeypatch,
+        "calendar.delete_event",
+        parameters.model_dump(mode="json"),
+        cancelled_master,
+    )
+    executor._finish = Mock(return_value=completed)
+
+    result = asyncio.run(
+        executor._reconcile_mutation(
+            user_id=USER_ID,
+            proposal=proposal,
+            parameters=parameters,
+        )
+    )
+
+    assert result is completed
+    executor._finish.assert_called_once_with(
+        user_id=USER_ID,
+        proposal_id=PROPOSAL_ID,
+        expected_state="executing",
+        state="completed",
+        classification="confirmed",
+        reconciliation="confirmed",
+        result={
+            "outcome": "deleted",
+            "google_event_id": "series-master",
+        },
+    )
+    api.request_mutation.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status_code", [404, 410])
+def test_event_reconciliation_treats_provider_gone_as_verified_absence(
+    monkeypatch,
+    status_code,
+):
+    parameters = CalendarDeleteEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "series-master",
+        "expected_etag": '"etag-1"',
+        "current_event": {
+            **CURRENT_EVENT,
+            "recurrence": ["RRULE:FREQ=DAILY"],
+        },
+        "delete_entire_series": True,
+    }).model_dump(mode="json")
+    executor, _approval, _api, _proposal, _completed = _executor(
+        monkeypatch,
+        "calendar.delete_event",
+        parameters,
+        None,
+    )
+    executor._read_event_for_reconciliation = (
+        CalendarActionExecutor._read_event_for_reconciliation.__get__(
+            executor,
+        )
+    )
+    executor.calendar_service._google_get.side_effect = GoogleAPIError(
+        status_code=status_code,
+        message="The event is no longer available.",
+    )
+
+    result = asyncio.run(
+        executor._read_event_for_reconciliation(
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            calendar_id="primary",
+            event_id="series-master",
+        )
+    )
+
+    assert result is None
+    executor.calendar_service._google_get.assert_awaited_once_with(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        endpoint="calendars/primary/events/series-master",
+        params={},
+    )
+
+
+def test_uncertain_delete_keeps_active_master_pending(monkeypatch):
+    parameters = CalendarDeleteEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "series-master",
+        "expected_etag": '"etag-1"',
+        "current_event": {
+            **CURRENT_EVENT,
+            "recurrence": ["RRULE:FREQ=DAILY"],
+        },
+        "delete_entire_series": True,
+    }).model_dump(mode="json")
+    active_master = {
+        **_normalized_event(),
+        "id": "series-master",
+        "status": "confirmed",
+        "recurrence": ["RRULE:FREQ=DAILY"],
+    }
+    executor, approval, api, proposal, _completed = _executor(
+        monkeypatch,
+        "calendar.delete_event",
+        parameters,
+        active_master,
+    )
+    proposal.status = "execution_uncertain"
+    proposal.model_copy = lambda *, update: SimpleNamespace(
+        **{**vars(proposal), **update},
+    )
+
+    result = asyncio.run(
+        executor._reconcile_update_or_delete(
+            user_id=USER_ID,
+            proposal=proposal,
+        )
+    )
+
+    assert result.status == "execution_uncertain"
+    assert result.result == {
+        "outcome": "unconfirmed",
+        "reason": "event_still_exists",
+        "checked_now": True,
+    }
+    update_reconciliation = (
+        approval.calendar_operation_repository.update_uncertain_reconciliation
+    )
+    update_reconciliation.assert_called_once_with(
+        user_id=USER_ID,
+        proposal_id=PROPOSAL_ID,
+        reconciliation_status="pending",
+    )
+    api.request_mutation.assert_not_awaited()
+
+
+def test_uncertain_delete_preserves_uncertainty_when_provider_read_fails(
+    monkeypatch,
+):
+    parameters = CalendarDeleteEventParameters.model_validate({
+        "calendar_id": "primary",
+        "event_id": "series-master",
+        "expected_etag": '"etag-1"',
+        "current_event": {
+            **CURRENT_EVENT,
+            "recurrence": ["RRULE:FREQ=DAILY"],
+        },
+        "delete_entire_series": True,
+    }).model_dump(mode="json")
+    executor, approval, api, proposal, _completed = _executor(
+        monkeypatch,
+        "calendar.delete_event",
+        parameters,
+        None,
+    )
+    proposal.status = "execution_uncertain"
+    proposal.model_copy = lambda *, update: SimpleNamespace(
+        **{**vars(proposal), **update},
+    )
+    executor._read_event_for_reconciliation.side_effect = GoogleAPIError(
+        status_code=503,
+        message="Calendar read failed.",
+    )
+
+    result = asyncio.run(
+        executor._reconcile_update_or_delete(
+            user_id=USER_ID,
+            proposal=proposal,
+        )
+    )
+
+    assert result.status == "execution_uncertain"
+    assert result.result == {
+        "outcome": "unconfirmed",
+        "reason": "read_failed",
+        "checked_now": True,
+    }
+    update_reconciliation = (
+        approval.calendar_operation_repository.update_uncertain_reconciliation
+    )
+    update_reconciliation.assert_called_once_with(
+        user_id=USER_ID,
+        proposal_id=PROPOSAL_ID,
+        reconciliation_status="pending",
+    )
+    api.request_mutation.assert_not_awaited()
 
 
 def test_delete_404_is_idempotently_confirmed_after_absence_check(monkeypatch):
@@ -385,6 +765,7 @@ def test_approved_calendar_create_confirms_google_readback_for_saved_payload(
         "attendees": [],
         "all_day": False,
     }).model_dump(mode="json")
+    parameters.pop("recurrence")
     event = {
         "id": "event-123",
         "summary": "A",
@@ -452,6 +833,75 @@ def test_approved_calendar_create_confirms_google_readback_for_saved_payload(
     ]["outcome"] == "created"
 
 
+def test_recurring_create_sends_and_confirms_daily_recurrence(monkeypatch):
+    parameters = CalendarCreateEventParameters.model_validate({
+        "calendar_id": "primary",
+        "summary": "Gym",
+        "description": None,
+        "start": "2026-11-10T10:00:00+05:30",
+        "end": "2026-11-10T11:00:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "location": None,
+        "attendees": [],
+        "all_day": False,
+        "recurrence": ["RRULE:FREQ=DAILY"],
+    }).model_dump(mode="json")
+    event = {
+        "id": "event-123",
+        "summary": "Gym",
+        "description": None,
+        "location": None,
+        "start": {
+            "dateTime": "2026-11-10T10:00:00+05:30",
+            "timeZone": "Asia/Kolkata",
+        },
+        "end": {
+            "dateTime": "2026-11-10T11:00:00+05:30",
+            "timeZone": "Asia/Kolkata",
+        },
+        "attendees": [],
+        "recurrence": ["RRULE:FREQ=DAILY"],
+    }
+    executor, approval, api, proposal, completed = _executor(
+        monkeypatch,
+        "calendar.create_event",
+        parameters,
+        event,
+    )
+    identity = build_calendar_operation_identity(
+        proposal_id=PROPOSAL_ID,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        action_type="calendar.create_event",
+        parameters=parameters,
+    )
+    event["id"] = identity.event_id
+    event["extendedProperties"] = {
+        "private": {
+            "personal_ai_operation_id": str(identity.operation_id),
+            "personal_ai_payload_fingerprint": identity.payload_fingerprint,
+        },
+    }
+    proposal.action_type = "calendar.create_event"
+    proposal.parameters = parameters
+    proposal.operation_id = identity.operation_id
+    proposal.payload_fingerprint = identity.payload_fingerprint
+    proposal.calendar_event_id = identity.event_id
+    executor._read_back = AsyncMock(return_value=event)
+
+    result = asyncio.run(
+        executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+    )
+
+    assert result is completed
+    assert api.request_mutation.call_args.kwargs["json_data"]["recurrence"] == [
+        "RRULE:FREQ=DAILY"
+    ]
+    assert approval.finish_calendar_execution.call_args.kwargs[
+        "safe_result"
+    ]["outcome"] == "created"
+
+
 def test_google_calendar_create_failure_is_persisted_as_failed(
     monkeypatch,
 ):
@@ -463,6 +913,7 @@ def test_google_calendar_create_failure_is_persisted_as_failed(
         "time_zone": "Asia/Kolkata",
         "all_day": False,
     }).model_dump(mode="json")
+    parameters.pop("recurrence")
     executor, approval, api, proposal, _completed = _executor(
         monkeypatch,
         "calendar.create_event",

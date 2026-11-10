@@ -69,6 +69,15 @@ function eventDateTime(value) {
   }
 }
 
+function formatRecurrence(value) {
+  if (!Array.isArray(value) || value.length === 0) return null
+  return value
+    .map((rule) => (
+      rule === 'RRULE:FREQ=DAILY' ? 'Daily' : String(rule)
+    ))
+    .join('; ')
+}
+
 function getCalendarEventDetails(proposal, original = false) {
   const parameters = proposal.parameters
   if (proposal.action_type === 'calendar.create_event') {
@@ -79,6 +88,7 @@ function getCalendarEventDetails(proposal, original = false) {
       timeZone: parameters.time_zone,
       calendarId: parameters.calendar_id,
       allDay: parameters.all_day === true,
+      recurrence: formatRecurrence(parameters.recurrence),
     }
   }
 
@@ -96,6 +106,15 @@ function getCalendarEventDetails(proposal, original = false) {
       calendarId: parameters.calendar_id,
       allDay: currentStart.allDay,
       attendees: currentEvent.attendees || [],
+      recurrence: formatRecurrence(currentEvent.recurrence),
+      deleteEntireSeries: parameters.delete_entire_series === true,
+      recurrenceHasNoEndDate: parameters.delete_entire_series === true
+        && Array.isArray(currentEvent.recurrence)
+        && currentEvent.recurrence.length > 0
+        && currentEvent.recurrence.every(
+          (rule) => typeof rule === 'string'
+            && !/(?:^|;)(?:UNTIL|COUNT)=/i.test(rule),
+        ),
     }
   }
   if (proposal.action_type !== 'calendar.update_event') return null
@@ -111,6 +130,7 @@ function getCalendarEventDetails(proposal, original = false) {
     calendarId: parameters.calendar_id,
     allDay: start.allDay,
     attendees: changes.attendees || currentEvent.attendees || [],
+    recurrence: formatRecurrence(currentEvent.recurrence),
   }
 }
 
@@ -227,6 +247,21 @@ function CalendarEventDetails({ details, label, isDark }) {
           <>
             <dt className="font-semibold">Calendar</dt>
             <dd>{details.calendarId}</dd>
+          </>
+        )}
+        {details.recurrence && (
+          <>
+            <dt className="font-semibold">Recurrence</dt>
+            <dd>{details.recurrence}</dd>
+          </>
+        )}
+        {details.deleteEntireSeries && (
+          <>
+            <dt className="font-semibold">Deletion scope</dt>
+            <dd>
+              Entire recurring series, including all future occurrences
+              {details.recurrenceHasNoEndDate && ' (no end date)'}
+            </dd>
           </>
         )}
         {details.attendees && (
@@ -653,6 +688,7 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
             .filter(([key]) => ![
               'expected_etag',
               'current_event',
+              'delete_entire_series',
               ...(isCalendarUpdate ? ['changes'] : []),
               ...(isCalendarCreate
                 ? ['summary', 'start', 'end', 'time_zone', 'calendar_id', 'all_day']
@@ -773,9 +809,17 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
         )}
         {visibleStatus === 'execution_uncertain' && (
           <p role="alert" className="text-xs text-rose-400">
-            {isCalendarAction
-              ? 'The Calendar change outcome is unconfirmed. Do not retry this proposal or create a replacement action.'
-              : 'Gmail may have sent the message, but the result is unconfirmed. Do not retry this proposal.'}
+            {isCalendarDelete &&
+              proposal.result?.checked_now === true &&
+              proposal.result?.reason === 'event_still_exists'
+              ? 'Google Calendar still returned the event. Deletion remains unconfirmed; do not retry.'
+              : isCalendarDelete &&
+                proposal.result?.checked_now === true &&
+                proposal.result?.reason === 'read_failed'
+                ? 'Google Calendar status could not be verified. Deletion remains unconfirmed; do not retry.'
+                : isCalendarAction
+                  ? 'The Calendar change outcome is unconfirmed. Do not retry this proposal or create a replacement action.'
+                  : 'Gmail may have sent the message, but the result is unconfirmed. Do not retry this proposal.'}
           </p>
         )}
         {isExpired && (

@@ -225,6 +225,29 @@ def test_event_list_uses_primary_calendar_range_search_and_pagination():
     assert result["time_zone"] == "America/Los_Angeles"
 
 
+def test_event_list_url_encodes_provider_calendar_ids_with_hash():
+    service, _ = make_service()
+    request = {}
+
+    async def fake_google_get(**kwargs):
+        request.update(kwargs)
+        return {"items": []}
+
+    service._google_get = fake_google_get
+    result = asyncio.run(
+        service.list_events(
+            USER_ID,
+            CONNECTION_ID,
+            calendar_id="holiday#en@group.v.calendar.google.com",
+        )
+    )
+
+    assert result["calendar_id"] == "holiday#en@group.v.calendar.google.com"
+    assert request["endpoint"] == (
+        "calendars/holiday%23en%40group.v.calendar.google.com/events"
+    )
+
+
 def test_calendar_list_uses_owned_read_scope_and_continuation_token():
     service, calls = make_service()
     request = {}
@@ -285,6 +308,26 @@ def test_calendar_list_uses_owned_read_scope_and_continuation_token():
         ],
         "next_page_token": "next-calendar-page",
     }
+
+
+def test_calendar_list_accepts_provider_holiday_calendar_ids():
+    service, _ = make_service()
+
+    async def fake_google_get(**_kwargs):
+        return {
+            "items": [{
+                "id": "holiday#en@group.v.calendar.google.com",
+                "summary": "Holidays in the United States",
+            }],
+        }
+
+    service._google_get = fake_google_get
+
+    result = asyncio.run(service.list_calendars(USER_ID, CONNECTION_ID))
+
+    assert result["calendars"][0]["id"] == (
+        "holiday#en@group.v.calendar.google.com"
+    )
 
 
 def test_calendar_list_rejects_unowned_connection_and_missing_scope():

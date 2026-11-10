@@ -493,6 +493,55 @@ describe('Connected Apps', () => {
     })).not.toBeInTheDocument()
   })
 
+  it('displays enabled Create and Update capabilities from the API response', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        ...googleConnection.capabilities,
+        calendar: true,
+        calendar_events_read: true,
+        calendar_freebusy: true,
+        calendar_api_available: true,
+        calendar_write_permission_granted: true,
+        calendar_create_feature_enabled: true,
+        calendar_update_feature_enabled: true,
+        calendar_delete_feature_enabled: false,
+        calendar_create_execution_available: true,
+        calendar_update_execution_available: true,
+        calendar_delete_execution_available: false,
+      },
+    }], {
+      ...noCalendarCapabilities,
+      connected: true,
+      events_read: true,
+      freebusy: true,
+      api_available: true,
+      google_connection_available: true,
+      write_permission_granted: true,
+      create_feature_enabled: true,
+      update_feature_enabled: true,
+      delete_feature_enabled: false,
+      create_execution_available: true,
+      update_execution_available: true,
+      delete_execution_available: false,
+      write_available: true,
+    }))
+    renderConnectors()
+
+    const calendarCard = screen.getByRole('heading', {
+      name: 'Google Calendar',
+    }).closest('article')
+    expect(await within(calendarCard).findByText(
+      'Create: Enabled · Execution available',
+    )).toBeInTheDocument()
+    expect(within(calendarCard).getByText(
+      'Update: Enabled · Execution available',
+    )).toBeInTheDocument()
+    expect(within(calendarCard).getByText(
+      'Delete: Disabled · Execution not available',
+    )).toBeInTheDocument()
+  })
+
   it('does not offer write consent when the backend cannot verify permission status', async () => {
     api.get.mockResolvedValue(connectedResponse([{
       ...googleConnection,

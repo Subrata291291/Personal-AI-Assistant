@@ -2,15 +2,17 @@
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
-from app.core.request_metrics import request_id as correlation_request_id
 from app.core.error_logging import log_exception_traceback
 from app.memory.memory_pipeline import MemoryPipeline
 from app.services.user_settings_service import UserSettingsService
+from app.workflows.calendar_update_parser import (
+    log_calendar_update_diagnostic,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ class ChatService:
     LEASE_SECONDS = 600
     HEARTBEAT_INTERVAL = 60
     HEARTBEAT_JOIN_TIMEOUT = 10
+    CALENDAR_ACTION_CLARIFICATION_TTL_SECONDS = 30 * 60
     GMAIL_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
 
     def __init__(
@@ -231,6 +234,173 @@ class ChatService:
             return draft if isinstance(draft, dict) else None
         return None
 
+    @staticmethod
+    def _pending_calendar_action(
+        history: list[dict[str, Any]],
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        connection_id: str | None,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        for message in reversed(history):
+            if message.get("role") != "assistant":
+                continue
+            metadata = message.get("metadata")
+            pending = (
+                metadata.get("pending_calendar_action")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(pending, dict):
+                return None
+            if (
+                pending.get("user_id") != str(user_id)
+                or pending.get("conversation_id") != str(conversation_id)
+                or not connection_id
+                or pending.get("connection_id") != str(connection_id)
+                or pending.get("version") != 1
+                or pending.get("operation") not in {"create", "update", "delete"}
+            ):
+                return None
+            try:
+                expires_at = datetime.fromisoformat(
+                    str(pending["expires_at"]).replace("Z", "+00:00")
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                expires_at.tzinfo is None
+                or expires_at.astimezone(timezone.utc)
+                <= now.astimezone(timezone.utc)
+            ):
+                return None
+            original_request = pending.get("original_request")
+            if (
+                not isinstance(original_request, str)
+                or not original_request.strip()
+            ):
+                return None
+            return pending
+        return None
+
+    @staticmethod
+    def _calendar_action_clarification(
+        *,
+        result: dict[str, Any],
+        response: str,
+        current_message: str,
+        pending: dict[str, Any] | None,
+        user_id: UUID,
+        conversation_id: UUID,
+        connection_id: str | None,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        if (
+            not connection_id
+            or result.get("assistant_route") != "google_calendar"
+        ):
+            return None
+
+        plan = result.get("gmail_plan")
+        tool = plan.get("calendar_tool") if isinstance(plan, dict) else None
+        operation = {
+            "create_calendar_event_proposal": "create",
+            "update_calendar_event_proposal": "update",
+            "delete_calendar_event_proposal": "delete",
+        }.get(tool)
+        if operation is None:
+            return None
+
+        clarification = response.casefold()
+        if not re.search(
+            r"\b(?:which|what|please\s+(?:specify|include|provide|clarify)|"
+            r"multiple possible|couldn['’]?t find|didn['’]?t find|"
+            r"couldn['’]?t uniquely resolve|couldn['’]?t safely verify)\b",
+            clarification,
+        ):
+            return None
+
+        continuing = (
+            pending
+            if result.get("calendar_action_request")
+            and pending
+            and pending.get("operation") == operation
+            else None
+        )
+        original_request = (
+            f"{continuing['original_request']}\n"
+            f"Clarification: {current_message.strip()}"
+            if continuing
+            else current_message.strip()
+        )
+        arguments = plan.get("calendar_arguments")
+        known_details: dict[str, Any] = {}
+        if isinstance(arguments, dict):
+            try:
+                known_details = json.loads(
+                    json.dumps(arguments, allow_nan=False)
+                )
+            except (TypeError, ValueError):
+                known_details = {}
+        resolved_details = result.get("calendar_action_details")
+        if isinstance(resolved_details, dict):
+            known_details.update({
+                key: value
+                for key, value in resolved_details.items()
+                if key in {"calendar_id", "event_query"}
+                and isinstance(value, str)
+            })
+
+        draft = result.get("calendar_create_draft")
+        if not isinstance(draft, dict) and continuing:
+            draft = continuing.get("calendar_create_draft")
+        if isinstance(draft, dict):
+            try:
+                draft = json.loads(json.dumps(draft, allow_nan=False))
+            except (TypeError, ValueError):
+                draft = None
+
+        unresolved_fields = []
+        for field, pattern in (
+            ("event_identity", r"\bevent\b|\btitle\b"),
+            ("date", r"\bdate\b|\btomorrow\b|\btoday\b"),
+            ("time", r"\btime\b|\bstart\b|\bend\b"),
+            ("requested_changes", r"\bchange\b|\bupdate\b|\bwhat would"),
+            ("calendar", r"\bcalendar\b"),
+        ):
+            if re.search(pattern, clarification):
+                unresolved_fields.append(field)
+
+        calendar_id = known_details.get("calendar_id")
+        if not isinstance(calendar_id, str) and continuing:
+            calendar_id = continuing.get("calendar_id")
+        if (
+            not isinstance(calendar_id, str)
+            and not isinstance(known_details.get("calendar_name"), str)
+        ):
+            calendar_id = "primary"
+
+        pending_action = {
+            "version": 1,
+            "operation": operation,
+            "original_request": original_request,
+            "known_event_details": known_details,
+            "unresolved_fields": unresolved_fields,
+            "connection_id": str(connection_id),
+            "calendar_id": calendar_id,
+            "user_id": str(user_id),
+            "conversation_id": str(conversation_id),
+            "expires_at": (
+                now + timedelta(
+                    seconds=ChatService.CALENDAR_ACTION_CLARIFICATION_TTL_SECONDS
+                )
+            ).isoformat(),
+        }
+        if isinstance(draft, dict):
+            pending_action["calendar_create_draft"] = draft
+        return pending_action
+
     def _get_completed_response(
         self,
         user_id: UUID,
@@ -266,6 +436,37 @@ class ChatService:
             )
 
         metadata = assistant_message.get("metadata") or {}
+        if (
+            isinstance(metadata, dict)
+            and "action_approval" not in metadata
+        ):
+            persisted_messages = self.message_service.get_conversation_messages(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                limit=500,
+            )
+            source_message_id = str(assistant_message_id)
+            for message in reversed(persisted_messages):
+                message_metadata = message.get("metadata")
+                proposal = (
+                    message_metadata.get("action_approval")
+                    if isinstance(message_metadata, dict)
+                    else None
+                )
+                if (
+                    isinstance(proposal, dict)
+                    and proposal.get("source_message_id")
+                    == source_message_id
+                ):
+                    metadata = {
+                        **metadata,
+                        "action_approval": proposal,
+                    }
+                    assistant_message = {
+                        **assistant_message,
+                        "metadata": metadata,
+                    }
+                    break
 
         return {
             "conversation_id": conversation_id,
@@ -664,6 +865,17 @@ class ChatService:
                 if calendar_enabled
                 else None
             )
+            pending_calendar_action = self._pending_calendar_action(
+                history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                connection_id=(
+                    str(write_connection_id)
+                    if write_connection_id
+                    else None
+                ),
+                now=request_time,
+            )
             calendar_capabilities = {
                 **calendar_access["capabilities"],
                 "integration_enabled": calendar_enabled,
@@ -795,6 +1007,10 @@ class ChatService:
                 "assistant_capabilities": assistant_capabilities,
                 "memory_enabled": memory_enabled,
             }
+            if pending_calendar_action is not None:
+                initial_state["pending_calendar_action"] = (
+                    pending_calendar_action
+                )
             pending_calendar_create = self._pending_calendar_create_proposal(
                 history=history,
                 user_id=user_id,
@@ -827,14 +1043,13 @@ class ChatService:
 
             lowered_content = normalized_content.casefold()
             if "calendar" in lowered_content and "update" in lowered_content:
-                logger.info(
-                    "calendar_update_trace | request_id=%s "
-                    "| boundary=chatservice_dispatch | message_length=%d "
-                    "| timezone_present=%s | module_path=%s",
-                    correlation_request_id(),
-                    len(normalized_content),
-                    "Asia/Kolkata" in normalized_content,
-                    __file__,
+                log_calendar_update_diagnostic(
+                    boundary="chatservice_dispatch",
+                    message_length=len(normalized_content),
+                    timezone_present=(
+                        "Asia/Kolkata" in normalized_content
+                    ),
+                    module_path=__file__,
                 )
 
             # 12. Start heartbeat immediately before LLM execution.
@@ -1004,6 +1219,24 @@ class ChatService:
                     ):
                         assistant_metadata["action_approval"] = (
                             result["calendar_approval_result"]
+                        )
+                    pending_action = self._calendar_action_clarification(
+                        result=result,
+                        response=assistant_content,
+                        current_message=normalized_content,
+                        pending=pending_calendar_action,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        connection_id=(
+                            str(write_connection_id)
+                            if write_connection_id
+                            else None
+                        ),
+                        now=request_time,
+                    )
+                    if pending_action is not None:
+                        assistant_metadata["pending_calendar_action"] = (
+                            pending_action
                         )
                     if "calendar_create_draft" in result:
                         assistant_metadata["calendar_create_draft"] = (

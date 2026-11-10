@@ -9,7 +9,6 @@ from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app.core.request_metrics import request_id
 from langgraph.runtime import Runtime
 from pydantic import ValidationError
 
@@ -30,7 +29,8 @@ from app.workflows.calendar_create_draft import (
 )
 from app.workflows.calendar_update_parser import (
     merge_calendar_update_arguments,
-    _safe_timezone_for_logging,
+    log_calendar_update_diagnostic,
+    parse_calendar_delete_request,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,80 @@ async def _list_all_calendars(tool: Any) -> str:
     })
 
 
+async def _list_all_calendar_events(
+    tool: Any,
+    base_arguments: dict[str, Any],
+) -> str:
+    events: list[Any] = []
+    page_token: str | None = None
+    seen_page_tokens: set[str] = set()
+    result_data: dict[str, Any] | None = None
+    for _ in range(CALENDAR_LIST_MAX_PAGES):
+        arguments = {
+            key: value
+            for key, value in base_arguments.items()
+            if key != "page_token"
+        }
+        if page_token:
+            arguments["page_token"] = page_token
+        output = json.loads(await tool.ainvoke(arguments))
+        if not isinstance(output, dict):
+            return json.dumps({
+                "ok": False,
+                "error": {
+                    "message": "Google Calendar returned an invalid event list.",
+                },
+            })
+        if output.get("ok") is not True:
+            return json.dumps(output)
+        data = output.get("data")
+        page_events = data.get("events") if isinstance(data, dict) else None
+        if not isinstance(page_events, list) or not all(
+            isinstance(event, dict) for event in page_events
+        ):
+            return json.dumps({
+                "ok": False,
+                "error": {
+                    "message": "Google Calendar returned an incomplete event list.",
+                },
+            })
+        if result_data is None:
+            result_data = dict(data)
+        events.extend(page_events)
+        next_page_token = data.get("next_page_token")
+        if next_page_token is None:
+            return json.dumps({
+                "ok": True,
+                "data": {
+                    **result_data,
+                    "events": events,
+                    "next_page_token": None,
+                },
+            })
+        if (
+            not isinstance(next_page_token, str)
+            or not next_page_token
+            or next_page_token in seen_page_tokens
+        ):
+            return json.dumps({
+                "ok": False,
+                "error": {
+                    "message": "Google Calendar returned invalid event pagination.",
+                },
+            })
+        seen_page_tokens.add(next_page_token)
+        page_token = next_page_token
+    return json.dumps({
+        "ok": False,
+        "error": {
+            "message": (
+                "Google Calendar returned too many event pages to "
+                "complete this request safely."
+            ),
+        },
+    })
+
+
 def _is_next_event_details_request(message: str) -> bool:
     return bool(re.search(
         r"\b(?:show|get|find|tell me|what is|what's)\b.{0,50}"
@@ -105,6 +179,12 @@ def _is_next_event_details_request(message: str) -> bool:
 
 
 def _requested_calendar_name(message: str) -> str | None:
+    if re.search(
+        r"\b(?:my|the)\s+connected\s+Google\s+Calendar\b",
+        message,
+        re.IGNORECASE,
+    ):
+        return None
     match = re.search(
         r"\b(?:my|the)\s+([a-z0-9][\w &'’-]{0,39}?)\s+calendar\b",
         message,
@@ -123,6 +203,18 @@ def _requested_calendar_name(message: str) -> str | None:
     if not name or name.casefold() in {"google", "primary", "my", "the"}:
         return None
     return name
+
+
+def _requested_title_substring(message: str) -> str | None:
+    match = re.search(
+        r"\btitle(?:s)?\s+contain(?:s)?\s+[\"“](.+?)[\"”]",
+        message,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    title = match.group(1).strip()
+    return title or None
 
 
 def _matching_calendars(
@@ -514,12 +606,34 @@ def _event_card_date(
         return None
 
 
-def _format_event(event: dict[str, Any], timezone: str) -> str:
+def _format_event(
+    event: dict[str, Any],
+    timezone: str,
+    calendar_id: str | None = None,
+) -> str:
     summary = event.get("summary")
     title = summary.strip() if isinstance(summary, str) and summary.strip() else "Untitled event"
     start = _format_event_time(event.get("start"), timezone)
     end = _format_event_time(event.get("end"), timezone)
     lines = [f"- **{title}** — {start} to {end}"]
+    event_id = event.get("id")
+    if isinstance(event_id, str) and event_id.strip():
+        lines.append(f"  - Event ID: {event_id}")
+    if isinstance(calendar_id, str) and calendar_id.strip():
+        lines.append(f"  - Calendar ID: {calendar_id}")
+    recurrence = event.get("recurrence")
+    recurring_event_id = event.get("recurring_event_id")
+    if isinstance(recurrence, list) and all(
+        isinstance(rule, str) for rule in recurrence
+    ):
+        lines.append(f"  - Recurrence: {'; '.join(recurrence)}")
+    elif isinstance(recurring_event_id, str) and recurring_event_id.strip():
+        lines.append(
+            "  - Recurrence: recurring instance; "
+            f"master event ID {recurring_event_id}; rule not included"
+        )
+    else:
+        lines.append("  - Recurrence: single event")
     location = event.get("location")
     if isinstance(location, str) and location.strip():
         lines.append(f"  - Location: {location.strip()}")
@@ -667,7 +781,13 @@ def _render_result(
         return "Google Calendar returned no matching events for this live request."
     result = f"Live results from Google Calendar ({len(events)} event(s)):\n\n"
     result += "\n".join(
-        _format_event(event, timezone)
+        _format_event(
+            event,
+            timezone,
+            data.get("calendar_id")
+            if isinstance(data.get("calendar_id"), str)
+            else None,
+        )
         for event in events
         if isinstance(event, dict)
     )
@@ -732,7 +852,7 @@ def _event_snapshot(event: dict[str, Any]) -> dict[str, Any]:
         return {"dateTime": event_time.isoformat()}
 
     attendees = event.get("attendees") or []
-    return {
+    snapshot = {
         "summary": event.get("summary"),
         "description": event.get("description"),
         "location": event.get("location"),
@@ -746,6 +866,10 @@ def _event_snapshot(event: dict[str, Any]) -> dict[str, Any]:
         ),
         "etag": event.get("etag"),
     }
+    recurrence = event.get("recurrence")
+    if isinstance(recurrence, list):
+        snapshot["recurrence"] = recurrence
+    return snapshot
 
 
 def _resolve_relative_time_changes(
@@ -754,8 +878,13 @@ def _resolve_relative_time_changes(
     fallback_timezone: str,
 ) -> tuple[dict[str, Any], str | None]:
     requested_start_time = changes.pop("start_time", None)
+    requested_start_date = changes.pop("start_date", None)
     duration_delta_minutes = changes.pop("duration_delta_minutes", None)
-    if requested_start_time is None and duration_delta_minutes is None:
+    if (
+        requested_start_time is None
+        and requested_start_date is None
+        and duration_delta_minutes is None
+    ):
         return changes, None
 
     start = event.get("start")
@@ -787,6 +916,14 @@ def _resolve_relative_time_changes(
         raise ValueError("The event time range is invalid.")
 
     resolved_start = event_start.astimezone(zone)
+    local_start_date = resolved_start.date()
+    if requested_start_date is not None:
+        if not isinstance(requested_start_date, str):
+            raise ValueError("A local ISO start date is required.")
+        try:
+            local_start_date = date.fromisoformat(requested_start_date)
+        except ValueError as exc:
+            raise ValueError("A local ISO start date is required.") from exc
     if requested_start_time is not None:
         if not isinstance(requested_start_time, str) or not re.fullmatch(
             r"(?:[01]\d|2[0-3]):[0-5]\d",
@@ -794,11 +931,22 @@ def _resolve_relative_time_changes(
         ):
             raise ValueError("A local 24-hour HH:MM start time is required.")
         hour, minute = (int(value) for value in requested_start_time.split(":"))
-        local_current_start = event_start.astimezone(zone)
         naive_start = datetime.combine(
-            local_current_start.date(),
+            local_start_date,
             time(hour, minute),
         )
+        first = naive_start.replace(tzinfo=zone, fold=0)
+        second = naive_start.replace(tzinfo=zone, fold=1)
+        if first.utcoffset() != second.utcoffset():
+            raise ValueError("The requested start time is ambiguous.")
+        if first.astimezone(timezone.utc).astimezone(zone).replace(
+            tzinfo=None
+        ) != naive_start:
+            raise ValueError("The requested start time does not exist.")
+        resolved_start = first
+    elif requested_start_date is not None:
+        local_current_start = event_start.astimezone(zone)
+        naive_start = datetime.combine(local_start_date, local_current_start.time())
         first = naive_start.replace(tzinfo=zone, fold=0)
         second = naive_start.replace(tzinfo=zone, fold=1)
         if first.utcoffset() != second.utcoffset():
@@ -845,6 +993,17 @@ def _resolve_relative_time_changes(
 
 
 def _is_calendar_update_request(text: str) -> bool:
+    first_mutation = re.search(
+        r"\b(?:delete|remove|cancel|move|reschedule|update|edit|change|modify)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if first_mutation and first_mutation.group(0).casefold() in {
+        "delete",
+        "remove",
+        "cancel",
+    }:
+        return False
     return bool(re.search(
         r"\b(?:move|reschedule|update|edit|change|modify)\b.{0,100}"
         r"\b(?:my\s+)?(?:existing\s+)?(?:google\s+)?"
@@ -857,12 +1016,42 @@ def _is_calendar_update_request(text: str) -> bool:
     ))
 
 
+def _is_calendar_delete_request(text: str) -> bool:
+    first_mutation = re.search(
+        r"\b(?:delete|remove|cancel|move|reschedule|update|edit|change|modify)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not first_mutation or first_mutation.group(0).casefold() not in {
+        "delete",
+        "remove",
+        "cancel",
+    }:
+        return False
+    return bool(re.search(
+        r"\b(?:delete|remove|cancel)\b.{0,120}"
+        r"\b(?:calendar\s+)?(?:event|series|meeting|appointment|calendar)\b|"
+        r"\b(?:calendar\s+)?(?:event|series|meeting|appointment)\b"
+        r".{0,120}\b(?:delete|remove|cancel)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+
 def _update_event_matches_request(
     event: dict[str, Any],
     event_query: str | None,
     details: dict[str, Any],
 ) -> bool:
-    if details.get("event_title_is_explicit"):
+    if details.get("event_title_is_prefix"):
+        summary = event.get("summary")
+        if not isinstance(summary, str) or not isinstance(event_query, str):
+            return False
+        if not " ".join(summary.casefold().split()).startswith(
+            " ".join(event_query.casefold().split())
+        ):
+            return False
+    elif details.get("event_title_is_explicit"):
         summary = event.get("summary")
         if not isinstance(summary, str) or not isinstance(event_query, str):
             return False
@@ -932,12 +1121,81 @@ def _update_event_matches_request(
     return True
 
 
+def _matches_recurring_master(
+    master: dict[str, Any],
+    occurrence: dict[str, Any],
+    event_query: str | None,
+    details: dict[str, Any],
+) -> bool:
+    if master.get("recurring_event_id"):
+        return False
+    is_listed_master = (
+        occurrence.get("id") == master.get("id")
+        and bool(occurrence.get("recurrence"))
+        and not occurrence.get("recurring_event_id")
+    )
+    if (
+        not is_listed_master
+        and occurrence.get("recurring_event_id") != master.get("id")
+    ):
+        return False
+    recurrence = master.get("recurrence")
+    expected_recurrence = details.get("expected_recurrence")
+    if not isinstance(recurrence, list) or not recurrence:
+        return False
+    expected_frequency = None
+    if isinstance(expected_recurrence, list):
+        expected_frequency_match = re.search(
+            r"(?:^|;)FREQ=([A-Z]+)(?:;|$)",
+            expected_recurrence[0].removeprefix("RRULE:").upper(),
+        )
+        if expected_frequency_match:
+            expected_frequency = expected_frequency_match.group(1)
+    recurrence_rules = [
+        rule.removeprefix("RRULE:").upper()
+        for rule in recurrence
+        if isinstance(rule, str) and rule.upper().startswith("RRULE:")
+    ]
+    if expected_frequency is not None and not any(
+        re.search(
+            rf"(?:^|;)FREQ={re.escape(expected_frequency)}(?:;|$)",
+            rule,
+        )
+        for rule in recurrence_rules
+    ):
+        return False
+    if details.get("expected_recurring_unbounded"):
+        has_unbounded_daily_rule = any(
+            re.search(r"(?:^|;)FREQ=DAILY(?:;|$)", rule)
+            for rule in recurrence_rules
+        )
+        has_any_recurrence_end = any(
+            re.search(r"(?:^|;)(?:UNTIL|COUNT)=", rule)
+            for rule in recurrence_rules
+        )
+        if not has_unbounded_daily_rule or has_any_recurrence_end:
+            return False
+    occurrence_summary = occurrence.get("summary")
+    if (
+        not isinstance(occurrence_summary, str)
+        or master.get("summary") != occurrence_summary
+    ):
+        return False
+
+    return _update_event_matches_request(
+        master,
+        event_query,
+        details,
+    )
+
+
 def _prepare_event_mutation(
     state: ChatState,
     runtime: Runtime[ChatContext],
     arguments: object,
     action_type: str,
     update_details: dict[str, Any] | None = None,
+    delete_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     capabilities = (
         (state.get("assistant_capabilities") or {}).get("google_calendar", {})
@@ -1030,6 +1288,39 @@ def _prepare_event_mutation(
                     {"role": "assistant", "content": response},
                 ],
             }
+    if (
+        action_type == "calendar.delete_event"
+        and delete_details
+        and delete_details.get("delete_entire_series")
+    ):
+        required_fields = (
+            delete_details.get("event_query"),
+            delete_details.get("event_date"),
+            delete_details.get("original_start_time"),
+            delete_details.get("original_end_time"),
+            delete_details.get("time_zone"),
+            delete_details.get("expected_recurrence"),
+            delete_details.get("expected_recurring_unbounded"),
+        )
+        if (
+            delete_details.get("errors")
+            or any(value is None for value in required_fields)
+            or not delete_details.get("expected_recurring_unbounded")
+        ):
+            response = (
+                "I couldn’t safely verify the recurring series. Please "
+                "specify its exact title, date, time range, timezone, and "
+                "recurrence. Nothing was changed."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
 
     calendar_name = arguments.get("calendar_name")
     calendar_id = arguments.get("calendar_id")
@@ -1038,12 +1329,33 @@ def _prepare_event_mutation(
     event_id = arguments.get("event_id")
     event_query = arguments.get("event_query")
     changes = arguments.get("changes")
+    lookup_details = (
+        update_details
+        if action_type == "calendar.update_event"
+        else delete_details
+    )
+    if (
+        action_type == "calendar.delete_event"
+        and delete_details
+        and delete_details.get("delete_entire_series")
+    ):
+        event_id = None
     latest_message = state["user_message"].casefold()
     if isinstance(event_id, str) and event_id.casefold() not in latest_message:
         event_id = None
     if isinstance(event_query, str):
         normalized_query = " ".join(event_query.casefold().split())
         recent_messages = state.get("messages", [])[-6:]
+        pending_details = state.get("pending_calendar_action")
+        pending_known_details = (
+            pending_details.get("known_event_details")
+            if isinstance(pending_details, dict)
+            else None
+        )
+        query_from_pending_action = (
+            isinstance(pending_known_details, dict)
+            and pending_known_details.get("event_query") == event_query
+        )
         is_contextual_followup = bool(re.match(
             r"^(?:move|reschedule|change|update|delete|cancel|remove|"
             r"make)\s+(?:it|that|this)\b",
@@ -1059,6 +1371,7 @@ def _prepare_event_mutation(
         if (
             normalized_query not in " ".join(latest_message.split())
             and not (is_contextual_followup and query_in_recent_context)
+            and not query_from_pending_action
         ):
             event_query = None
     if action_type == "calendar.update_event":
@@ -1197,46 +1510,88 @@ def _prepare_event_mutation(
                         ],
                     }
                 calendar_id = matches[0]["id"]
+            selected = None
             if not isinstance(event_id, str) or not event_id.strip():
                 if not isinstance(event_query, str) or not event_query.strip():
                     raise ValueError("An event ID or event search is required.")
                 lookup_time_min = (
-                    update_details.get("lookup_time_min")
-                    if update_details
+                    lookup_details.get("lookup_time_min")
+                    if lookup_details
                     else None
                 )
                 lookup_time_max = (
-                    update_details.get("lookup_time_max")
-                    if update_details
+                    lookup_details.get("lookup_time_max")
+                    if lookup_details
                     else None
                 )
-                matches = asyncio.run(
-                    service.list_events(
-                        user_id=UUID(str(user_id)),
-                        connection_id=UUID(str(connection_id)),
-                        calendar_id=calendar_id,
-                        max_results=10,
-                        time_min=lookup_time_min,
-                        time_max=lookup_time_max,
-                        query=event_query,
-                        time_zone=(
-                            update_details.get("time_zone")
-                            if update_details
-                            else state.get("user_timezone", "UTC")
-                        ),
+                matches: dict[str, Any] = {}
+                events: list[dict[str, Any]] = []
+                page_token = None
+                seen_page_tokens: set[str] = set()
+                for _ in range(CALENDAR_LIST_MAX_PAGES):
+                    page = asyncio.run(
+                        service.list_events(
+                            user_id=UUID(str(user_id)),
+                            connection_id=UUID(str(connection_id)),
+                            calendar_id=calendar_id,
+                            max_results=10,
+                            page_token=page_token,
+                            time_min=lookup_time_min,
+                            time_max=lookup_time_max,
+                            query=event_query,
+                            time_zone=(
+                                lookup_details.get("time_zone")
+                                if lookup_details
+                                else state.get("user_timezone", "UTC")
+                            ),
+                        )
                     )
-                )
-                events = matches.get("events")
-                if not isinstance(events, list):
-                    raise ValueError("Calendar returned invalid event results.")
-                if action_type == "calendar.update_event" and update_details:
+                    page_events = page.get("events")
+                    if not isinstance(page_events, list):
+                        raise ValueError(
+                            "Calendar returned invalid event results."
+                        )
+                    events.extend(
+                        event for event in page_events
+                        if isinstance(event, dict)
+                    )
+                    matches = page
+                    next_page_token = page.get("next_page_token")
+                    if not next_page_token:
+                        page_token = None
+                        break
+                    if (
+                        not isinstance(next_page_token, str)
+                        or next_page_token in seen_page_tokens
+                    ):
+                        raise ValueError(
+                            "Calendar returned an invalid pagination token."
+                        )
+                    seen_page_tokens.add(next_page_token)
+                    page_token = next_page_token
+                matches = {**matches, "events": events}
+                if page_token:
+                    matches["next_page_token"] = page_token
+                else:
+                    matches["next_page_token"] = None
+                if (
+                    action_type == "calendar.update_event"
+                    and update_details
+                ) or (
+                    action_type == "calendar.delete_event"
+                    and delete_details
+                    and (
+                        delete_details.get("delete_entire_series")
+                        or delete_details.get("event_title_is_explicit")
+                    )
+                ):
                     events = [
                         event for event in events
                         if isinstance(event, dict)
                         and _update_event_matches_request(
                             event,
                             event_query,
-                            update_details,
+                            lookup_details or {},
                         )
                     ]
                 if not events:
@@ -1246,6 +1601,10 @@ def _prepare_event_mutation(
                     )
                     return {
                         "assistant_response": response,
+                        "calendar_action_details": {
+                            "calendar_id": calendar_id,
+                            "event_query": event_query,
+                        },
                         "provider": "",
                         "model": "",
                         "messages": [
@@ -1255,7 +1614,13 @@ def _prepare_event_mutation(
                     }
                 if len(events) != 1 or matches.get("next_page_token"):
                     choices = "\n".join(
-                        _format_event(event, state.get("user_timezone", "UTC"))
+                        _format_event(
+                            event,
+                            state.get("user_timezone", "UTC"),
+                            matches.get("calendar_id")
+                            if isinstance(matches.get("calendar_id"), str)
+                            else None,
+                        )
                         for event in events[:5]
                         if isinstance(event, dict)
                     )
@@ -1266,6 +1631,10 @@ def _prepare_event_mutation(
                     )
                     return {
                         "assistant_response": response,
+                        "calendar_action_details": {
+                            "calendar_id": calendar_id,
+                            "event_query": event_query,
+                        },
                         "provider": "",
                         "model": "",
                         "messages": [
@@ -1277,6 +1646,59 @@ def _prepare_event_mutation(
                 event_id = selected.get("id") if isinstance(selected, dict) else None
                 if not isinstance(event_id, str) or not event_id:
                     raise ValueError("Calendar returned an invalid event.")
+                if (
+                    action_type == "calendar.delete_event"
+                    and delete_details
+                    and delete_details.get("delete_entire_series")
+                ):
+                    recurring_master_id = selected.get("recurring_event_id")
+                    if (
+                        not isinstance(recurring_master_id, str)
+                        and selected.get("recurrence")
+                    ):
+                        recurring_master_id = event_id
+                    if not isinstance(recurring_master_id, str):
+                        response = (
+                            "I found the matching event, but could not verify "
+                            "its recurring master. Nothing was changed."
+                        )
+                        return {
+                            "assistant_response": response,
+                            "provider": "",
+                            "model": "",
+                            "messages": [
+                                {"role": "user", "content": state["user_message"]},
+                                {"role": "assistant", "content": response},
+                            ],
+                        }
+                    master = asyncio.run(
+                        service.get_event(
+                            user_id=UUID(str(user_id)),
+                            connection_id=UUID(str(connection_id)),
+                            calendar_id=calendar_id,
+                            event_id=recurring_master_id,
+                        )
+                    )
+                    if not _matches_recurring_master(
+                        master,
+                        selected,
+                        event_query,
+                        delete_details,
+                    ):
+                        response = (
+                            "The matching event did not verify as the "
+                            "requested recurring series. Nothing was changed."
+                        )
+                        return {
+                            "assistant_response": response,
+                            "provider": "",
+                            "model": "",
+                            "messages": [
+                                {"role": "user", "content": state["user_message"]},
+                                {"role": "assistant", "content": response},
+                            ],
+                        }
+                    event_id = recurring_master_id
 
             event = asyncio.run(
                 service.validate_event_write_access(
@@ -1308,7 +1730,39 @@ def _prepare_event_mutation(
                         {"role": "assistant", "content": response},
                     ],
                 }
-            if event.get("recurrence") and not event.get("recurring_event_id"):
+            if (
+                action_type == "calendar.delete_event"
+                and delete_details
+                and delete_details.get("delete_entire_series")
+                and not _matches_recurring_master(
+                    event,
+                    selected,
+                    event_query,
+                    delete_details,
+                )
+            ):
+                response = (
+                    "The recurring master changed or no longer matches the "
+                    "requested series. Nothing was changed."
+                )
+                return {
+                    "assistant_response": response,
+                    "provider": "",
+                    "model": "",
+                    "messages": [
+                        {"role": "user", "content": state["user_message"]},
+                        {"role": "assistant", "content": response},
+                    ],
+                }
+            if (
+                event.get("recurrence")
+                and not event.get("recurring_event_id")
+                and not (
+                    action_type == "calendar.delete_event"
+                    and delete_details
+                    and delete_details.get("delete_entire_series")
+                )
+            ):
                 response = (
                     "This is a recurring Calendar series. Series-wide changes "
                     "are not available yet; nothing was changed."
@@ -1359,6 +1813,10 @@ def _prepare_event_mutation(
                     "event_id": event_id,
                     "expected_etag": snapshot["etag"],
                     "current_event": snapshot,
+                    "delete_entire_series": bool(
+                        delete_details
+                        and delete_details.get("delete_entire_series")
+                    ),
                 })
     except ValidationError:
         response = (
@@ -1367,8 +1825,18 @@ def _prepare_event_mutation(
         )
     except ValueError:
         response = (
-            "I couldn’t safely apply the requested time change to this event. "
-            "Please clarify the time and timezone. Nothing was changed."
+            "I couldn’t verify the recurring Calendar master. Nothing was "
+            "changed; please check the event and account, then try again."
+            if (
+                action_type == "calendar.delete_event"
+                and delete_details
+                and delete_details.get("delete_entire_series")
+            )
+            else (
+                "I couldn’t safely apply the requested time change to this "
+                "event. Please clarify the time and timezone. Nothing was "
+                "changed."
+            )
         )
     except PermissionError:
         response = (
@@ -1433,6 +1901,12 @@ def _prepare_event_mutation(
                 state.get("user_timezone", "UTC"),
             )
             details = f" ({event_start} to {event_end})"
+            if parameters.delete_entire_series:
+                details = (
+                    " (entire daily recurring series with no end date, "
+                    f"including all future occurrences; {event_start} to "
+                    f"{event_end})"
+                )
         response = (
             f"I prepared an approval request to {verb} **{event_title}**"
             f"{details}. "
@@ -1469,6 +1943,20 @@ def calendar_agent_node(
     runtime: Runtime[ChatContext],
 ) -> dict[str, Any]:
     plan = state.get("gmail_plan") or {}
+    if plan.get("intent") == "calendar_action_cancelled":
+        response = (
+            "The pending Google Calendar request was canceled. "
+            "No Calendar action was prepared or executed."
+        )
+        return {
+            "assistant_response": response,
+            "provider": "",
+            "model": "",
+            "messages": [
+                {"role": "user", "content": state["user_message"]},
+                {"role": "assistant", "content": response},
+            ],
+        }
     if plan.get("intent") == "approval_workflow":
         pending = state.get("pending_calendar_create_proposal")
         operation = plan.get("operation")
@@ -1534,36 +2022,74 @@ def calendar_agent_node(
                 {"role": "assistant", "content": response},
             ],
         }
+    action_request = state.get("calendar_action_request")
+    if isinstance(action_request, str) and action_request.strip():
+        state = {**state, "user_message": action_request}
     tool_name = plan.get("calendar_tool")
     arguments = plan.get("calendar_arguments")
     update_details = None
-    if (
-        plan.get("intent") == "google_calendar"
+    current_delete_request = _is_calendar_delete_request(
+        state["user_message"]
+    )
+    current_update_request = (
+        not current_delete_request
         and _is_calendar_update_request(state["user_message"])
-    ):
-        logger.info(
-            "calendar_update_trace | request_id=%s "
-            "| boundary=calendar_agent_preparse | message_length=%d "
-            "| timezone_present=%s | planner_tool=%s "
-            "| planner_arguments_null=%s | planner_timezone=%s "
-            "| module_path=%s",
-            request_id(),
-            len(state["user_message"]),
-            "Asia/Kolkata" in state["user_message"],
-            plan.get("calendar_tool"),
-            not isinstance(plan.get("calendar_arguments"), dict),
-            _safe_timezone_for_logging(
-                (plan.get("calendar_arguments") or {}).get("time_zone")
-                if isinstance(plan.get("calendar_arguments"), dict)
+    )
+    if current_delete_request:
+        tool_name = "delete_calendar_event_proposal"
+    elif current_update_request:
+        tool_name = "update_calendar_event_proposal"
+        planner_arguments = plan.get("calendar_arguments")
+        log_calendar_update_diagnostic(
+            boundary="calendar_agent_preparse",
+            message_length=len(state["user_message"]),
+            timezone_present="Asia/Kolkata" in state["user_message"],
+            planner_intent=str(plan.get("intent", "-")),
+            planner_tool=str(plan.get("calendar_tool", "-")),
+            planner_arguments_null=not isinstance(
+                planner_arguments,
+                dict,
+            ),
+            planner_timezone=(
+                planner_arguments.get("time_zone")
+                if isinstance(planner_arguments, dict)
                 else None
             ),
-            __file__,
+            selected_route="google_calendar",
+            module_path=__file__,
         )
+    if current_update_request:
         arguments, update_details = merge_calendar_update_arguments(
             state["user_message"],
             arguments,
+            default_time_zone=state.get("user_timezone"),
+            reference_time=(
+                _parse_request_time(
+                    state.get("request_time") or datetime.now(UTC)
+                )
+            ),
         )
         tool_name = "update_calendar_event_proposal"
+    delete_details = None
+    if current_delete_request:
+        planner_arguments = arguments if isinstance(arguments, dict) else {}
+        planner_time_zone = planner_arguments.get("time_zone")
+        if planner_time_zone is None:
+            planner_time_zone = state.get("user_timezone")
+        delete_details = parse_calendar_delete_request(
+            state["user_message"],
+            planner_time_zone=planner_time_zone,
+        )
+        arguments = dict(planner_arguments)
+        if delete_details.get("event_query"):
+            arguments["event_query"] = delete_details["event_query"]
+        if delete_details.get("calendar_id"):
+            arguments["calendar_id"] = delete_details["calendar_id"]
+            arguments.pop("calendar_name", None)
+        elif delete_details.get("calendar_name"):
+            arguments["calendar_name"] = delete_details["calendar_name"]
+            arguments.pop("calendar_id", None)
+        tool_name = "delete_calendar_event_proposal"
     next_event_details = (
         plan.get("intent") == "google_calendar"
         and _is_next_event_details_request(state["user_message"])
@@ -1778,6 +2304,7 @@ def calendar_agent_node(
             if tool_name == "update_calendar_event_proposal"
             else "calendar.delete_event",
             update_details=update_details,
+            delete_details=delete_details,
         )
     if (
         tool_name == "clarify"
@@ -2113,6 +2640,8 @@ def calendar_agent_node(
         serialized = parameters.model_dump(mode="json")
         if serialized.get("reminders") is None:
             serialized.pop("reminders")
+        if serialized.get("recurrence") is None:
+            serialized.pop("recurrence")
         if parameters.all_day:
             event_time = f"{parameters.start} (all day)"
         else:
@@ -2324,11 +2853,23 @@ def calendar_agent_node(
                     )
                 )
         else:
-            tool_output = asyncio.run(
-                _list_all_calendars(selected_tool)
-                if tool_name == "list_calendars"
-                else selected_tool.ainvoke(arguments)
+            collect_all_event_pages = (
+                tool_name == "list_calendar_events"
+                and re.search(
+                    r"\b(?:all pages|every page|all matching events)\b",
+                    state["user_message"],
+                    re.IGNORECASE,
+                )
+                is not None
             )
+            if tool_name == "list_calendars":
+                tool_output = asyncio.run(_list_all_calendars(selected_tool))
+            elif collect_all_event_pages:
+                tool_output = asyncio.run(
+                    _list_all_calendar_events(selected_tool, arguments)
+                )
+            else:
+                tool_output = asyncio.run(selected_tool.ainvoke(arguments))
             envelope = json.loads(tool_output)
             if not envelope.get("ok"):
                 error = envelope.get("error")
@@ -2346,6 +2887,23 @@ def calendar_agent_node(
                         "I can’t provide a reliable answer."
                     )
                 else:
+                    title_substring = _requested_title_substring(
+                        state["user_message"],
+                    )
+                    if title_substring is not None:
+                        matched_events = data.get("events")
+                        if isinstance(matched_events, list):
+                            data = {
+                                **data,
+                                "events": [
+                                    event
+                                    for event in matched_events
+                                    if isinstance(event, dict)
+                                    and isinstance(event.get("summary"), str)
+                                    and title_substring.casefold()
+                                    in event["summary"].casefold()
+                                ],
+                            }
                     timezone = state.get("user_timezone", "UTC")
                     requested_calendar_ids = arguments.get("calendar_ids")
                     if next_event_details:
