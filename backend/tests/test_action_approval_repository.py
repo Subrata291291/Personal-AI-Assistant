@@ -201,7 +201,10 @@ def test_generic_proposal_creation_uses_typed_action_type_bind():
     assert connection.parameters["action_type"] == "gmail.send"
 
 
-def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically():
+@pytest.mark.parametrize("old_status", ["pending", "approved"])
+def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically(
+    old_status,
+):
     user_id = uuid4()
     conversation_id = uuid4()
     source_message_id = uuid4()
@@ -216,7 +219,7 @@ def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically():
         "connection_id": str(connection_id),
         "action_type": "calendar.create_event",
         "parameters": {"summary": "Gym"},
-        "status": "pending",
+        "status": old_status,
         "created_at": now.isoformat(),
         "expires_at": (now + timedelta(minutes=10)).isoformat(),
     }
@@ -225,6 +228,7 @@ def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically():
         def __init__(self):
             self.statements = []
             self.transition_parameters = None
+            self.sync_parameters = None
 
         def execute(self, statement, parameters):
             self.statements.append(statement)
@@ -242,6 +246,7 @@ def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically():
                 self.transition_parameters = parameters
                 return Result({"proposal": old_proposal})
             if statement is _SYNC_CALENDAR_APPROVAL_STATE:
+                self.sync_parameters = parameters
                 return Result(rowcount=1)
             if statement is _INSERT_PROPOSAL:
                 proposal = {
@@ -300,6 +305,9 @@ def test_calendar_replacement_rejects_old_pending_and_inserts_new_atomically():
         connection.statements.index(_INSERT_PROPOSAL)
     )
     assert _SYNC_CALENDAR_APPROVAL_STATE in connection.statements
+    assert connection.transition_parameters["expected_status"] == old_status
+    assert connection.sync_parameters["expected_state"] == old_status
+    assert connection.sync_parameters["new_state"] == "rejected"
     assert json.loads(connection.transition_parameters["patch"]) == {
         "result": {"outcome": "superseded"},
         "status": "rejected",

@@ -50,13 +50,16 @@ def _calendar_identity_parameters(
         | CalendarDeleteEventParameters
     ),
 ) -> dict[str, Any]:
-    serialized = parameters.model_dump(mode="json")
-    if (
-        isinstance(parameters, CalendarCreateEventParameters)
-        and parameters.recurrence is None
-    ):
-        serialized.pop("recurrence")
-    return serialized
+    """Return the canonical identity payload used at every stage.
+
+    Proposal creation fingerprints ``model_dump(mode="json")`` exactly as it
+    is persisted, including optional fields whose value is ``None`` (for
+    example ``recurrence`` on a non-recurring event). Execution and
+    reconciliation must reuse that same canonical form. Dropping ``None``
+    values here would change the SHA-256 payload fingerprint and make an
+    approved proposal fail its own integrity check.
+    """
+    return parameters.model_dump(mode="json")
 
 
 class CalendarActionExecutor:

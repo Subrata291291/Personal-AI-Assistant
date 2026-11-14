@@ -776,8 +776,9 @@ class ActionApprovalRepository:
                     superseded,
                     account_email,
                 )
+                superseded_status = superseded_row["status"]
                 if (
-                    superseded_row["status"] != "pending"
+                    superseded_status not in {"pending", "approved"}
                     or superseded_row["action_type"]
                     != "calendar.create_event"
                     or superseded_row["conversation_id"] != conversation_id
@@ -793,7 +794,7 @@ class ActionApprovalRepository:
                         {
                             "user_id": str(user_id),
                             "proposal_id": str(supersedes_proposal_id),
-                            "expected_status": "pending",
+                            "expected_status": superseded_status,
                             "expiry_mode": "valid",
                             "timestamp_field": "completed_at",
                             "patch": json.dumps(
@@ -819,7 +820,7 @@ class ActionApprovalRepository:
                     {
                         "user_id": str(user_id),
                         "proposal_id": str(supersedes_proposal_id),
-                        "expected_state": "pending",
+                        "expected_state": superseded_status,
                         "new_state": "rejected",
                     },
                 )

@@ -819,7 +819,23 @@ def test_timed_out_completed_chat_retry_recovers_saved_calendar_proposal(
     graph_invoke.assert_not_called()
 
 
-def test_delete_clarification_resumes_across_chat_requests(monkeypatch):
+@pytest.mark.parametrize(
+    ("initial_request", "clarification", "event_title"),
+    [
+        (
+            "Delete my Personal AI Assistant - Calendar Test.",
+            "Personal AI Assistant - Calendar Test",
+            "Personal AI Assistant - Calendar Test",
+        ),
+        ("Delete my event.", "Gym", "Gym"),
+    ],
+)
+def test_delete_clarification_resumes_across_chat_requests(
+    monkeypatch,
+    initial_request,
+    clarification,
+    event_title,
+):
     service, _message_service = _make_service()
     events = [
         _event_at(
@@ -833,6 +849,7 @@ def test_delete_clarification_resumes_across_chat_requests(monkeypatch):
             "2026-11-12T10:30:00+05:30",
         ),
     ]
+    events[0]["summary"] = event_title
     events_by_id = {event["id"]: event for event in events}
     calendar_service = SimpleNamespace(
         list_events=AsyncMock(side_effect=[
@@ -903,8 +920,8 @@ def test_delete_clarification_resumes_across_chat_requests(monkeypatch):
 
     responses = []
     for content in (
-        "Delete my Personal AI Assistant - Calendar Test.",
-        "Personal AI Assistant - Calendar Test",
+        initial_request,
+        clarification,
     ):
         metrics_token = current_request_metrics.set(
             RequestMetrics(request_id=str(uuid4()))
@@ -947,7 +964,7 @@ def test_delete_clarification_resumes_across_chat_requests(monkeypatch):
         second_result.get("calendar_action_request"),
     )
     assert calendar_service.list_events.await_args.kwargs["query"] == (
-        "Personal AI Assistant - Calendar Test"
+        event_title
     )
     assert len(saved_proposals) == 1
     _proposal_id, proposal = saved_proposals[0]
@@ -1200,3 +1217,125 @@ def test_chat_service_restores_create_and_update_clarifications(
     )
     assert second_routed[0]["gmail_plan"]["calendar_tool"] == tool
     assert second_routed[0]["assistant_route"] == "google_calendar"
+
+
+def test_chat_service_modify_creates_a_superseding_create_proposal(
+    monkeypatch,
+):
+    saved_proposals = []
+    proposal_created_at = datetime.now(timezone.utc)
+    old_proposal_id = uuid4()
+    original_parameters = {
+        "calendar_id": "primary",
+        "summary": "Gym",
+        "description": "Workout session",
+        "start": "2026-11-14T20:00:00+05:30",
+        "end": "2026-11-14T21:00:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "location": None,
+        "attendees": [],
+        "all_day": False,
+    }
+
+    class FakeActionApprovalService:
+        def __init__(self, _db):
+            pass
+
+        def create_proposal(
+            self,
+            *,
+            proposal_id,
+            payload,
+            supersedes_proposal_id=None,
+            **_kwargs,
+        ):
+            saved_proposals.append(
+                (proposal_id, payload, supersedes_proposal_id)
+            )
+            return SimpleNamespace(
+                model_dump=lambda mode="python": {
+                    "proposal_id": str(proposal_id),
+                    "source_message_id": str(payload.source_message_id),
+                    "user_id": str(USER_ID),
+                    "conversation_id": str(CONVERSATION_ID),
+                    "action_type": payload.action_type,
+                    "parameters": payload.parameters,
+                    "connection_id": str(CONNECTION_ID),
+                    "account_email": "owner@example.com",
+                    "created_at": proposal_created_at.isoformat(),
+                    "expires_at": (
+                        proposal_created_at + timedelta(minutes=15)
+                    ).isoformat(),
+                    "status": "pending",
+                    "execution_available": False,
+                }
+            )
+
+    monkeypatch.setattr(
+        chat_service_module,
+        "ActionApprovalService",
+        FakeActionApprovalService,
+    )
+    monkeypatch.setattr(
+        ChatService,
+        "_start_heartbeat",
+        lambda _self, *_args, **_kwargs: (None, None, None),
+    )
+    monkeypatch.setattr(
+        ChatService,
+        "_stop_heartbeat",
+        lambda _self, **_kwargs: None,
+    )
+    service, message_service = _make_service()
+    message_service.messages.append({
+        "id": uuid4(),
+        "conversation_id": CONVERSATION_ID,
+        "role": "assistant",
+        "content": "I prepared an approval request to create **Gym**.",
+        "metadata": {
+            "action_approval": {
+                "proposal_id": str(old_proposal_id),
+                "source_message_id": str(uuid4()),
+                "user_id": str(USER_ID),
+                "conversation_id": str(CONVERSATION_ID),
+                "action_type": "calendar.create_event",
+                "parameters": original_parameters,
+                "connection_id": str(CONNECTION_ID),
+                "account_email": "owner@example.com",
+                "created_at": proposal_created_at.isoformat(),
+                "expires_at": (
+                    proposal_created_at + timedelta(minutes=15)
+                ).isoformat(),
+                "status": "approved",
+            },
+        },
+        "created_at": proposal_created_at,
+    })
+
+    token = current_request_metrics.set(
+        RequestMetrics(request_id=str(uuid4()))
+    )
+    try:
+        response = service.send_message(
+            user_id=USER_ID,
+            conversation_id=CONVERSATION_ID,
+            content="Modify it to 9 PM to 10 PM.",
+            idempotency_key=uuid4(),
+            user_timezone="Asia/Kolkata",
+            default_calendar_connection_id=str(CONNECTION_ID),
+            calendar_enabled=True,
+        )
+    finally:
+        current_request_metrics.reset(token)
+
+    assert len(saved_proposals) == 1
+    _new_proposal_id, payload, supersedes_proposal_id = saved_proposals[0]
+    assert payload.action_type == "calendar.create_event"
+    assert payload.parameters["start"] == "2026-11-14T21:00:00+05:30"
+    assert payload.parameters["end"] == "2026-11-14T22:00:00+05:30"
+    assert supersedes_proposal_id == old_proposal_id
+
+    serialized = ChatResponse.model_validate(response).model_dump(mode="json")
+    approval = serialized["assistant_message"]["metadata"]["action_approval"]
+    assert approval["parameters"]["start"] == "2026-11-14T21:00:00+05:30"
+    assert approval["status"] == "pending"

@@ -284,6 +284,8 @@ describe('Calendar workspace', () => {
           next_page_token: 'events-page-2',
         })
     ))
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
     renderCalendar()
 
     expect(await screen.findByRole('button', { name: /First page event/ }))
@@ -418,6 +420,8 @@ describe('Calendar workspace', () => {
           next_page_token: null,
         })
     })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T12:00:00.000Z'))
     renderCalendar()
 
     expect(await screen.findByRole('button', { name: /Available event/ }))

@@ -1,3 +1,4 @@
+
 import asyncio
 from contextlib import asynccontextmanager
 from unittest.mock import Mock
@@ -5,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.integrations.google.api_client import GmailReadContext
 from app.services.gmail_service import GmailService
 
 
@@ -61,8 +63,19 @@ def test_archived_message_remains_in_all_mail(monkeypatch):
     connection_id = uuid4()
     requests = []
 
+    async def fake_create_gmail_read_context(
+        requested_user_id,
+        requested_connection_id,
+    ):
+        return GmailReadContext(
+            user_id=requested_user_id,
+            connection_id=requested_connection_id,
+            access_token="test-access-token",
+        )
+
     async def fake_google_get(**kwargs):
         requests.append(kwargs)
+
         if kwargs["endpoint"] == "messages":
             return {
                 "messages": [{
@@ -71,6 +84,7 @@ def test_archived_message_remains_in_all_mail(monkeypatch):
                 }],
                 "resultSizeEstimate": 1,
             }
+
         return {
             "id": "message-123",
             "labelIds": ["UNREAD", "CATEGORY_PERSONAL"],
@@ -82,6 +96,11 @@ def test_archived_message_remains_in_all_mail(monkeypatch):
         yield object()
 
     monkeypatch.setattr(service, "_validate_connection", Mock())
+    monkeypatch.setattr(
+        service,
+        "_create_gmail_read_context",
+        fake_create_gmail_read_context,
+    )
     monkeypatch.setattr(service, "_google_get", fake_google_get)
     monkeypatch.setattr(service.api_client, "session", fake_api_session)
 

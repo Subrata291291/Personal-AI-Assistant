@@ -226,6 +226,57 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
       .not.toBeInTheDocument()
   })
 
+  it('offers approval and execution for the latest revised Calendar proposal', async () => {
+    const superseded = createCalendarProposal('rejected')
+    superseded.result = { outcome: 'superseded' }
+    const revised = {
+      ...createCalendarProposal('pending'),
+      proposal_id: 'calendar-proposal-2',
+      parameters: {
+        ...createCalendarProposal('pending').parameters,
+        start: '2026-06-10T21:00:00+05:30',
+        end: '2026-06-10T22:00:00+05:30',
+        time_zone: 'Asia/Kolkata',
+      },
+    }
+    actionApprovalService.approve.mockResolvedValue({
+      proposal: { ...revised, status: 'approved' },
+    })
+    actionApprovalService.getProposal.mockResolvedValue({
+      ...revised,
+      status: 'approved',
+    })
+    actionApprovalService.execute.mockResolvedValue({
+      proposal: {
+        ...revised,
+        status: 'completed',
+        result: { outcome: 'created', google_event_id: 'event-2' },
+      },
+    })
+
+    renderProposalCard(superseded)
+    renderProposalCard(revised)
+
+    expect(screen.getByText('Approval: Superseded')).toBeInTheDocument()
+    expect(screen.getByText('9:00 PM')).toBeInTheDocument()
+    expect(screen.getByText('10:00 PM')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+    await waitFor(() => {
+      expect(actionApprovalService.approve)
+        .toHaveBeenCalledWith('calendar-proposal-2')
+    })
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Create Calendar event',
+    }))
+    await waitFor(() => {
+      expect(actionApprovalService.execute)
+        .toHaveBeenCalledWith('calendar-proposal-2')
+    })
+    expect(actionApprovalService.execute).toHaveBeenCalledTimes(1)
+  })
+
   it('requires a separate execute action for an approved Calendar event', async () => {
     actionApprovalService.approve.mockResolvedValue({
       proposal: createCalendarProposal('approved'),

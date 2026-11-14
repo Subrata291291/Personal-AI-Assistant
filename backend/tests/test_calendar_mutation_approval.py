@@ -1,12 +1,13 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
 
+from app.schemas.action_approval import ApprovalProposalCreate
 from app.schemas.calendar_approval import (
     CalendarCreateEventParameters,
     CalendarDeleteEventParameters,
@@ -19,7 +20,14 @@ from app.integrations.google.exceptions import (
 from app.integrations.connectors.permissions.approval_policy import (
     ApprovalPolicy,
 )
-from app.services.calendar_action_executor import CalendarActionExecutor
+from app.services.action_approval_service import (
+    ActionApprovalService,
+    ApprovalConflictError,
+)
+from app.services.calendar_action_executor import (
+    CalendarActionExecutor,
+    _calendar_identity_parameters,
+)
 from app.services.calendar_action_identity import (
     build_calendar_operation_identity,
 )
@@ -765,7 +773,6 @@ def test_approved_calendar_create_confirms_google_readback_for_saved_payload(
         "attendees": [],
         "all_day": False,
     }).model_dump(mode="json")
-    parameters.pop("recurrence")
     event = {
         "id": "event-123",
         "summary": "A",
@@ -913,7 +920,6 @@ def test_google_calendar_create_failure_is_persisted_as_failed(
         "time_zone": "Asia/Kolkata",
         "all_day": False,
     }).model_dump(mode="json")
-    parameters.pop("recurrence")
     executor, approval, api, proposal, _completed = _executor(
         monkeypatch,
         "calendar.create_event",
@@ -1014,3 +1020,482 @@ def test_every_calendar_write_requires_explicit_approval(capability):
 
     assert decision.required is True
     assert "explicit user approval" in decision.reason
+
+
+_CREATE_EVENT_PAYLOAD = {
+    "calendar_id": "primary",
+    "summary": "Design review",
+    "description": None,
+    "start": "2026-06-10T10:00:00+00:00",
+    "end": "2026-06-10T11:00:00+00:00",
+    "time_zone": "UTC",
+    "location": None,
+    "attendees": [],
+    "all_day": False,
+}
+
+
+def _create_event_payload(**overrides):
+    return {**_CREATE_EVENT_PAYLOAD, **overrides}
+
+
+class _InMemoryApprovalRepository:
+    """Row shapes mirror ActionApprovalRepository for service-level tests."""
+
+    engine = None
+
+    def __init__(self):
+        self.row = None
+        self.operation = None
+
+    def create_proposal(self, **kwargs):
+        operation = kwargs["calendar_operation"]
+        now = datetime.now(timezone.utc)
+        self.operation = {
+            "proposal_id": str(kwargs["proposal_id"]),
+            "operation_id": operation["operation_id"],
+            "user_id": str(kwargs["user_id"]),
+            "connection_id": str(kwargs["connection_id"]),
+            "action_type": operation["action_type"],
+            "calendar_id": operation["calendar_id"],
+            "event_id": operation["event_id"],
+            "payload_fingerprint": operation["payload_fingerprint"],
+            "execution_state": "pending",
+        }
+        self.row = {
+            "proposal_id": kwargs["proposal_id"],
+            "message_id": uuid4(),
+            "source_message_id": kwargs["source_message_id"],
+            "user_id": kwargs["user_id"],
+            "conversation_id": kwargs["conversation_id"],
+            "action_type": kwargs["action_type"],
+            "parameters": kwargs["parameters"],
+            "connection_id": kwargs["connection_id"],
+            "account_email": kwargs["account_email"],
+            "created_at": now,
+            "expires_at": now + timedelta(
+                minutes=kwargs["expiration_minutes"]
+            ),
+            "status": "pending",
+            "approved_at": None,
+            "execution_started_at": None,
+            "completed_at": None,
+            "result": None,
+            "integrity_schema_version": operation["integrity_schema_version"],
+            "payload_fingerprint": operation["payload_fingerprint"],
+            "operation_id": UUID(operation["operation_id"]),
+            "calendar_event_id": operation["event_id"],
+        }
+        return self.row
+
+    def recover_stale_gmail_send(self, **kwargs):
+        return None
+
+    def get_proposal(self, user_id, proposal_id):
+        row = self.row
+        if row is None:
+            return None
+        if row["user_id"] != user_id or row["proposal_id"] != proposal_id:
+            return None
+        return row
+
+    def transition(
+        self,
+        *,
+        user_id,
+        proposal_id,
+        expected_status,
+        new_status,
+        expiry_mode,
+        timestamp_field,
+    ):
+        row = self.row
+        if (
+            row is None
+            or row["user_id"] != user_id
+            or row["proposal_id"] != proposal_id
+        ):
+            return None
+        if row["status"] != expected_status:
+            return None
+        row["status"] = new_status
+        row[timestamp_field] = datetime.now(timezone.utc)
+        self.operation["execution_state"] = new_status
+        return row
+
+
+class _InMemoryCalendarOperationRepository:
+    """Persists the operation state transitions the executor relies on."""
+
+    def __init__(self, repository):
+        self.repository = repository
+
+    def get_for_user(self, user_id, proposal_id):
+        operation = self.repository.operation
+        if operation is None:
+            return None
+        if (
+            operation["user_id"] != str(user_id)
+            or operation["proposal_id"] != str(proposal_id)
+        ):
+            return None
+        return dict(operation)
+
+    def claim_execution(self, *, user_id, proposal_id):
+        row = self.repository.row
+        if row is None or row["status"] != "approved":
+            return None
+        row["status"] = "executing"
+        row["execution_started_at"] = datetime.now(timezone.utc)
+        self.repository.operation["execution_state"] = "executing"
+        return row
+
+    def finish_execution(
+        self,
+        *,
+        user_id,
+        proposal_id,
+        expected_state,
+        new_state,
+        provider_result_classification,
+        reconciliation_status,
+        safe_result,
+    ):
+        row = self.repository.row
+        if row is None or row["status"] != expected_state:
+            return None
+        row["status"] = new_state
+        row["result"] = dict(safe_result)
+        row["completed_at"] = datetime.now(timezone.utc)
+        self.repository.operation["execution_state"] = new_state
+        return row
+
+
+def _approval_service_with_fake_repository(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.calendar_action_executor.settings.CALENDAR_CREATE_EVENT_ENABLED",
+        True,
+    )
+    repository = _InMemoryApprovalRepository()
+    service = ActionApprovalService(db=None, repository=repository)
+    service.connection_repository = SimpleNamespace(
+        get_active_google_connection=Mock(
+            return_value=SimpleNamespace(email="owner@example.com"),
+        ),
+    )
+    service.credential_repository = SimpleNamespace(
+        get_by_connection=Mock(
+            return_value=SimpleNamespace(
+                scopes=["https://www.googleapis.com/auth/calendar.events"],
+            ),
+        ),
+    )
+    service.calendar_operation_repository = (
+        _InMemoryCalendarOperationRepository(repository)
+    )
+    return service, repository
+
+
+def _create_and_approve(service, parameters=None):
+    payload = ApprovalProposalCreate.model_validate({
+        "conversation_id": uuid4(),
+        "source_message_id": uuid4(),
+        "connection_id": CONNECTION_ID,
+        "action_type": "calendar.create_event",
+        "parameters": parameters or _create_event_payload(),
+    })
+    created = service.create_proposal(
+        user_id=USER_ID,
+        payload=payload,
+        proposal_id=PROPOSAL_ID,
+    )
+    approved = service.approve(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+    return created, approved
+
+
+def test_create_identity_parameters_keep_null_optional_fields():
+    parameters = CalendarCreateEventParameters.model_validate(
+        _create_event_payload()
+    )
+    canonical = _calendar_identity_parameters(parameters)
+
+    assert canonical["recurrence"] is None
+    assert canonical["reminders"] is None
+    assert canonical == parameters.model_dump(mode="json")
+    assert (
+        _calendar_identity_parameters(
+            CalendarCreateEventParameters.model_validate(canonical)
+        )
+        == canonical
+    )
+
+
+def test_create_proposal_approval_and_execution_share_identity_with_null_recurrence(
+    monkeypatch,
+):
+    service, repository = _approval_service_with_fake_repository(monkeypatch)
+    created, approved = _create_and_approve(service)
+
+    # Proposal creation persists the canonical payload, including
+    # recurrence=None. Rows written before this fix had this exact shape, so
+    # their stored fingerprints remain valid after the executor correction.
+    assert "recurrence" in created.parameters
+    assert created.parameters["recurrence"] is None
+    assert approved.status == "approved"
+    assert approved.execution_available is True
+
+    identity = build_calendar_operation_identity(
+        proposal_id=PROPOSAL_ID,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        action_type="calendar.create_event",
+        parameters=created.parameters,
+    )
+    assert created.payload_fingerprint == identity.payload_fingerprint
+    assert created.operation_id == identity.operation_id
+
+    event = {
+        "id": identity.event_id,
+        "summary": created.parameters["summary"],
+        "description": None,
+        "location": None,
+        "start": {
+            "dateTime": created.parameters["start"],
+            "timeZone": created.parameters["time_zone"],
+        },
+        "end": {
+            "dateTime": created.parameters["end"],
+            "timeZone": created.parameters["time_zone"],
+        },
+        "attendees": [],
+        "extendedProperties": {
+            "private": {
+                "personal_ai_operation_id": str(identity.operation_id),
+                "personal_ai_payload_fingerprint": (
+                    identity.payload_fingerprint
+                ),
+            },
+        },
+    }
+    calendar_service = SimpleNamespace(
+        validate_create_event_access=AsyncMock(),
+    )
+    api = SimpleNamespace(request_mutation=AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        "app.services.calendar_action_executor.SessionLocal",
+        lambda: SimpleNamespace(close=Mock()),
+    )
+    executor = CalendarActionExecutor(
+        db=None,
+        approval_service=service,
+        calendar_service=calendar_service,
+        api_client=api,
+    )
+    executor._read_back = AsyncMock(return_value=event)
+
+    result = asyncio.run(
+        executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+    )
+
+    assert result.status == "completed"
+    calendar_service.validate_create_event_access.assert_awaited_once()
+    api.request_mutation.assert_awaited_once()
+    request = api.request_mutation.call_args.kwargs
+    assert request["method"] == "POST"
+    assert request["json_data"]["summary"] == "Design review"
+    assert "recurrence" not in request["json_data"]
+    assert repository.operation["execution_state"] == "completed"
+
+
+def test_pre_existing_approved_create_proposal_executes_after_normalization_fix(
+    monkeypatch,
+):
+    service, repository = _approval_service_with_fake_repository(monkeypatch)
+    parameters = CalendarCreateEventParameters.model_validate(
+        _create_event_payload()
+    ).model_dump(mode="json")
+    identity = build_calendar_operation_identity(
+        proposal_id=PROPOSAL_ID,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        action_type="calendar.create_event",
+        parameters=parameters,
+    )
+    now = datetime.now(timezone.utc)
+
+    # Simulate an approved row written before this fix: the stored canonical
+    # payload contains recurrence=None and no execution has happened yet.
+    repository.operation = {
+        "proposal_id": str(PROPOSAL_ID),
+        "operation_id": str(identity.operation_id),
+        "user_id": str(USER_ID),
+        "connection_id": str(CONNECTION_ID),
+        "action_type": "calendar.create_event",
+        "calendar_id": parameters["calendar_id"],
+        "event_id": identity.event_id,
+        "payload_fingerprint": identity.payload_fingerprint,
+        "execution_state": "approved",
+    }
+    repository.row = {
+        "proposal_id": PROPOSAL_ID,
+        "message_id": uuid4(),
+        "source_message_id": uuid4(),
+        "user_id": USER_ID,
+        "conversation_id": uuid4(),
+        "action_type": "calendar.create_event",
+        "parameters": parameters,
+        "connection_id": CONNECTION_ID,
+        "account_email": "owner@example.com",
+        "created_at": now,
+        "expires_at": now + timedelta(minutes=15),
+        "status": "approved",
+        "approved_at": now,
+        "execution_started_at": None,
+        "completed_at": None,
+        "result": None,
+        "integrity_schema_version": 1,
+        "payload_fingerprint": identity.payload_fingerprint,
+        "operation_id": identity.operation_id,
+        "calendar_event_id": identity.event_id,
+    }
+
+    event = {
+        "id": identity.event_id,
+        "summary": parameters["summary"],
+        "description": None,
+        "location": None,
+        "start": {
+            "dateTime": parameters["start"],
+            "timeZone": parameters["time_zone"],
+        },
+        "end": {
+            "dateTime": parameters["end"],
+            "timeZone": parameters["time_zone"],
+        },
+        "attendees": [],
+        "extendedProperties": {
+            "private": {
+                "personal_ai_operation_id": str(identity.operation_id),
+                "personal_ai_payload_fingerprint": (
+                    identity.payload_fingerprint
+                ),
+            },
+        },
+    }
+    calendar_service = SimpleNamespace(
+        validate_create_event_access=AsyncMock(),
+    )
+    api = SimpleNamespace(request_mutation=AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        "app.services.calendar_action_executor.SessionLocal",
+        lambda: SimpleNamespace(close=Mock()),
+    )
+    executor = CalendarActionExecutor(
+        db=None,
+        approval_service=service,
+        calendar_service=calendar_service,
+        api_client=api,
+    )
+    executor._read_back = AsyncMock(return_value=event)
+
+    result = asyncio.run(
+        executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+    )
+
+    assert result.status == "completed"
+    api.request_mutation.assert_awaited_once()
+    assert repository.operation["execution_state"] == "completed"
+
+
+def test_tampered_approved_calendar_create_is_rejected_before_google_call(
+    monkeypatch,
+):
+    service, repository = _approval_service_with_fake_repository(monkeypatch)
+    _create_and_approve(service)
+
+    repository.row["parameters"]["summary"] = "Tampered meeting"
+
+    api = SimpleNamespace(request_mutation=AsyncMock())
+    executor = CalendarActionExecutor(
+        db=None,
+        approval_service=service,
+        calendar_service=SimpleNamespace(),
+        api_client=api,
+    )
+
+    with pytest.raises(
+        ApprovalConflictError,
+        match="integrity verification failed",
+    ):
+        asyncio.run(
+            executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+        )
+
+    api.request_mutation.assert_not_awaited()
+    assert repository.operation["execution_state"] == "approved"
+
+
+def test_revised_calendar_create_payload_has_a_new_valid_fingerprint(monkeypatch):
+    original = _create_event_payload()
+    revised = _create_event_payload(
+        start="2026-06-10T21:00:00+05:30",
+        end="2026-06-10T22:00:00+05:30",
+        time_zone="Asia/Kolkata",
+    )
+    original_identity = build_calendar_operation_identity(
+        proposal_id=PROPOSAL_ID,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        action_type="calendar.create_event",
+        parameters=_calendar_identity_parameters(
+            CalendarCreateEventParameters.model_validate(original)
+        ),
+    )
+    revised_identity = build_calendar_operation_identity(
+        proposal_id=uuid4(),
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        action_type="calendar.create_event",
+        parameters=_calendar_identity_parameters(
+            CalendarCreateEventParameters.model_validate(revised)
+        ),
+    )
+    assert (
+        revised_identity.payload_fingerprint
+        != original_identity.payload_fingerprint
+    )
+
+    service, _repository = _approval_service_with_fake_repository(monkeypatch)
+    created, approved = _create_and_approve(service, parameters=revised)
+
+    assert approved.status == "approved"
+    assert created.payload_fingerprint == revised_identity.payload_fingerprint
+    assert created.payload_fingerprint != original_identity.payload_fingerprint
+
+
+def test_old_approval_cannot_authorize_a_changed_calendar_time_payload(
+    monkeypatch,
+):
+    service, repository = _approval_service_with_fake_repository(monkeypatch)
+    _create_and_approve(service)
+
+    repository.row["parameters"]["start"] = "2026-06-10T21:00:00+05:30"
+    repository.row["parameters"]["end"] = "2026-06-10T22:00:00+05:30"
+
+    api = SimpleNamespace(request_mutation=AsyncMock())
+    executor = CalendarActionExecutor(
+        db=None,
+        approval_service=service,
+        calendar_service=SimpleNamespace(),
+        api_client=api,
+    )
+
+    with pytest.raises(
+        ApprovalConflictError,
+        match="integrity verification failed",
+    ):
+        asyncio.run(
+            executor.execute(user_id=USER_ID, proposal_id=PROPOSAL_ID)
+        )
+
+    api.request_mutation.assert_not_awaited()

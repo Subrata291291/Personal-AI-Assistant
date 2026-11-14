@@ -103,7 +103,9 @@ def test_calendar_list_oauth_is_separate_incremental_read_consent():
     assert list_scopes == [GoogleOAuthClient.CALENDAR_LIST_READ_SCOPE]
 
 
-def test_write_grant_is_reported_but_execution_remains_unavailable():
+def test_write_grant_is_reported_but_execution_remains_unavailable(
+    calendar_write_flags_disabled,
+):
     connection = SimpleNamespace(
         id=CONNECTION_ID,
         provider="google",

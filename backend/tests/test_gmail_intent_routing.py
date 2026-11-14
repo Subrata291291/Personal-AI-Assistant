@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -1602,10 +1602,128 @@ def test_general_assistant_questions_do_not_route_to_calendar():
 
 def test_calendar_availability_without_a_complete_interval_clarifies():
     routed = gmail_agent_nodes.gmail_intent_router_node(
-        _state("Am I free tomorrow?")
+        _state("Am I free?")
     )
     assert routed["assistant_route"] == "google_calendar"
     assert routed["gmail_plan"]["calendar_tool"] == "clarify"
+
+
+def test_calendar_availability_for_a_named_day_covers_the_local_day():
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "Check my calendar. Am I free today?",
+            user_timezone="Asia/Kolkata",
+            request_time="2026-11-14T18:00:00+05:30",
+        )
+    )
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "check_calendar_availability"
+    arguments = routed["gmail_plan"]["calendar_arguments"]
+    assert arguments["time_min"] == "2026-11-14T00:00:00+05:30"
+    assert arguments["time_max"] == "2026-11-15T00:00:00+05:30"
+    assert arguments["time_zone"] == "Asia/Kolkata"
+
+
+def test_calendar_full_day_availability_uses_dst_safe_local_boundaries():
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "am i free today",
+            user_timezone="America/New_York",
+            request_time="2027-03-14T12:00:00-04:00",
+        )
+    )
+
+    assert routed["gmail_plan"]["calendar_tool"] == "check_calendar_availability"
+    arguments = routed["gmail_plan"]["calendar_arguments"]
+    assert arguments["time_min"] == "2027-03-14T00:00:00-05:00"
+    assert arguments["time_max"] == "2027-03-15T00:00:00-04:00"
+    start = datetime.fromisoformat(arguments["time_min"])
+    end = datetime.fromisoformat(arguments["time_max"])
+    assert end - start == timedelta(hours=23)
+
+
+def test_calendar_misspelling_still_routes_to_the_calendar_delete_flow():
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "remove personal AI assistant - calender test from google calender",
+            user_timezone="Asia/Kolkata",
+            request_time="2026-11-14T18:00:00+05:30",
+        )
+    )
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "delete_calendar_event_proposal"
+    )
+
+
+def test_combined_day_read_and_create_checks_availability_before_proposal():
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state(
+            "check my todays google calendar and add gym time from 8pm-9pm",
+            user_timezone="Asia/Kolkata",
+            request_time="2026-11-14T18:00:00+05:30",
+            assistant_capabilities={
+                "google_calendar": {"write_permission_granted": True},
+            },
+        )
+    )
+
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == (
+        "create_event_after_availability_check"
+    )
+    arguments = routed["gmail_plan"]["calendar_arguments"]
+    assert arguments["time_min"] == "2026-11-14T00:00:00+05:30"
+    assert arguments["time_max"] == "2026-11-15T00:00:00+05:30"
+    assert arguments["time_zone"] == "Asia/Kolkata"
+    assert arguments["parameters"] == {
+        "calendar_id": "primary",
+        "summary": "Gym",
+        "description": "Workout session",
+        "start": "2026-11-14T20:00:00+05:30",
+        "end": "2026-11-14T21:00:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "location": None,
+        "attendees": [],
+        "all_day": False,
+    }
+
+
+def test_modify_request_supersedes_the_pending_or_approved_proposal():
+    state = _state(
+        "Modify it to 9 PM to 10 PM.",
+        user_timezone="Asia/Kolkata",
+        request_time="2026-11-14T18:00:00+05:30",
+        assistant_capabilities={
+            "google_calendar": {"write_permission_granted": True},
+        },
+        pending_calendar_create_proposal={
+            "proposal_id": "original-proposal",
+            "status": "approved",
+            "parameters": {
+                "calendar_id": "primary",
+                "summary": "Gym",
+                "description": "Workout session",
+                "start": "2026-11-14T20:00:00+05:30",
+                "end": "2026-11-14T21:00:00+05:30",
+                "time_zone": "Asia/Kolkata",
+                "location": None,
+                "attendees": [],
+                "all_day": False,
+            },
+        },
+    )
+
+    plan, route = gmail_agent_nodes._deterministic_assistant_plan(state)
+
+    assert route == "google_calendar"
+    assert plan["calendar_tool"] == "create_calendar_event_proposal"
+    assert plan["supersedes_proposal_id"] == "original-proposal"
+    assert plan["calendar_arguments"]["start"] == "2026-11-14T21:00:00+05:30"
+    assert plan["calendar_arguments"]["end"] == "2026-11-14T22:00:00+05:30"
+
 
 
 def test_calendar_availability_respects_explicit_iana_timezone_and_dst():

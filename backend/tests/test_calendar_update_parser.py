@@ -1,5 +1,7 @@
 from datetime import date, datetime, time
 
+import pytest
+
 from app.workflows import calendar_update_parser
 from app.workflows.calendar_update_parser import (
     merge_calendar_update_arguments,
@@ -95,6 +97,56 @@ def test_natural_move_to_single_time_preserves_existing_duration():
     assert details["event_query"] == "meeting"
     assert details["changes"] == {"start_time": "16:00"}
     assert "proposed end time" not in details["missing_fields"]
+
+
+def test_contextual_event_query_extracts_meaningful_descriptor():
+    for message, expected in (
+        ("Rename my gym event to Evening Workout.", "gym"),
+        ("Rename my dentist appointment to Evening Workout.", "dentist"),
+        ("Rename my team meeting to Evening Workout.", "team"),
+    ):
+        details = parse_calendar_update_message(message)
+
+        assert details["event_query"] == expected
+
+
+def test_contextual_event_query_preserves_multiword_descriptor():
+    details = parse_calendar_update_message(
+        "Rename my project discussion to Evening Workout."
+    )
+
+    assert details["event_query"] == "project"
+
+
+@pytest.mark.parametrize(
+    ("duration", "expected_end"),
+    [
+        ("30 minutes", time(15, 30)),
+        ("45 minutes", time(15, 45)),
+        ("1 hour", time(16, 0)),
+        ("1 hour 30 minutes", time(16, 30)),
+    ],
+)
+def test_duration_only_update_calculates_new_end_time(
+    duration, expected_end
+):
+    details = parse_calendar_update_message(
+        "Event: My meeting\n"
+        "Date: 2026-11-16\n"
+        "Original time: 3:00 PM-4:00 PM\n"
+        "Timezone: Asia/Kolkata\n"
+        f"Change the duration of my meeting to {duration}."
+    )
+
+    assert details["original_start_time"] == time(15, 0)
+    assert details["changes"]["start"] == {
+        "dateTime": "2026-11-16T15:00:00+05:30",
+        "timeZone": "Asia/Kolkata",
+    }
+    assert details["changes"]["end"] == {
+        "dateTime": f"2026-11-16T{expected_end.hour:02d}:{expected_end.minute:02d}:00+05:30",
+        "timeZone": "Asia/Kolkata",
+    }
 
 
 def test_natural_move_parses_target_day_in_user_timezone():

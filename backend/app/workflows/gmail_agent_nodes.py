@@ -629,7 +629,7 @@ def _calendar_pending_time_revision(
     proposal = state.get("pending_calendar_create_proposal")
     message = state["user_message"].strip()
     if not isinstance(proposal, dict) or not re.search(
-        r"\b(?:change|update|adjust|revise|set)\b",
+        r"\b(?:change|update|adjust|revise|modify|set)\b",
         message,
         re.IGNORECASE,
     ):
@@ -745,6 +745,68 @@ def _calendar_pending_time_revision(
     )
 
 
+def _pending_calendar_availability_resolution(
+    state: ChatState,
+) -> tuple[dict[str, Any], str] | None:
+    pending = state.get("pending_calendar_availability")
+    if not isinstance(pending, dict) or pending.get("version") != 1:
+        return None
+    if pending.get("operation") != "availability":
+        return None
+    user_id = state.get("user_id")
+    conversation_id = state.get("conversation_id")
+    if str(pending.get("user_id")) != str(user_id) or str(
+        pending.get("conversation_id")
+    ) != str(conversation_id):
+        return None
+    try:
+        expires_at = datetime.fromisoformat(
+            str(pending["expires_at"]).replace("Z", "+00:00")
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        expires_at.tzinfo is None
+        or expires_at.astimezone(ZoneInfo("UTC"))
+        <= _request_time(state).astimezone(ZoneInfo("UTC"))
+    ):
+        return None
+    timezone_name = (
+        pending.get("time_zone")
+        or state.get("user_timezone")
+        or "UTC"
+    )
+    try:
+        ZoneInfo(timezone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        timezone_name = "UTC"
+    target_date = _relative_calendar_date(state["user_message"], state)
+    if target_date is None:
+        target_date = _extract_explicit_calendar_date(state["user_message"])
+    if target_date is None:
+        return None
+    whole_day = pending.get("whole_day", True)
+    if not whole_day:
+        return None
+    start = _calendar_local_datetime(
+        target_date, datetime_time.min, timezone_name
+    )
+    end = _calendar_local_datetime(
+        target_date + timedelta(days=1), datetime_time.min, timezone_name
+    )
+    if start is None or end is None or end <= start:
+        return None
+    return _calendar_plan(
+        "check_calendar_availability",
+        {
+            "time_min": start.isoformat(),
+            "time_max": end.isoformat(),
+            "time_zone": timezone_name,
+            "calendar_ids": ["primary"],
+        },
+    )
+
+
 def _calendar_create_title(text: str) -> str | None:
     explicit_title = extract_calendar_create_draft(
         text,
@@ -753,6 +815,25 @@ def _calendar_create_title(text: str) -> str | None:
     ).get("summary")
     if explicit_title:
         return explicit_title
+
+    # Extract a purpose stated after "for", e.g. "from 2 PM to 3 PM for lunch".
+    purpose_match = re.search(
+        r"\bfor\s+(?:a\s+|an\s+|the\s+)?"
+        r"([A-Za-z][A-Za-z0-9 '&-]{1,80}?)\s*[.?!]*$",
+        text,
+        re.IGNORECASE,
+    )
+    if purpose_match:
+        purpose = purpose_match.group(1).strip()
+        purpose = re.sub(
+            r"\b(?:today|tomorrow|at|from|to|on|in|this|next)\b.*$",
+            "",
+            purpose,
+            flags=re.IGNORECASE,
+        ).strip()
+        if purpose:
+            return purpose[:250].capitalize() if purpose.islower() else purpose
+
     if re.search(
         r"(?:^|\n|\s[-*•]\s*)"
         r"(?:title|frequency|recurrence|start\s+time|end\s+time|"
@@ -763,7 +844,7 @@ def _calendar_create_title(text: str) -> str | None:
         return None
 
     title = re.sub(
-        r"^\s*(?:please\s+)?(?:set|put|add|create|book|schedule)\b"
+        r"^\s*(?:please\s+)?(?:set|put|add|create|book|schedule|block|reserve)\b"
         r"(?:\s+(?:in|on|to)\s+(?:my\s+|the\s+)?(?:google\s+)?calendar\b)?",
         "",
         text,
@@ -813,14 +894,16 @@ def _calendar_create_title(text: str) -> str | None:
         title,
         flags=re.IGNORECASE,
     )
-    title = re.sub(
-        r"\b(?:calendar|event|meeting|appointment)\b",
-        " ",
+    title = re.sub(r"\b(?:to|and|my|the|in|on)\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"^\s*(?:a|an|the)\b\s*", "", title, flags=re.IGNORECASE)
+    # Only drop a generic noun when it is the entire remaining title;
+    # keep meaningful compounds such as "team meeting".
+    if re.fullmatch(
+        r"\s*(?:calendar|event|meeting|appointment)\s*",
         title,
         flags=re.IGNORECASE,
-    )
-    title = re.sub(r"\b(?:to|and|my|the|in|on)\b", " ", title, flags=re.IGNORECASE)
-    title = re.sub(r"^(?:a|an|the)\b\s*", "", title, flags=re.IGNORECASE)
+    ):
+        title = ""
     title = " ".join(title.split()).strip(" -,:.")
     return title[:250].capitalize() if title else None
 
@@ -927,9 +1010,9 @@ def _relative_calendar_date(text: str, state: ChatState) -> date | None:
     timezone = _validated_timezone(state)
     today = _request_time(state).astimezone(ZoneInfo(timezone)).date()
     lowered = text.casefold()
-    if re.search(r"\btoday\b", lowered):
+    if re.search(r"\btoday(?:'s|s)?\b", lowered):
         return today
-    if re.search(r"\btomorrow\b", lowered):
+    if re.search(r"\btomorrow(?:'s|s)?\b", lowered):
         return today + timedelta(days=1)
     weekday_match = re.search(
         r"\b(?:(next|this)\s+)?"
@@ -948,19 +1031,167 @@ def _relative_calendar_date(text: str, state: ChatState) -> date | None:
     return today + timedelta(days=days_ahead)
 
 
+def _calendar_compound_create_clause(text: str) -> str | None:
+    """Return the creation clause of a combined read-and-create request.
+
+    Example: "check today's calendar and add gym from 8pm-9pm" returns
+    "add gym from 8pm-9pm". A plain "add gym from 8pm-9pm" request is not a
+    compound request and is handled by the existing create parser.
+    """
+    match = re.search(
+        r"\b(?:add|create|schedule|book|put|set)\b"
+        r"\s+(?:an?\s+|the\s+)?"
+        r"[A-Za-z0-9][A-Za-z0-9 '&-]{0,80}?"
+        r"\s+(?:from|between|at)\s+"
+        r"\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?"
+        r"\s*(?:-|–|—|to|until|till)\s*"
+        r"\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?",
+        text,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return text[match.start():]
+
+
+def _calendar_compound_day_plan(
+    text: str,
+    *,
+    timezone: str,
+    target_date: date,
+    has_day_reference: bool,
+) -> tuple[dict[str, Any], str] | None:
+    """Build a day-read plus availability-checked create plan.
+
+    The workflow must fetch the target day's events, verify the requested
+    interval is free, and only then prepare a proposal. This helper never
+    creates or executes an event.
+    """
+    if not has_day_reference:
+        return None
+    if not re.search(
+        r"\b(?:check|see|view|show|list|look\s+at|what(?:'s| is) on)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
+    clause = _calendar_compound_create_clause(text)
+    if clause is None:
+        return None
+    clock_text = re.sub(
+        r"\b20\d{2}-\d{2}-\d{2}\b",
+        " ",
+        clause.casefold(),
+    )
+    clock_matches = _calendar_clock_matches(clock_text)
+    if clock_matches is None or len(clock_matches) != 2:
+        return None
+    if clock_matches[1] <= clock_matches[0]:
+        return None
+    title = _calendar_create_title(clause)
+    if not title:
+        return None
+    title = re.sub(r"\s+(?:time|timing)$", "", title, flags=re.IGNORECASE)
+    title = title.strip(" -,:.")
+    if not title:
+        return None
+    meeting_start = _calendar_local_datetime(
+        target_date,
+        clock_matches[0],
+        timezone,
+    )
+    meeting_end = _calendar_local_datetime(
+        target_date,
+        clock_matches[1],
+        timezone,
+    )
+    day_start = _calendar_local_datetime(
+        target_date,
+        datetime_time.min,
+        timezone,
+    )
+    day_end = _calendar_local_datetime(
+        target_date + timedelta(days=1),
+        datetime_time.min,
+        timezone,
+    )
+    if (
+        meeting_start is None
+        or meeting_end is None
+        or day_start is None
+        or day_end is None
+        or day_end <= day_start
+    ):
+        return _calendar_plan("clarify")
+    return _calendar_plan(
+        "create_event_after_availability_check",
+        {
+            "time_min": day_start.isoformat(),
+            "time_max": day_end.isoformat(),
+            "time_zone": timezone,
+            "calendar_id": "primary",
+            "parameters": {
+                "calendar_id": "primary",
+                "summary": title,
+                "description": _calendar_create_description(title),
+                "start": meeting_start.isoformat(timespec="seconds"),
+                "end": meeting_end.isoformat(timespec="seconds"),
+                "time_zone": timezone,
+                "location": None,
+                "attendees": [],
+                "all_day": False,
+            },
+        },
+    )
+
+
 def _calendar_create_draft_plan(
     state: ChatState,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     current_message = state["user_message"].strip()
     new_create_request = _calendar_event_creation_request(current_message) or (
         bool(re.search(
-            r"^\s*(?:please\s+)?(?:schedule|book)\s+(?:a\s+)?"
+            r"^\s*(?:please\s+)?(?:schedule|book|block|reserve)\s+(?:a\s+)?"
             r"[A-Za-z0-9][A-Za-z0-9 '&-]{0,80}\s+"
             r"(?:today|tomorrow|on\b|from\b|at\b)",
             current_message,
             re.IGNORECASE,
         ))
     )
+    if _calendar_pending_time_revision(state) is not None:
+        return None
+    # An independent new request also contains its own time range or a
+    # distinct date+title, so never reuse a stale pending draft.  Do not
+    # apply this to pending time revisions or combined read+create requests.
+    if not new_create_request:
+        compound_clause = _calendar_compound_create_clause(current_message)
+        if compound_clause is None:
+            has_date = (
+                _relative_calendar_date(current_message, state) is not None
+                or _extract_explicit_calendar_date(current_message) is not None
+            )
+            try:
+                clock_matches = _calendar_clock_matches(current_message)
+            except Exception:
+                clock_matches = None
+            if isinstance(clock_matches, list) and len(clock_matches) == 2:
+                # A bare time range ("from 11 AM to 12 PM") is usually a
+                # clarification answer, not a new independent request.
+                if re.search(
+                    r"\b(?:block|reserve|add|create|schedule|book|for|tomorrow|"
+                    r"today|monday|tuesday|wednesday|thursday|friday|saturday|"
+                    r"sunday)\b",
+                    current_message,
+                    re.IGNORECASE,
+                ) or has_date:
+                    new_create_request = True
+            else:
+                if has_date and re.search(
+                    r"\b(?:block|reserve|add|create|schedule|book|for)\b",
+                    current_message,
+                    re.IGNORECASE,
+                ):
+                    new_create_request = True
     current_intent = _calendar_intent(current_message)
     if current_intent not in {None, "CREATE_EVENT"}:
         return None
@@ -1086,11 +1317,11 @@ def _calendar_create_request(text: str) -> bool:
 def _calendar_event_creation_request(text: str) -> bool:
     lowered = text.casefold()
     return bool(re.search(
-        r"\b(?:set|put|create|add|book|schedule)\b.{0,60}"
+        r"\b(?:set|put|create|add|book|schedule|block|reserve)\b.{0,60}"
         r"\b(?:meetings?|events?|appointments?|sessions?|classes?|calendar)\b|"
         r"\b(?:meetings?|events?|appointments?|sessions?|classes?)\b.{0,60}"
-        r"\b(?:set|put|create|add|book|schedule)\b|"
-        r"^\s*(?:please\s+)?add\s+(?:an?\s+)?"
+        r"\b(?:set|put|create|add|book|schedule|block|reserve)\b|"
+        r"^\s*(?:please\s+)?(?:add|block|reserve|schedule|book)\s+(?:an?\s+)?"
         r"[A-Za-z0-9][A-Za-z0-9 '&-]{0,80}\s+"
         r"(?:today|tomorrow|on\b|from\b|at\b)",
         lowered,
@@ -1127,7 +1358,7 @@ def _calendar_intent(text: str) -> str | None:
         return "VERIFY_EVENT"
     first_action = re.search(
         r"\b(?:delete|remove|cancel|move|reschedule|update|edit|change|"
-        r"rename|modify|create|add|book|schedule)\b",
+        r"rename|modify|create|add|book|schedule|block|reserve)\b",
         lowered,
     )
     if first_action:
@@ -1271,7 +1502,7 @@ def _deterministic_calendar_plan(
     today = request_now.date()
     explicit_date = _extract_explicit_calendar_date(text)
     explicit_date_matches = re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", text)
-    date_match = re.search(r"\b(today|tomorrow)\b", lowered)
+    date_match = re.search(r"\b(today|tomorrow)(?:'s|s)?\b", lowered)
     weekday_match = re.search(
         r"\b(?:(next|this)\s+)?"
         r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
@@ -1298,6 +1529,19 @@ def _deterministic_calendar_plan(
         target_date = today + timedelta(days=days_ahead)
     if explicit_date is not None:
         target_date = explicit_date
+
+    compound_plan = _calendar_compound_day_plan(
+        text,
+        timezone=timezone,
+        target_date=target_date,
+        has_day_reference=(
+            date_match is not None
+            or weekday_match is not None
+            or explicit_date is not None
+        ),
+    )
+    if compound_plan is not None:
+        return compound_plan
 
     creation_request = bool(re.search(
         r"\b(?:set|put|create|add|book|schedule|cancel|delete|remove|update|edit|"
@@ -1446,7 +1690,36 @@ def _deterministic_calendar_plan(
         clock_text = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", " ", lowered)
         parsed_times = _calendar_clock_matches(clock_text)
         if not parsed_times:
-            return _calendar_plan("clarify")
+            # A date without clock times is an unambiguous full-local-day
+            # availability question. Resolve the day in the user's timezone
+            # and convert the DST-safe local boundaries to absolute instants.
+            if (
+                date_match is None
+                and weekday_match is None
+                and explicit_date is None
+            ):
+                return _calendar_plan("clarify")
+            start = _calendar_local_datetime(
+                target_date,
+                datetime_time.min,
+                timezone,
+            )
+            end = _calendar_local_datetime(
+                target_date + timedelta(days=1),
+                datetime_time.min,
+                timezone,
+            )
+            if start is None or end is None or end <= start:
+                return _calendar_plan("clarify")
+            return _calendar_plan(
+                "check_calendar_availability",
+                {
+                    "time_min": start.isoformat(),
+                    "time_max": end.isoformat(),
+                    "time_zone": timezone,
+                    "calendar_ids": ["primary"],
+                },
+            )
         start = _calendar_local_datetime(target_date, parsed_times[0], timezone)
         if start is None:
             return _calendar_plan("clarify")
@@ -1725,6 +1998,55 @@ def _deterministic_calendar_plan(
             },
         )
 
+    if weekday_match and not creation_request and re.search(
+        r"\b(?:show|list|find|get|open|view|what|when|tell me|"
+        r"do i have|have|schedule|meetings?|events?|calendar)\b",
+        lowered,
+    ):
+        return _calendar_plan(
+            "get_calendar_schedule",
+            {
+                "date": target_date.isoformat(),
+                "period": "day",
+                "time_zone": timezone,
+                "calendar_id": "primary",
+            },
+        )
+
+    if re.search(r"\bweekend\b", lowered) and re.search(
+        r"\b(?:show|list|find|get|open|view|what|when|tell me|"
+        r"do i have|have|schedule|meetings?|events?|calendar|free|"
+        r"available|busy)\b",
+        lowered,
+    ) and not creation_request:
+        days_until_saturday = (5 - today.weekday()) % 7
+        if "next" in lowered:
+            days_until_saturday += 7
+        saturday = today + timedelta(days=days_until_saturday)
+        monday = saturday + timedelta(days=2)
+        range_start = _calendar_local_datetime(
+            saturday,
+            datetime_time.min,
+            timezone,
+        )
+        range_end = _calendar_local_datetime(
+            monday,
+            datetime_time.min,
+            timezone,
+        )
+        if range_start is None or range_end is None:
+            return _calendar_plan("clarify")
+        return _calendar_plan(
+            "list_calendar_events",
+            {
+                "time_min": range_start.isoformat(),
+                "time_max": range_end.isoformat(),
+                "time_zone": timezone,
+                "max_results": 100,
+                "calendar_id": "primary",
+            },
+        )
+
     if date_match or explicit_date is not None:
         if re.search(r"\b(?:schedule|meetings?|events?|calendar)\b", lowered):
             return _calendar_plan(
@@ -1773,7 +2095,16 @@ def _deterministic_calendar_plan(
             or named_calendar_match.group(2)
             or ""
         ).strip()
-        if calendar_name.casefold() not in {"google", "primary", "my", "the"}:
+        if (
+            calendar_name.casefold() not in {
+                "google", "primary", "my", "the", "me", "me my",
+                "my primary", "the primary",
+            }
+            and not all(
+                word.casefold() in {"my", "me", "the", "primary", "google"}
+                for word in calendar_name.split()
+            )
+        ):
             return _calendar_plan(
                 "list_calendar_events",
                 {
@@ -1969,6 +2300,10 @@ def _deterministic_assistant_plan(
     resumed_calendar = _calendar_resume_disabled_integration(state)
     if resumed_calendar is not None:
         return resumed_calendar
+
+    pending_availability = _pending_calendar_availability_resolution(state)
+    if pending_availability is not None:
+        return pending_availability
 
     current_calendar_intent = _calendar_intent(text)
     if current_calendar_intent == "DELETE_EVENT":
@@ -2605,15 +2940,17 @@ def _contextual_followup_messages(state: ChatState) -> list[dict[str, str]]:
 def _is_explicit_new_intent(text: str) -> bool:
     if _calendar_intent(text) is not None:
         return True
+    if _calendar_event_creation_request(text):
+        return True
     if _is_calendar_update_request(text):
         return True
     return bool(re.search(
         r"\b(?:send|reply|forward|draft|search|find|delete|archive|trash|"
-        r"create|add|update|change|rename|move|schedule|book)\b.{0,100}"
+        r"create|add|update|change|rename|move|schedule|book|block|reserve)\b.{0,100}"
         r"\b(?:gmail|e-?mail|inbox|drive|file|task|reminder|contact)\b|"
         r"\b(?:gmail|e-?mail|inbox|drive|file|task|reminder|contact)\b.{0,100}"
         r"\b(?:send|reply|forward|draft|search|find|delete|archive|trash|"
-        r"create|add|update|change|rename|move|schedule|book)\b",
+        r"create|add|update|change|rename|move|schedule|book|block|reserve)\b",
         text,
         re.IGNORECASE,
     ))

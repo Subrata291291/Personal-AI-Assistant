@@ -235,6 +235,47 @@ class ChatService:
         return None
 
     @staticmethod
+    def _pending_calendar_availability(
+        history: list[dict[str, Any]],
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        for message in reversed(history):
+            if message.get("role") != "assistant":
+                continue
+            metadata = message.get("metadata")
+            pending = (
+                metadata.get("pending_calendar_availability")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(pending, dict):
+                return None
+            if (
+                pending.get("version") != 1
+                or pending.get("operation") != "availability"
+                or pending.get("user_id") != str(user_id)
+                or pending.get("conversation_id") != str(conversation_id)
+            ):
+                return None
+            try:
+                expires_at = datetime.fromisoformat(
+                    str(pending["expires_at"]).replace("Z", "+00:00")
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                expires_at.tzinfo is None
+                or expires_at.astimezone(timezone.utc)
+                <= now.astimezone(timezone.utc)
+            ):
+                return None
+            return pending
+        return None
+
+    @staticmethod
     def _pending_calendar_action(
         history: list[dict[str, Any]],
         *,
@@ -876,6 +917,12 @@ class ChatService:
                 ),
                 now=request_time,
             )
+            pending_calendar_availability = self._pending_calendar_availability(
+                history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                now=request_time,
+            )
             calendar_capabilities = {
                 **calendar_access["capabilities"],
                 "integration_enabled": calendar_enabled,
@@ -1020,6 +1067,10 @@ class ChatService:
             if pending_calendar_create is not None:
                 initial_state["pending_calendar_create_proposal"] = (
                     pending_calendar_create
+                )
+            if pending_calendar_availability is not None:
+                initial_state["pending_calendar_availability"] = (
+                    pending_calendar_availability
                 )
             pending_calendar_draft = self._pending_calendar_create_draft(
                 history,
@@ -1238,6 +1289,43 @@ class ChatService:
                         assistant_metadata["pending_calendar_action"] = (
                             pending_action
                         )
+                    if (
+                        result.get("assistant_route") == "google_calendar"
+                        and isinstance(result.get("gmail_plan"), dict)
+                        and result["gmail_plan"].get("calendar_tool")
+                        == "clarify"
+                        and re.search(
+                            r"\b(?:free|available|availability)\b",
+                            normalized_content,
+                            re.IGNORECASE,
+                        )
+                    ):
+                        assistant_metadata[
+                            "pending_calendar_availability"
+                        ] = {
+                            "version": 1,
+                            "operation": "availability",
+                            "user_id": str(user_id),
+                            "conversation_id": str(conversation_id),
+                            "connection_id": str(
+                                event_read_connection_id
+                                or freebusy_connection_id
+                                or write_connection_id
+                                or ""
+                            ),
+                            "expires_at": (
+                                request_time + timedelta(minutes=5)
+                            ).isoformat(),
+                            "original_request": normalized_content,
+                            "whole_day": bool(
+                                re.search(
+                                    r"\bwhole\s+day\b",
+                                    normalized_content,
+                                    re.IGNORECASE,
+                                )
+                            ),
+                            "time_zone": user_timezone,
+                        }
                     if "calendar_create_draft" in result:
                         assistant_metadata["calendar_create_draft"] = (
                             result["calendar_create_draft"]

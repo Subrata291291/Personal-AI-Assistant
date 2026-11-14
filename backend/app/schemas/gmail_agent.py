@@ -52,6 +52,7 @@ class IntegrationPlan(GmailPlanBase):
         "get_calendar_schedule",
         "check_calendar_availability",
         "create_calendar_event_proposal",
+        "create_event_after_availability_check",
         "update_calendar_event_proposal",
         "delete_calendar_event_proposal",
         "get_calendar_proposal_status",

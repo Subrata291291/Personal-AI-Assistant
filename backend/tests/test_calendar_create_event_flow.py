@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -318,7 +319,6 @@ def test_calendar_executor_rechecks_write_access_before_claim(
     )
     parameters = CalendarCreateEventParameters.model_validate(PARAMETERS)
     identity_parameters = parameters.model_dump(mode="json")
-    identity_parameters.pop("recurrence")
     identity = build_calendar_operation_identity(
         proposal_id=PROPOSAL_ID,
         user_id=USER_ID,
@@ -364,3 +364,145 @@ def test_calendar_executor_rechecks_write_access_before_claim(
 
     approval_service.claim_calendar_execution.assert_not_called()
     api_client.request_mutation.assert_not_awaited()
+
+
+COMBINED_PARAMETERS = {
+    "calendar_id": "primary",
+    "summary": "Gym",
+    "description": "Workout session",
+    "start": "2026-11-14T20:00:00+05:30",
+    "end": "2026-11-14T21:00:00+05:30",
+    "time_zone": "Asia/Kolkata",
+    "location": None,
+    "attendees": [],
+    "all_day": False,
+}
+
+
+def _combined_state():
+    return {
+        "user_message": (
+            "check my todays google calendar and add gym time from 8pm-9pm"
+        ),
+        "gmail_plan": {
+            "calendar_tool": "create_event_after_availability_check",
+            "calendar_arguments": {
+                "time_min": "2026-11-14T00:00:00+05:30",
+                "time_max": "2026-11-15T00:00:00+05:30",
+                "time_zone": "Asia/Kolkata",
+                "calendar_id": "primary",
+                "parameters": COMBINED_PARAMETERS,
+            },
+        },
+        "assistant_capabilities": {
+            "google_calendar": {"write_permission_granted": True},
+        },
+    }
+
+
+def _combined_context():
+    return SimpleNamespace(
+        context={
+            "user_id": str(USER_ID),
+            "calendar_write_connection_id": str(CONNECTION_ID),
+            "calendar_event_connection_id": str(CONNECTION_ID),
+            "calendar_freebusy_connection_id": str(CONNECTION_ID),
+            "google_connection_available": True,
+        }
+    )
+
+
+def _fake_calendar_tools(events, captured):
+    class ListTool:
+        name = "list_calendar_events"
+
+        async def ainvoke(self, arguments):
+            captured.append(arguments)
+            return json.dumps({"ok": True, "data": {"events": events}})
+
+    return lambda **_kwargs: [ListTool()]
+
+
+def test_combined_day_check_creates_a_proposal_only_after_free_interval(
+    monkeypatch,
+):
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        calendar_node_module,
+        "create_calendar_tools",
+        _fake_calendar_tools([], captured),
+    )
+
+    result = calendar_node_module.calendar_agent_node(
+        _combined_state(),
+        _combined_context(),
+    )
+
+    assert result["calendar_create_event_proposal"] == COMBINED_PARAMETERS
+    assert result["calendar_availability_checked"] is True
+    assert "approval request" in result["assistant_response"]
+    assert captured == [{
+        "time_min": "2026-11-14T00:00:00+05:30",
+        "time_max": "2026-11-15T00:00:00+05:30",
+        "time_zone": "Asia/Kolkata",
+        "calendar_id": "primary",
+        "max_results": 100,
+    }]
+
+
+def test_combined_day_check_reports_a_conflict_without_creating_a_proposal(
+    monkeypatch,
+):
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        calendar_node_module,
+        "create_calendar_tools",
+        _fake_calendar_tools(
+            [
+                {
+                    "summary": "Standup",
+                    "start": {"date_time": "2026-11-14T19:30:00+05:30"},
+                    "end": {"date_time": "2026-11-14T20:30:00+05:30"},
+                },
+            ],
+            captured,
+        ),
+    )
+
+    result = calendar_node_module.calendar_agent_node(
+        _combined_state(),
+        _combined_context(),
+    )
+
+    assert "calendar_create_event_proposal" not in result
+    assert "conflict" in result["assistant_response"]
+    assert "Standup" in result["assistant_response"]
+    assert len(captured) == 1
+
+
+def test_combined_day_check_treats_an_all_day_event_as_a_conflict(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        calendar_node_module,
+        "create_calendar_tools",
+        _fake_calendar_tools(
+            [
+                {
+                    "summary": "Company holiday",
+                    "start": {"date": "2026-11-14"},
+                    "end": {"date": "2026-11-15"},
+                },
+            ],
+            [],
+        ),
+    )
+
+    result = calendar_node_module.calendar_agent_node(
+        _combined_state(),
+        _combined_context(),
+    )
+
+    assert "calendar_create_event_proposal" not in result
+    assert "Company holiday" in result["assistant_response"]
+

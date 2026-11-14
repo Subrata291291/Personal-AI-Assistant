@@ -200,7 +200,18 @@ def _requested_calendar_name(message: str) -> str | None:
     if match is None:
         return None
     name = match.group(1).strip(" .,'\"")
-    if not name or name.casefold() in {"google", "primary", "my", "the"}:
+    if not name:
+        return None
+    words = name.split()
+    if all(
+        word.casefold() in {"google", "primary", "my", "me", "the"}
+        for word in words
+    ):
+        return None
+    if name.casefold() in {
+        "google", "primary", "my", "the", "me", "me my",
+        "my google", "my primary", "the primary", "my calendar",
+    }:
         return None
     return name
 
@@ -327,6 +338,12 @@ def _clarification(state: ChatState) -> str:
                 "Please provide an IANA timezone, such as "
                 "America/Los_Angeles."
             )
+        if not re.search(
+            r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|"
+            r"friday|saturday|sunday|20\d{2}-\d{2}-\d{2})\b",
+            lowered,
+        ):
+            return "Which date should I check?"
         return (
             "What date and time range should I check? Please include the "
             "start and end time; I’ll use your selected timezone."
@@ -872,6 +889,158 @@ def _event_snapshot(event: dict[str, Any]) -> dict[str, Any]:
     return snapshot
 
 
+def _calendar_event_interval(
+    event: dict[str, Any],
+    timezone: str,
+) -> tuple[datetime, datetime] | None:
+    """Return absolute start/end instants for a Calendar event payload."""
+
+    try:
+        zone = ZoneInfo(timezone)
+    except (ValueError, ZoneInfoNotFoundError):
+        zone = ZoneInfo("UTC")
+
+    def parse(value: object) -> datetime | None:
+        if not isinstance(value, dict):
+            return None
+        date_value = value.get("date")
+        if isinstance(date_value, date) and not isinstance(
+            date_value,
+            datetime,
+        ):
+            return datetime.combine(date_value, time.min, tzinfo=zone)
+        if isinstance(date_value, str):
+            try:
+                return datetime.combine(
+                    date.fromisoformat(date_value),
+                    time.min,
+                    tzinfo=zone,
+                )
+            except ValueError:
+                return None
+        date_time = value.get("date_time")
+        if isinstance(date_time, datetime):
+            parsed = date_time
+        elif isinstance(date_time, str):
+            try:
+                parsed = datetime.fromisoformat(
+                    date_time[:-1] + "+00:00"
+                    if date_time.endswith("Z")
+                    else date_time
+                )
+            except ValueError:
+                return None
+        else:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed
+
+    start = parse(event.get("start"))
+    end = parse(event.get("end"))
+    if start is None or end is None or end <= start:
+        return None
+    return start, end
+
+
+def _calendar_conflict_lines(
+    events: list[Any],
+    start: datetime,
+    end: datetime,
+    timezone: str,
+) -> list[str]:
+    conflicts: list[str] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        interval = _calendar_event_interval(event, timezone)
+        if interval is None:
+            continue
+        event_start, event_end = interval
+        if event_start >= end or event_end <= start:
+            continue
+        summary = str(event.get("summary") or "Untitled event").strip()
+        conflicts.append(
+            f"{summary} ("
+            f"{_format_local_datetime(event_start, timezone)} to "
+            f"{_format_local_datetime(event_end, timezone)})"
+        )
+    return conflicts
+
+
+def _recent_created_calendar_event(
+    state: ChatState,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return the most recent trusted Calendar create result in history."""
+
+    user_id = state.get("user_id")
+    conversation_id = state.get("conversation_id")
+    for message in reversed(state.get("messages", [])):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        metadata = message.get("metadata")
+        proposal = (
+            metadata.get("action_approval")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if not isinstance(proposal, dict):
+            continue
+        if proposal.get("action_type") != "calendar.create_event":
+            continue
+        if str(proposal.get("user_id")) != str(user_id):
+            continue
+        if str(proposal.get("conversation_id")) != str(conversation_id):
+            continue
+        if proposal.get("status") != "completed":
+            continue
+        result = proposal.get("result")
+        event_id = None
+        if isinstance(result, dict):
+            candidate = result.get("google_event_id")
+            if isinstance(candidate, str) and candidate.strip():
+                event_id = candidate.strip()
+        if event_id is None:
+            candidate = proposal.get("calendar_event_id")
+            if isinstance(candidate, str) and candidate.strip():
+                event_id = candidate.strip()
+        if event_id is None:
+            continue
+
+        # Contextual references are intentionally short-lived.
+        completed_at_raw = proposal.get("completed_at") or proposal.get(
+            "approved_at"
+        )
+        if not isinstance(completed_at_raw, str) or not completed_at_raw.strip():
+            continue
+        try:
+            completed_at = datetime.fromisoformat(
+                completed_at_raw.replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            continue
+        if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+            continue
+        now_value = state.get("request_time")
+        if isinstance(now_value, datetime):
+            now = now_value
+        elif isinstance(now_value, str):
+            try:
+                now = datetime.fromisoformat(now_value.replace("Z", "+00:00"))
+            except ValueError:
+                now = datetime.now(timezone.utc)
+        else:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None or now.utcoffset() is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if completed_at > now + timedelta(minutes=1):
+            continue
+        if (now - completed_at).total_seconds() > 5 * 60:
+            continue
+        return proposal, event_id
+    return None, None
+
+
 def _resolve_relative_time_changes(
     event: dict[str, Any],
     changes: dict[str, Any],
@@ -1340,8 +1509,11 @@ def _prepare_event_mutation(
         and delete_details.get("delete_entire_series")
     ):
         event_id = None
+    trusted_event_ids = state.get("trusted_calendar_event_ids")
+    if not isinstance(trusted_event_ids, set):
+        trusted_event_ids = set(trusted_event_ids) if isinstance(trusted_event_ids, (list, tuple)) else set()
     latest_message = state["user_message"].casefold()
-    if isinstance(event_id, str) and event_id.casefold() not in latest_message:
+    if isinstance(event_id, str) and event_id not in trusted_event_ids and event_id.casefold() not in latest_message:
         event_id = None
     if isinstance(event_query, str):
         normalized_query = " ".join(event_query.casefold().split())
@@ -1938,6 +2110,78 @@ def _prepare_event_mutation(
     }
 
 
+def _pending_delete_title_clarification(state: ChatState) -> str | None:
+    """Return a plain event-title answer for a pending Delete clarification.
+
+    The continuation marker is added internally by the intent router.  Keeping
+    this separate from the original request prevents a generic phrase such as
+    "Delete my event" from being mistaken for the actual event title.
+    """
+    pending = state.get("pending_calendar_action")
+    action_request = state.get("calendar_action_request")
+    if (
+        not isinstance(pending, dict)
+        or pending.get("operation") != "delete"
+        or not isinstance(action_request, str)
+        or not action_request.strip()
+    ):
+        return None
+
+    matches = re.findall(
+        r"(?im)^\s*Clarification supplied by the user:\s*(.*?)\s*$",
+        action_request,
+    )
+    if not matches:
+        return None
+
+    title = matches[-1].strip().strip(' \t\"\'“”')
+    title = re.sub(r"[.?!,;]+$", "", title).strip()
+    if not title or len(title) > 250:
+        return None
+
+    normalized = " ".join(title.casefold().split())
+    generic_values = {
+        "event", "my event", "the event", "calendar event",
+        "meeting", "my meeting", "the meeting",
+        "appointment", "my appointment", "the appointment",
+        "that event", "this event",
+    }
+    if normalized in generic_values:
+        return None
+
+    # Date/time-only answers belong to occurrence disambiguation, not the
+    # event-title field.  Do not turn answers such as "tomorrow" or "10 AM"
+    # into a Calendar search query.
+    temporal_only = re.fullmatch(
+        r"(?:today|tomorrow|yesterday|tonight|this\s+week|next\s+week|"
+        r"this\s+month|next\s+month|monday|tuesday|wednesday|thursday|"
+        r"friday|saturday|sunday|"
+        r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+        r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|"
+        r"nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|"
+        r"\d{1,2}(?:st|nd|rd|th)?\s+(?:jan(?:uary)?|feb(?:ruary)?|"
+        r"mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+        r"sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{4})?|"
+        r"\d{4}-\d{2}-\d{2}|"
+        r"\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?"
+        r"(?:\s*(?:to|[-–—])\s*\d{1,2}(?::\d{2})?\s*"
+        r"(?:a\.?m\.?|p\.?m\.?)?)?)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if temporal_only:
+        return None
+
+    # A clarification must identify the event, not replace the pending action
+    # with a cancellation or a different instruction.
+    if re.match(
+        r"^(?:never\s*mind|nevermind|stop|cancel|delete|remove|update|change)\b",
+        normalized,
+    ):
+        return None
+    return title
+
+
 def calendar_agent_node(
     state: ChatState,
     runtime: Runtime[ChatContext],
@@ -2083,6 +2327,65 @@ def calendar_agent_node(
         arguments = dict(planner_arguments)
         if delete_details.get("event_query"):
             arguments["event_query"] = delete_details["event_query"]
+
+        # Resolve contextual references such as "the event I just created"
+        # using the most recent trusted Calendar creation result in this
+        # conversation. This never trusts an event id from LLM text alone.
+        contextual_proposal, contextual_event_id = (
+            _recent_created_calendar_event(state)
+        )
+        if (
+            contextual_event_id is not None
+            and not (
+                isinstance(arguments.get("event_id"), str)
+                and str(arguments.get("event_id")).strip()
+            )
+            and (
+                not isinstance(arguments.get("event_query"), str)
+                or not str(arguments.get("event_query")).strip()
+                or re.search(
+                    r"\b(?:just created|you (?:just )?created|"
+                    r"i just created|that event|this event)\b",
+                    state["user_message"],
+                    re.IGNORECASE,
+                )
+            )
+        ):
+            arguments["event_id"] = contextual_event_id
+            if isinstance(contextual_proposal, dict):
+                params = contextual_proposal.get("parameters")
+                if isinstance(params, dict):
+                    if (
+                        not isinstance(arguments.get("calendar_id"), str)
+                        or not arguments.get("calendar_id")
+                    ) and isinstance(params.get("calendar_id"), str):
+                        arguments["calendar_id"] = params["calendar_id"]
+                    if (
+                        not isinstance(arguments.get("time_zone"), str)
+                        or not arguments.get("time_zone")
+                    ) and isinstance(params.get("time_zone"), str):
+                        arguments["time_zone"] = params["time_zone"]
+                    if not isinstance(arguments.get("event_query"), str):
+                        summary = params.get("summary")
+                        if isinstance(summary, str) and summary.strip():
+                            arguments["event_query"] = summary
+            state = {
+                **state,
+                "trusted_calendar_event_ids": {contextual_event_id},
+            }
+
+        clarification_title = _pending_delete_title_clarification(state)
+        current_query = arguments.get("event_query")
+        generic_queries = {
+            "event", "my event", "the event", "calendar event",
+            "meeting", "my meeting", "the meeting",
+            "appointment", "my appointment", "the appointment",
+        }
+        if clarification_title and (
+            not isinstance(current_query, str)
+            or " ".join(current_query.casefold().split()) in generic_queries
+        ):
+            arguments["event_query"] = clarification_title
         if delete_details.get("calendar_id"):
             arguments["calendar_id"] = delete_details["calendar_id"]
             arguments.pop("calendar_name", None)
@@ -2679,6 +2982,188 @@ def calendar_agent_node(
             proposal_result["calendar_proposal_supersedes_id"] = (
                 supersedes_proposal_id
             )
+        return proposal_result
+
+    if tool_name == "create_event_after_availability_check":
+        combined_arguments = (
+            arguments if isinstance(arguments, dict) else {}
+        )
+        parameters_payload = combined_arguments.get("parameters")
+        context = runtime.context
+        user_id = context.get("user_id")
+        event_connection_id = context.get("calendar_event_connection_id")
+        time_zone = (
+            combined_arguments.get("time_zone")
+            or state.get("user_timezone")
+            or "UTC"
+        )
+        calendar_id = combined_arguments.get("calendar_id") or "primary"
+        time_min = combined_arguments.get("time_min")
+        time_max = combined_arguments.get("time_max")
+        if not user_id or not event_connection_id:
+            response = (
+                "I couldn’t check your Google Calendar because event-read "
+                "access is unavailable. Nothing was created."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+        if not isinstance(parameters_payload, dict):
+            response = (
+                "I couldn’t safely validate the event details for that "
+                "Calendar request. Nothing was created."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+        try:
+            calendar_parameters = CalendarCreateEventParameters.model_validate(
+                parameters_payload
+            )
+        except ValidationError:
+            response = (
+                "I couldn’t safely validate the event details for that "
+                "Calendar request. Nothing was created."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+        try:
+            tools = create_calendar_tools(
+                user_id=user_id,
+                connection_id=event_connection_id,
+                freebusy_connection_id=(
+                    context.get("calendar_freebusy_connection_id")
+                ),
+                include_event_tools=True,
+                include_freebusy_tool=bool(
+                    context.get("calendar_freebusy_connection_id")
+                ),
+                request_time=context.get("request_time"),
+            )
+            list_tool = next(
+                (tool for tool in tools if tool.name == "list_calendar_events"),
+                None,
+            )
+            if list_tool is None:
+                raise LookupError("Calendar event listing is unavailable.")
+            tool_output = asyncio.run(list_tool.ainvoke({
+                "time_min": time_min,
+                "time_max": time_max,
+                "time_zone": time_zone,
+                "calendar_id": calendar_id,
+                "max_results": 100,
+            }))
+            envelope = json.loads(tool_output)
+        except Exception as exc:
+            logger.warning(
+                "Calendar day availability check failed | user_id=%s | "
+                "error_type=%s",
+                user_id,
+                type(exc).__name__,
+            )
+            response = (
+                "I couldn’t check your Google Calendar for that time, so I "
+                "did not prepare an event. Nothing was created."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+        if not envelope.get("ok"):
+            error = envelope.get("error")
+            response = (
+                error.get("message")
+                if isinstance(error, dict)
+                and isinstance(error.get("message"), str)
+                else (
+                    "I couldn’t check your Google Calendar for that time, so "
+                    "I did not prepare an event. Nothing was created."
+                )
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+        data = envelope.get("data")
+        events = data.get("events") if isinstance(data, dict) else None
+        if not isinstance(events, list):
+            response = (
+                "Google Calendar returned an incomplete day view, so I did "
+                "not prepare an event. Nothing was created."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+        requested_start = datetime.fromisoformat(
+            calendar_parameters.start.replace("Z", "+00:00")
+        )
+        requested_end = datetime.fromisoformat(
+            calendar_parameters.end.replace("Z", "+00:00")
+        )
+        conflicts = _calendar_conflict_lines(
+            events,
+            requested_start,
+            requested_end,
+            time_zone,
+        )
+        if conflicts:
+            conflict_text = "; ".join(conflicts[:5])
+            response = (
+                "I checked your Google Calendar for that time and found a "
+                f"conflict: {conflict_text}. I did not create the event. "
+                "Choose another time and I’ll check again."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+        proposal_result = _create_event_proposal(
+            state,
+            runtime,
+            calendar_parameters.model_dump(mode="json"),
+        )
+        if proposal_result.get("calendar_create_event_proposal") is not None:
+            proposal_result["calendar_availability_checked"] = True
         return proposal_result
 
     context = runtime.context

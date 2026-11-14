@@ -1,7 +1,7 @@
 import asyncio
 import json
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
@@ -74,6 +74,359 @@ def test_recurring_series_delete_does_not_fall_back_to_occurrence(
     )
     assert "calendar_action_proposal" not in result
     service.get_event.assert_not_awaited()
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_contextual_delete_resolves_trusted_event_id_from_completed_create(
+    monkeypatch,
+):
+    trusted_event = _update_event(
+        "trusted-event-id",
+        "Gym",
+        "2026-11-15T09:00:00+05:30",
+        "2026-11-15T10:00:00+05:30",
+    )
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": []}),
+        validate_event_write_access=AsyncMock(return_value=trusted_event),
+    )
+    monkeypatch.setattr(calendar_agent_node, "CalendarService", lambda _db: service)
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", lambda: nullcontext(object()))
+
+    completed_proposal = {
+        "proposal_id": "create-proposal-1",
+        "user_id": USER_ID,
+        "conversation_id": "conversation-1",
+        "action_type": "calendar.create_event",
+        "status": "completed",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "result": {"outcome": "created", "google_event_id": "trusted-event-id"},
+        "parameters": {
+            "calendar_id": "primary",
+            "summary": "Gym",
+            "start": "2026-11-15T09:00:00+05:30",
+            "end": "2026-11-15T10:00:00+05:30",
+            "time_zone": "Asia/Kolkata",
+        },
+    }
+    state = _state("delete_calendar_event_proposal", {})
+    state["user_message"] = "Delete the event I just created."
+    state["user_id"] = USER_ID
+    state["conversation_id"] = "conversation-1"
+    state["user_timezone"] = "Asia/Kolkata"
+    state["messages"] = [
+        {"role": "assistant", "content": "created", "metadata": {"action_approval": completed_proposal}},
+    ]
+    state["assistant_capabilities"] = {
+        "google_calendar": {"write_permission_granted": True},
+    }
+    runtime = _runtime(
+        user_id=USER_ID,
+        calendar_write_connection_id=EVENT_CONNECTION_ID,
+        calendar_event_connection_id=EVENT_CONNECTION_ID,
+        google_connection_available=True,
+        calendar_enabled=True,
+    )
+    result = run_node(state, runtime)
+
+    assert "calendar_action_proposal" in result
+    proposal = result["calendar_action_proposal"]["parameters"]
+    assert proposal["event_id"] == "trusted-event-id"
+    assert proposal["action_type"] if "action_type" in proposal else True
+    service.validate_event_write_access.assert_awaited()
+
+
+def test_contextual_delete_missing_trusted_event_id_does_not_resolve(
+    monkeypatch,
+):
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": []}),
+        validate_event_write_access=AsyncMock(),
+    )
+    monkeypatch.setattr(calendar_agent_node, "CalendarService", lambda _db: service)
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", lambda: nullcontext(object()))
+
+    completed_proposal = {
+        "proposal_id": "create-proposal-2",
+        "user_id": USER_ID,
+        "conversation_id": "conversation-1",
+        "action_type": "calendar.create_event",
+        "status": "completed",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "result": {"outcome": "created"},  # no google_event_id
+        "parameters": {"calendar_id": "primary", "summary": "Gym"},
+    }
+    state = _state("delete_calendar_event_proposal", {})
+    state["user_message"] = "Delete the event I just created."
+    state["user_id"] = USER_ID
+    state["conversation_id"] = "conversation-1"
+    state["user_timezone"] = "Asia/Kolkata"
+    state["messages"] = [
+        {"role": "assistant", "content": "created", "metadata": {"action_approval": completed_proposal}},
+    ]
+    state["assistant_capabilities"] = {
+        "google_calendar": {"write_permission_granted": True},
+    }
+    runtime = _runtime(
+        user_id=USER_ID,
+        calendar_write_connection_id=EVENT_CONNECTION_ID,
+        calendar_event_connection_id=EVENT_CONNECTION_ID,
+        google_connection_available=True,
+        calendar_enabled=True,
+    )
+    result = run_node(state, runtime)
+
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_contextual_delete_wrong_user_does_not_resolve(
+    monkeypatch,
+):
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": []}),
+        validate_event_write_access=AsyncMock(),
+    )
+    monkeypatch.setattr(calendar_agent_node, "CalendarService", lambda _db: service)
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", lambda: nullcontext(object()))
+
+    completed_proposal = {
+        "proposal_id": "create-proposal-3",
+        "user_id": "other-user",
+        "conversation_id": "conversation-1",
+        "action_type": "calendar.create_event",
+        "status": "completed",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "result": {"outcome": "created", "google_event_id": "trusted-event-id"},
+        "parameters": {"calendar_id": "primary", "summary": "Gym"},
+    }
+    state = _state("delete_calendar_event_proposal", {})
+    state["user_message"] = "Delete the event I just created."
+    state["user_id"] = USER_ID
+    state["conversation_id"] = "conversation-1"
+    state["user_timezone"] = "Asia/Kolkata"
+    state["messages"] = [
+        {"role": "assistant", "content": "created", "metadata": {"action_approval": completed_proposal}},
+    ]
+    state["assistant_capabilities"] = {
+        "google_calendar": {"write_permission_granted": True},
+    }
+    runtime = _runtime(
+        user_id=USER_ID,
+        calendar_write_connection_id=EVENT_CONNECTION_ID,
+        calendar_event_connection_id=EVENT_CONNECTION_ID,
+        google_connection_available=True,
+        calendar_enabled=True,
+    )
+    result = run_node(state, runtime)
+
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_ambiguous_delete_does_not_create_proposal(
+    monkeypatch,
+):
+    event_one = _update_event(
+        "event-one",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T10:30:00+05:30",
+    )
+    event_two = _update_event(
+        "event-two",
+        "Personal AI Assistant - Calendar Test",
+        "2026-11-10T10:00:00+05:30",
+        "2026-11-10T10:30:00+05:30",
+    )
+
+    result, service = _run_mocked_calendar_delete(
+        monkeypatch,
+        [event_one, event_two],
+        event_one,
+        user_message="Delete my Personal AI Assistant - Calendar Test.",
+    )
+
+    assert "multiple possible Calendar events" in result["assistant_response"]
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_contextual_delete_wrong_conversation_does_not_resolve(
+    monkeypatch,
+):
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": []}),
+        validate_event_write_access=AsyncMock(),
+    )
+    monkeypatch.setattr(calendar_agent_node, "CalendarService", lambda _db: service)
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", lambda: nullcontext(object()))
+
+    completed_proposal = {
+        "proposal_id": "create-proposal-4",
+        "user_id": USER_ID,
+        "conversation_id": "other-conversation",
+        "action_type": "calendar.create_event",
+        "status": "completed",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "result": {"outcome": "created", "google_event_id": "trusted-event-id"},
+        "parameters": {"calendar_id": "primary", "summary": "Gym"},
+    }
+    state = _state("delete_calendar_event_proposal", {})
+    state["user_message"] = "Delete the event I just created."
+    state["user_id"] = USER_ID
+    state["conversation_id"] = "conversation-1"
+    state["user_timezone"] = "Asia/Kolkata"
+    state["messages"] = [
+        {"role": "assistant", "content": "created", "metadata": {"action_approval": completed_proposal}},
+    ]
+    state["assistant_capabilities"] = {
+        "google_calendar": {"write_permission_granted": True},
+    }
+    runtime = _runtime(
+        user_id=USER_ID,
+        calendar_write_connection_id=EVENT_CONNECTION_ID,
+        calendar_event_connection_id=EVENT_CONNECTION_ID,
+        google_connection_available=True,
+        calendar_enabled=True,
+    )
+    result = run_node(state, runtime)
+
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_contextual_delete_expired_context_does_not_resolve(
+    monkeypatch,
+):
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": []}),
+        validate_event_write_access=AsyncMock(),
+    )
+    monkeypatch.setattr(calendar_agent_node, "CalendarService", lambda _db: service)
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", lambda: nullcontext(object()))
+
+    expired = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    completed_proposal = {
+        "proposal_id": "create-proposal-5",
+        "user_id": USER_ID,
+        "conversation_id": "conversation-1",
+        "action_type": "calendar.create_event",
+        "status": "completed",
+        "completed_at": expired,
+        "result": {"outcome": "created", "google_event_id": "trusted-event-id"},
+        "parameters": {"calendar_id": "primary", "summary": "Gym"},
+    }
+    state = _state("delete_calendar_event_proposal", {})
+    state["user_message"] = "Delete the event I just created."
+    state["user_id"] = USER_ID
+    state["conversation_id"] = "conversation-1"
+    state["user_timezone"] = "Asia/Kolkata"
+    state["messages"] = [
+        {"role": "assistant", "content": "created", "metadata": {"action_approval": completed_proposal}},
+    ]
+    state["assistant_capabilities"] = {
+        "google_calendar": {"write_permission_granted": True},
+    }
+    runtime = _runtime(
+        user_id=USER_ID,
+        calendar_write_connection_id=EVENT_CONNECTION_ID,
+        calendar_event_connection_id=EVENT_CONNECTION_ID,
+        google_connection_available=True,
+        calendar_enabled=True,
+    )
+    result = run_node(state, runtime)
+
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_contextual_delete_approved_not_completed_does_not_resolve(
+    monkeypatch,
+):
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": []}),
+        validate_event_write_access=AsyncMock(),
+    )
+    monkeypatch.setattr(calendar_agent_node, "CalendarService", lambda _db: service)
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", lambda: nullcontext(object()))
+
+    approved_proposal = {
+        "proposal_id": "create-proposal-6",
+        "user_id": USER_ID,
+        "conversation_id": "conversation-1",
+        "action_type": "calendar.create_event",
+        "status": "approved",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "result": {"outcome": "created", "google_event_id": "trusted-event-id"},
+        "parameters": {"calendar_id": "primary", "summary": "Gym"},
+    }
+    state = _state("delete_calendar_event_proposal", {})
+    state["user_message"] = "Delete the event I just created."
+    state["user_id"] = USER_ID
+    state["conversation_id"] = "conversation-1"
+    state["user_timezone"] = "Asia/Kolkata"
+    state["messages"] = [
+        {"role": "assistant", "content": "created", "metadata": {"action_approval": approved_proposal}},
+    ]
+    state["assistant_capabilities"] = {
+        "google_calendar": {"write_permission_granted": True},
+    }
+    runtime = _runtime(
+        user_id=USER_ID,
+        calendar_write_connection_id=EVENT_CONNECTION_ID,
+        calendar_event_connection_id=EVENT_CONNECTION_ID,
+        google_connection_available=True,
+        calendar_enabled=True,
+    )
+    result = run_node(state, runtime)
+
+    assert "calendar_action_proposal" not in result
+    service.validate_event_write_access.assert_not_awaited()
+
+
+def test_contextual_delete_future_timestamp_does_not_resolve(
+    monkeypatch,
+):
+    service = SimpleNamespace(
+        list_events=AsyncMock(return_value={"events": []}),
+        validate_event_write_access=AsyncMock(),
+    )
+    monkeypatch.setattr(calendar_agent_node, "CalendarService", lambda _db: service)
+    monkeypatch.setattr(calendar_agent_node, "SessionLocal", lambda: nullcontext(object()))
+
+    future = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    completed_proposal = {
+        "proposal_id": "create-proposal-7",
+        "user_id": USER_ID,
+        "conversation_id": "conversation-1",
+        "action_type": "calendar.create_event",
+        "status": "completed",
+        "completed_at": future,
+        "result": {"outcome": "created", "google_event_id": "trusted-event-id"},
+        "parameters": {"calendar_id": "primary", "summary": "Gym"},
+    }
+    state = _state("delete_calendar_event_proposal", {})
+    state["user_message"] = "Delete the event I just created."
+    state["user_id"] = USER_ID
+    state["conversation_id"] = "conversation-1"
+    state["user_timezone"] = "Asia/Kolkata"
+    state["messages"] = [
+        {"role": "assistant", "content": "created", "metadata": {"action_approval": completed_proposal}},
+    ]
+    state["assistant_capabilities"] = {
+        "google_calendar": {"write_permission_granted": True},
+    }
+    runtime = _runtime(
+        user_id=USER_ID,
+        calendar_write_connection_id=EVENT_CONNECTION_ID,
+        calendar_event_connection_id=EVENT_CONNECTION_ID,
+        google_connection_available=True,
+        calendar_enabled=True,
+    )
+    result = run_node(state, runtime)
+
+    assert "calendar_action_proposal" not in result
     service.validate_event_write_access.assert_not_awaited()
 
 

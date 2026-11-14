@@ -5,7 +5,9 @@ from uuid import uuid4
 from app.services.user_connection_service import UserConnectionService, settings
 
 
-def test_list_connections_reports_service_capabilities_from_granted_scopes():
+def test_list_connections_reports_service_capabilities_from_granted_scopes(
+    calendar_write_flags_disabled,
+):
     user_id = uuid4()
     gmail_connection = SimpleNamespace(
         id=uuid4(),
@@ -89,7 +91,9 @@ def test_list_connections_reports_service_capabilities_from_granted_scopes():
     }
 
 
-def test_list_connections_does_not_report_non_google_as_gmail():
+def test_list_connections_does_not_report_non_google_as_gmail(
+    calendar_write_flags_disabled,
+):
     user_id = uuid4()
     connection = SimpleNamespace(
         id=uuid4(),
@@ -133,7 +137,9 @@ def test_list_connections_does_not_report_non_google_as_gmail():
     credentials.get_by_connection.assert_not_called()
 
 
-def test_list_connections_reports_both_services_only_when_both_scopes_are_granted():
+def test_list_connections_reports_both_services_only_when_both_scopes_are_granted(
+    calendar_write_flags_disabled,
+):
     user_id = uuid4()
     connection = SimpleNamespace(
         id=uuid4(),
@@ -190,7 +196,9 @@ def test_list_connections_reports_both_services_only_when_both_scopes_are_grante
     )
 
 
-def test_legacy_calendar_events_grant_is_partial_and_requests_new_consent():
+def test_legacy_calendar_events_grant_is_partial_and_requests_new_consent(
+    calendar_write_flags_disabled,
+):
     user_id = uuid4()
     connection = SimpleNamespace(
         id=uuid4(),

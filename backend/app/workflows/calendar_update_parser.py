@@ -112,7 +112,50 @@ def _label_value(text: str, *labels: str) -> str | None:
     return None
 
 
+def _parse_duration_minutes(text: str) -> int | None:
+    duration_match = re.search(
+        r"\bduration\b.*?\bto\s+(?P<expr>.+?)(?:[.?!]|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if duration_match is None:
+        duration_match = re.search(
+            r"\bduration\b\s*(?::|=)?\s*(?P<expr>.+?)(?:[.?!]|$)",
+            text,
+            re.IGNORECASE,
+        )
+    if duration_match is None:
+        return None
+    expr = duration_match.group("expr")
+    hours_match = re.search(r"(\d+)\s*(?:hours?|hrs?|h)\b", expr, re.IGNORECASE)
+    minutes_match = re.search(
+        r"(\d+)\s*(?:minutes?|mins?|m)\b", expr, re.IGNORECASE
+    )
+    total = 0
+    if hours_match:
+        total += int(hours_match.group(1)) * 60
+    if minutes_match:
+        total += int(minutes_match.group(1))
+    if total <= 0:
+        # Fall back to a bare number followed by a unit anywhere in the text.
+        bare = re.search(
+            r"\bto\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\b",
+            text,
+            re.IGNORECASE,
+        )
+        if bare:
+            value = int(bare.group(1))
+            unit = bare.group(2).casefold()
+            total = value * 60 if unit.startswith("hour") or unit.startswith("hr") else value
+    return total if total > 0 else None
+
+
 def _clean_title(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip().strip(' \t\"\'“”')
+    value = re.sub(r"[.?!,;]+$", "", value).strip()
+    return value or None
     if value is None:
         return None
     value = value.strip().strip(' \t\"\'“”')
@@ -159,6 +202,26 @@ def _extract_event_query(text: str) -> str | None:
     )
     if recurring_series:
         return _clean_title(recurring_series.group("title"))
+
+    contextual_descriptor = re.search(
+        r"\b(?:my|the)\s+"
+        r"(?P<descriptor>[A-Za-z][\w'-]{0,40})\s+"
+        r"(?:event|meeting|appointment|discussion)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if contextual_descriptor:
+        descriptor = _clean_title(contextual_descriptor.group("descriptor"))
+        if (
+            descriptor
+            and descriptor.casefold() not in {"my", "the", "calendar"}
+            and not re.search(
+                r"\b(?:calendar|google|existing|update|change)\b",
+                descriptor,
+                re.IGNORECASE,
+            )
+        ):
+            return descriptor
 
     generic_meeting = re.search(
         r"\b(?:my|the)\s+(?:calendar\s+)?"
@@ -501,6 +564,45 @@ def _parse_calendar_request_details(
     explicit_field_changes = _extract_field_changes(text)
     if explicit_field_changes:
         changes = {**(changes or {}), **explicit_field_changes}
+    duration_minutes = _parse_duration_minutes(text)
+    if duration_minutes is not None and original_start is None:
+        errors.append("The existing event start time is required.")
+
+    if (
+        proposed_start is not None
+        and proposed_end is None
+        and original_start is not None
+        and original_end is not None
+    ):
+        if original_end <= original_start:
+            duration_seconds = (
+                datetime.combine(date.min, original_end)
+                + timedelta(days=1)
+                - datetime.combine(date.min, original_start)
+            ).total_seconds()
+        else:
+            duration_seconds = (
+                datetime.combine(date.min, original_end)
+                - datetime.combine(date.min, original_start)
+            ).total_seconds()
+        if duration_seconds > 0:
+            proposed_end = (
+                datetime.combine(date.min, proposed_start)
+                + timedelta(seconds=duration_seconds)
+            ).time()
+
+    if (
+        duration_minutes is not None
+        and original_start is not None
+        and proposed_start is None
+        and proposed_end is None
+    ):
+        proposed_start = original_start
+        proposed_end = (
+            datetime.combine(date.min, original_start)
+            + timedelta(minutes=duration_minutes)
+        ).time()
+
     if proposed_start is not None and proposed_end is not None:
         if event_date is None:
             errors.append("A date is required for the proposed time range.")
