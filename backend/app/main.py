@@ -1,4 +1,14 @@
 
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load local environment variables before importing application modules so
+# LangSmith/LangChain tracing configuration is available to the process.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
+
 import time
 from uuid import UUID, uuid4
 

@@ -814,6 +814,17 @@ class ChatService:
 
             if (
                 current_request
+                and current_request.get("user_message_id")
+                and current_request.get("assistant_message_id")
+            ):
+                return self._get_completed_response(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    request=current_request,
+                )
+
+            if (
+                current_request
                 and current_request.get("execution_started_at")
             ):
                 raise ChatRequestUncertainError(
