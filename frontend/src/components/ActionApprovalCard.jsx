@@ -333,6 +333,7 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
   const [executionAttemptFailed, setExecutionAttemptFailed] = useState(false)
   const requestInProgress = useRef(false)
   const availabilityRefreshProposalId = useRef(null)
+  const latestProposalFetchId = useRef(0)
   useEffect(() => {
     if (proposal.status !== 'pending') return undefined
 
@@ -405,17 +406,41 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       const fallback = isCalendarAction
         ? 'The Calendar change outcome could not be confirmed.'
         : 'The Gmail send outcome could not be confirmed.'
-      setError(formatRequestError(mutationError, fallback))
-      setExecutionAttemptFailed(true)
+      const isNetworkFailure = Boolean(mutationError?.networkFailure)
+      setError(
+        isNetworkFailure
+          ? `${formatRequestError(mutationError, fallback)} The outcome is unconfirmed; check status before taking further action.`
+          : formatRequestError(mutationError, fallback),
+      )
+      // Network/transport failures do not prove execution failed; outcome may be
+      // uncertain or later reconciled. Avoid marking as a confirmed failure.
+      setExecutionAttemptFailed(!isNetworkFailure)
+      const fetchId = ++latestProposalFetchId.current
       try {
         const latest = await actionApprovalService.getProposal(
           proposal.proposal_id,
         )
+        if (fetchId !== latestProposalFetchId.current) return
         updateProposalMessage(message, latest, onUpdated)
-        if (isCalendarAction && latest.execution_available === false) {
+        if (
+          ['completed', 'failed', 'execution_uncertain', 'executing', 'rejected', 'expired'].includes(
+            latest?.status,
+          )
+        ) {
+          // Authoritative backend state supersedes client-side attempt inference.
+          setExecutionAttemptFailed(false)
+        } else if (isCalendarAction && latest.execution_available === false) {
           setError('')
           setExecutionAttemptFailed(false)
+        } else if (isNetworkFailure) {
+          // Approved (or other non-terminal) after a network failure: outcome unknown.
+          setExecutionAttemptFailed(false)
+          setError(
+            `${formatRequestError(mutationError, fallback)} The outcome is unconfirmed; check status before taking further action.`,
+          )
         }
+        // For non-network failures where status remains approved, keep attempt-failed UI
+        // unless backend reports execution unavailable (handled above).
       } catch (statusError) {
         setError(
           `${formatRequestError(mutationError, fallback)} Status check failed: ${formatRequestError(
@@ -433,9 +458,13 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
   })
 
   const statusMutation = useMutation({
-    mutationFn: () =>
-      actionApprovalService.getProposal(proposal.proposal_id),
-    onSuccess: (latest) => {
+    mutationFn: () => {
+      const fetchId = ++latestProposalFetchId.current
+      return actionApprovalService.getProposal(proposal.proposal_id)
+        .then((latest) => ({ latest, fetchId }))
+    },
+    onSuccess: ({ latest, fetchId }) => {
+      if (fetchId !== latestProposalFetchId.current) return
       setError('')
       updateProposalMessage(message, latest, onUpdated)
     },

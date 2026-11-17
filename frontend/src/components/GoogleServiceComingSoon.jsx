@@ -5,11 +5,12 @@ import { isGoogleServiceConnected } from '../lib/googleServiceCapabilities.js'
 const serviceDetails = {
   drive: {
     title: 'Google Drive',
-    description: 'Drive integration is not implemented yet.',
+    description:
+      'Google Drive integration is coming soon and is temporarily unavailable. It will be available in a future update.',
     planned: [
-      'File listing and folder navigation',
-      'Search and file details',
-      'Upload, download, and file organization',
+      'Select contracts and documents you choose to share',
+      'Ask questions about selected files in a read-only, grounded workflow',
+      'Clear permission and account controls before activation',
     ],
   },
   contacts: {

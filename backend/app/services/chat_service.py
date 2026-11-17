@@ -8,6 +8,9 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 from app.core.error_logging import log_exception_traceback
+from app.core.config import settings
+from app.core.diagnostics import lifecycle_event
+from app.core.request_metrics import current_request_metrics
 from app.memory.memory_pipeline import MemoryPipeline
 from app.services.user_settings_service import UserSettingsService
 from app.workflows.calendar_update_parser import (
@@ -72,8 +75,12 @@ class ChatService:
         gmail_connection_id: UUID | None = None,
         user_timezone: str = "UTC",
         default_calendar_connection_id: str | None = None,
+        default_contacts_connection_id: str | None = None,
+        default_drive_connection_id: str | None = None,
         gmail_enabled: bool = True,
         calendar_enabled: bool = True,
+        contacts_enabled: bool = True,
+        drive_enabled: bool = True,
     ) -> str:
         """Generate a deterministic SHA-256 fingerprint."""
 
@@ -89,10 +96,22 @@ class ChatService:
             payload["default_calendar_connection_id"] = (
                 str(default_calendar_connection_id)
             )
+        if default_contacts_connection_id:
+            payload["default_contacts_connection_id"] = (
+                str(default_contacts_connection_id)
+            )
+        if default_drive_connection_id:
+            payload["default_drive_connection_id"] = (
+                str(default_drive_connection_id)
+            )
         if not gmail_enabled:
             payload["gmail_enabled"] = False
         if not calendar_enabled:
             payload["calendar_enabled"] = False
+        if not contacts_enabled:
+            payload["contacts_enabled"] = False
+        if not drive_enabled:
+            payload["drive_enabled"] = False
 
         canonical_payload = json.dumps(
             payload,
@@ -235,6 +254,62 @@ class ChatService:
         return None
 
     @staticmethod
+    def _pending_contacts_clarification(
+        history: list[dict[str, Any]],
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        for message in reversed(history):
+            if message.get("role") != "assistant":
+                continue
+            metadata = message.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            pending = metadata.get("pending_contacts_clarification")
+            if pending is None:
+                # explicit clear in latest assistant message means no active clarification
+                if "pending_contacts_clarification" in metadata:
+                    return None
+                continue
+            if not isinstance(pending, dict):
+                return None
+            if (
+                pending.get("version") != 1
+                or pending.get("type") != "contacts_read_clarification"
+                or str(pending.get("user_id")) != str(user_id)
+                or str(pending.get("conversation_id")) != str(conversation_id)
+            ):
+                return None
+            try:
+                expires_at = datetime.fromisoformat(
+                    str(pending.get("expires_at")).replace("Z", "+00:00")
+                )
+            except Exception:
+                return None
+            if (
+                expires_at.tzinfo is None
+                or expires_at.astimezone(timezone.utc)
+                <= now.astimezone(timezone.utc)
+            ):
+                return None
+            candidates = pending.get("candidates")
+            if not isinstance(candidates, list) or not candidates:
+                return None
+            # Trusted candidates must contain server-verified resource names.
+            valid = True
+            for c in candidates:
+                rn = c.get("resource_name") if isinstance(c, dict) else None
+                if not isinstance(rn, str) or not rn.startswith("people/"):
+                    valid = False
+                    break
+            if not valid:
+                return None
+            return pending
+        return None
+
+    @staticmethod
     def _pending_calendar_availability(
         history: list[dict[str, Any]],
         *,
@@ -274,6 +349,203 @@ class ChatService:
                 return None
             return pending
         return None
+
+    @staticmethod
+    def _pending_calendar_delete_selection(
+        history: list[dict[str, Any]],
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        for message in reversed(history):
+            if message.get("role") != "assistant":
+                continue
+            metadata = message.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            pending = metadata.get("pending_calendar_delete_selection")
+            if pending is None:
+                if "pending_calendar_delete_selection" in metadata:
+                    return None
+                continue
+            if not isinstance(pending, dict):
+                return None
+            if (
+                pending.get("version") != 1
+                or pending.get("operation") != "delete_selection"
+                or str(pending.get("user_id")) != str(user_id)
+                or str(pending.get("conversation_id")) != str(conversation_id)
+            ):
+                return None
+            try:
+                expires_at = datetime.fromisoformat(
+                    str(pending.get("expires_at")).replace("Z", "+00:00")
+                )
+            except Exception:
+                return None
+            if (
+                expires_at.tzinfo is None
+                or expires_at.astimezone(timezone.utc)
+                <= now.astimezone(timezone.utc)
+            ):
+                return None
+            candidates = pending.get("candidates")
+            if not isinstance(candidates, list) or not candidates:
+                return None
+            valid = True
+            for c in candidates:
+                if not isinstance(c, dict):
+                    valid = False
+                    break
+                event_id = c.get("event_id")
+                cal_id = c.get("calendar_id")
+                if not isinstance(event_id, str) or not event_id.strip():
+                    valid = False
+                    break
+                if not isinstance(cal_id, str) or not cal_id.strip():
+                    valid = False
+                    break
+            if not valid:
+                return None
+            return pending
+        return None
+
+    @staticmethod
+    def _pending_calendar_read(
+        history: list[dict[str, Any]],
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        for item in reversed(history):
+            if item.get("role") != "assistant":
+                continue
+            metadata = item.get("metadata") or {}
+            pending = metadata.get("pending_calendar_read")
+            if pending is None:
+                if "pending_calendar_read" in metadata:
+                    return None
+                continue
+            if not isinstance(pending, dict):
+                continue
+            if pending.get("version") != 1 or pending.get("type") != "calendar_read_continuation":
+                continue
+            try:
+                expires_at = datetime.fromisoformat(str(pending.get("expires_at")).replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if expires_at.tzinfo is None or expires_at.astimezone(timezone.utc) <= now:
+                continue
+            if str(pending.get("user_id")) != str(user_id) or str(pending.get("conversation_id")) != str(conversation_id):
+                continue
+            return pending
+        return None
+
+    def _hydrate_action_approval_metadata(
+        self,
+        history: list[dict[str, Any]],
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+    ) -> list[dict[str, Any]]:
+        """Refresh assistant-message approval metadata from the source of truth.
+
+        Approval execution/completion happens outside the chat request path. The
+        stored conversation message metadata can therefore become stale. For
+        follow-up turns (e.g. contextual delete of a just-created event), the
+        workflow must see the latest trusted completed status/result while
+        preserving user and conversation isolation.
+        """
+        if not history or self.user_connection_service is None:
+            return history
+        db = getattr(self.user_connection_service, "db", None)
+        if db is None:
+            return history
+
+        approval_service = ActionApprovalService(db)
+        hydrated: list[dict[str, Any]] = []
+        cache: dict[str, dict[str, Any] | None] = {}
+        for message in history:
+            metadata = message.get("metadata")
+            proposal = metadata.get("action_approval") if isinstance(metadata, dict) else None
+            if not isinstance(proposal, dict):
+                hydrated.append(message)
+                continue
+            raw_id = proposal.get("id") or proposal.get("proposal_id")
+            if raw_id is None:
+                hydrated.append(message)
+                continue
+            try:
+                proposal_uuid = UUID(str(raw_id))
+            except Exception:
+                hydrated.append(message)
+                continue
+            cache_key = str(proposal_uuid)
+            if cache_key not in cache:
+                try:
+                    latest = approval_service.get_proposal(user_id, proposal_uuid)
+                    latest_data = latest.model_dump(mode="json")
+                except Exception:
+                    latest_data = None
+                cache[cache_key] = latest_data
+            latest_data = cache[cache_key]
+            if not isinstance(latest_data, dict):
+                hydrated.append(message)
+                continue
+            # Only merge proposals that belong to this conversation and user.
+            if str(latest_data.get("conversation_id")) != str(conversation_id):
+                hydrated.append(message)
+                continue
+            if str(latest_data.get("user_id")) != str(user_id):
+                hydrated.append(message)
+                continue
+            merged_metadata = dict(metadata)
+            merged_metadata["action_approval"] = latest_data
+            hydrated.append({**message, "metadata": merged_metadata})
+        return hydrated
+
+    @staticmethod
+    def _pending_gmail_clarification(
+        history: list[dict[str, Any]],
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        for item in reversed(history):
+            if item.get("role") != "assistant":
+                continue
+            metadata = item.get("metadata") or {}
+            pending = metadata.get("pending_gmail_clarification")
+            if pending is None:
+                if "pending_gmail_clarification" in metadata:
+                    return None
+                continue
+            if not isinstance(pending, dict):
+                continue
+            if pending.get("version") != 1 or pending.get("type") not in {
+                "gmail_date_range_clarification",
+                "gmail_search_fallback_clarification",
+            }:
+                continue
+            if (
+                str(pending.get("user_id")) != str(user_id)
+                or str(pending.get("conversation_id")) != str(conversation_id)
+            ):
+                continue
+            try:
+                expires_at = datetime.fromisoformat(
+                    str(pending.get("expires_at")).replace("Z", "+00:00")
+                )
+            except Exception:
+                continue
+            if expires_at.tzinfo is None or expires_at.astimezone(timezone.utc) <= now.astimezone(timezone.utc):
+                continue
+            return pending
+        return None
+
 
     @staticmethod
     def _pending_calendar_action(
@@ -354,6 +626,16 @@ class ChatService:
             return None
 
         clarification = response.casefold()
+        # Terminal "no events / no match" outcomes are not actionable follow-ups;
+        # persisting them as pending calendar actions can leak stale state into
+        # unrelated future requests.
+        if re.search(
+            r"\b(?:no events were found|couldn't find any events|couldn['’]?t find any events|"
+            r"couldn't find an existing calendar event|couldn['’]?t find an existing calendar event|"
+            r"no matching event was found)\b",
+            clarification,
+        ):
+            return None
         if not re.search(
             r"\b(?:which|what|please\s+(?:specify|include|provide|clarify)|"
             r"multiple possible|couldn['’]?t find|didn['’]?t find|"
@@ -441,6 +723,94 @@ class ChatService:
         if isinstance(draft, dict):
             pending_action["calendar_create_draft"] = draft
         return pending_action
+
+    def get_chat_request_status(
+        self,
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        idempotency_key: UUID,
+    ) -> dict[str, Any]:
+        """Return idempotent request status/result scoped to the authenticated user/conversation.
+
+        This enables safe client recovery after transport timeouts without creating
+        duplicate executions. Completed results are reconstructed from persisted
+        request-linked messages when available.
+        """
+        request = self.request_repository.get_request(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            idempotency_key=idempotency_key,
+        )
+        if request is None:
+            raise LookupError("Chat request not found.")
+
+        status = str(request.get("status") or "")
+        payload: dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "idempotency_key": idempotency_key,
+            "status": status,
+            "response": None,
+            "error_message": request.get("error_message"),
+        }
+
+        if status == "completed":
+            try:
+                payload["response"] = self._get_completed_response(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    request=request,
+                )
+            except Exception:
+                # Request marked completed but messages not yet reconstructable; treat as processing/reconciling.
+                payload["status"] = "processing"
+                payload["error_message"] = None
+        elif status == "processing":
+            # Best-effort reconciliation if assistant message was persisted but request not finalized.
+            request_id = request.get("id")
+            user_message_id = request.get("user_message_id")
+            if request_id and user_message_id:
+                try:
+                    assistant_message = self.message_service.get_request_message(
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        chat_request_id=UUID(str(request_id)),
+                        role="assistant",
+                    )
+                except Exception:
+                    assistant_message = None
+                if assistant_message and assistant_message.get("id"):
+                    lease = request.get("lease_expires_at")
+                    lease_expired = False
+                    if lease is not None:
+                        try:
+                            if lease.tzinfo is None:
+                                lease = lease.replace(tzinfo=timezone.utc)
+                            lease_expired = lease.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+                        except Exception:
+                            lease_expired = False
+                    if lease_expired:
+                        reconciled = self.request_repository.reconcile_completed_request(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            idempotency_key=idempotency_key,
+                            user_message_id=UUID(str(user_message_id)),
+                            assistant_message_id=UUID(str(assistant_message["id"])),
+                        )
+                        if reconciled is not None:
+                            request = reconciled
+                            payload["status"] = "completed"
+                            payload["error_message"] = None
+                            try:
+                                payload["response"] = self._get_completed_response(
+                                    user_id=user_id,
+                                    conversation_id=conversation_id,
+                                    request=request,
+                                )
+                            except Exception:
+                                payload["status"] = "processing"
+                                payload["response"] = None
+        return payload
 
     def _get_completed_response(
         self,
@@ -685,8 +1055,12 @@ class ChatService:
         gmail_connection_id: UUID | None = None,
         user_timezone: str = "UTC",
         default_calendar_connection_id: str | None = None,
+        default_contacts_connection_id: str | None = None,
+        default_drive_connection_id: str | None = None,
         gmail_enabled: bool = True,
         calendar_enabled: bool = True,
+        contacts_enabled: bool = True,
+        drive_enabled: bool = True,
     ) -> dict[str, Any]:
         """Process an idempotent chat request using LangGraph."""
 
@@ -714,8 +1088,12 @@ class ChatService:
             gmail_connection_id=gmail_connection_id,
             user_timezone=user_timezone,
             default_calendar_connection_id=default_calendar_connection_id,
+            default_contacts_connection_id=default_contacts_connection_id,
+            default_drive_connection_id=default_drive_connection_id,
             gmail_enabled=gmail_enabled,
             calendar_enabled=calendar_enabled,
+            contacts_enabled=contacts_enabled,
+            drive_enabled=drive_enabled,
         )
 
         # 3. Create or retrieve the idempotent request.
@@ -866,6 +1244,11 @@ class ChatService:
                 conversation_id=conversation_id,
                 limit=100,
             )
+            history = self._hydrate_action_approval_metadata(
+                history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
             effective_gmail_connection_id = (
                 gmail_connection_id if gmail_enabled else None
             )
@@ -901,6 +1284,60 @@ class ChatService:
                     "selected_event_scope_missing": False,
                     "selected_freebusy_scope_missing": False,
                 }
+            )
+            contacts_access = (
+                self.user_connection_service.get_user_contacts_access(
+                    user_id=user_id,
+                    default_connection_id=default_contacts_connection_id,
+                )
+                if self.user_connection_service
+                else {
+                    "google_connection_available": False,
+                    "capabilities": {},
+                    "read_connection_id": None,
+                    "write_connection_id": None,
+                    "selected_connection_email": None,
+                    "default_connection_invalid": False,
+                    "default_connection_selected": False,
+                    "selection_required": False,
+                    "candidate_emails": [],
+                    "read_scope_missing": False,
+                    "write_scope_missing": False,
+                }
+            )
+            contacts_connection_id = (
+                contacts_access["read_connection_id"]
+                if contacts_enabled
+                else None
+            )
+            contacts_write_connection_id = (
+                contacts_access["write_connection_id"]
+                if contacts_enabled
+                else None
+            )
+            drive_access = (
+                self.user_connection_service.get_user_drive_access(
+                    user_id=user_id,
+                    default_connection_id=default_drive_connection_id,
+                )
+                if self.user_connection_service
+                else {
+                    "google_connection_available": False,
+                    "capabilities": {},
+                    "connection_id": None,
+                    "selected_connection_email": None,
+                    "default_connection_invalid": False,
+                    "default_connection_selected": False,
+                    "selection_required": False,
+                    "candidate_emails": [],
+                    "read_scope_missing": False,
+                    "enabled": settings.DRIVE_CONTRACTS_ENABLED,
+                }
+            )
+            drive_connection_id = (
+                drive_access["connection_id"]
+                if drive_enabled
+                else None
             )
             event_read_connection_id = (
                 calendar_access["event_read_connection_id"]
@@ -1026,6 +1463,56 @@ class ChatService:
                     if node == "integration_unavailable"
                 },
                 calendar_capabilities=calendar_capabilities,
+                drive_capabilities={
+                    "connected": False,
+                    "read": False,
+                    "contracts_read": False,
+                    "file_scope_granted": False,
+                    "write_permission_granted": False,
+                    "google_connection_available": False,
+                    "permissions_need_consent": False,
+                    "integration_enabled": False,
+                    "temporarily_unavailable": True,
+                    "selection_required": False,
+                    "default_connection_invalid": False,
+                    "default_connection_selected": False,
+                    "read_scope_missing": False,
+                    "chat_available": False,
+                },
+                contacts_capabilities={
+                    **contacts_access["capabilities"],
+                    "integration_enabled": contacts_enabled,
+                    "connected": bool(
+                        contacts_access.get("read_connection_id")
+                        or contacts_access.get("write_connection_id")
+                    ),
+                    "google_connection_available": (
+                        contacts_access["google_connection_available"]
+                    ),
+                    "chat_available": bool(
+                        contacts_enabled
+                        and contacts_access.get("read_connection_id")
+                        and settings.CONTACTS_READ_ENABLED
+                    ),
+                    "selection_required": bool(
+                        contacts_enabled
+                        and contacts_access.get("selection_required")
+                    ),
+                    "default_connection_invalid": bool(
+                        contacts_access.get("default_connection_invalid")
+                    ),
+                    "default_connection_selected": bool(
+                        contacts_access.get("default_connection_selected")
+                    ),
+                    "read_scope_missing": bool(
+                        contacts_access.get("read_scope_missing")
+                    ),
+                    "read_available": bool(
+                        contacts_enabled
+                        and contacts_access.get("read_connection_id")
+                        and settings.CONTACTS_READ_ENABLED
+                    ),
+                },
             )
 
             previous_messages = [
@@ -1083,12 +1570,55 @@ class ChatService:
                 initial_state["pending_calendar_availability"] = (
                     pending_calendar_availability
                 )
+            pending_calendar_delete_selection = self._pending_calendar_delete_selection(
+                history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                now=request_time,
+            )
+            if pending_calendar_delete_selection is not None:
+                initial_state["pending_calendar_delete_selection"] = (
+                    pending_calendar_delete_selection
+                )
+            pending_calendar_read = self._pending_calendar_read(
+                history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                now=request_time,
+            )
+            if pending_calendar_read is not None:
+                initial_state["pending_calendar_read"] = pending_calendar_read
+            pending_gmail_clarification = self._pending_gmail_clarification(
+                history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                now=request_time,
+            )
+            if pending_gmail_clarification is not None:
+                initial_state["pending_gmail_clarification"] = pending_gmail_clarification
             pending_calendar_draft = self._pending_calendar_create_draft(
                 history,
             )
-            if pending_calendar_draft is not None:
+            # Only hydrate a standalone create draft when it is part of a valid,
+            # scoped pending create clarification/action. Orphan drafts can leak
+            # into unrelated requests and must not hijack routing/response.
+            if (
+                pending_calendar_draft is not None
+                and isinstance(pending_calendar_action, dict)
+                and pending_calendar_action.get("operation") == "create"
+            ):
                 initial_state["calendar_create_draft"] = (
                     pending_calendar_draft
+                )
+            pending_contacts_clarification = self._pending_contacts_clarification(
+                history,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                now=request_time,
+            )
+            if pending_contacts_clarification is not None:
+                initial_state["pending_contacts_clarification"] = (
+                    pending_contacts_clarification
                 )
             if available_gmail_sources:
                 initial_state["available_gmail_sources"] = (
@@ -1190,6 +1720,56 @@ class ChatService:
                         "calendar_selected_freebusy_scope_missing": (
                             calendar_access["selected_freebusy_scope_missing"]
                         ),
+                        "contacts_connection_id": (
+                            contacts_connection_id
+                        ),
+                        "contacts_write_connection_id": (
+                            contacts_write_connection_id
+                        ),
+                        "contacts_enabled": contacts_enabled,
+                        "contacts_selection_required": (
+                            contacts_enabled
+                            and contacts_access["selection_required"]
+                        ),
+                        "contacts_selected_account_email": (
+                            contacts_access["selected_connection_email"]
+                        ),
+                        "contacts_candidate_emails": (
+                            contacts_access["candidate_emails"]
+                        ),
+                        "contacts_default_connection_invalid": (
+                            contacts_access["default_connection_invalid"]
+                        ),
+                        "contacts_default_connection_selected": (
+                            contacts_access["default_connection_selected"]
+                        ),
+                        "contacts_read_scope_missing": (
+                            contacts_access["read_scope_missing"]
+                        ),
+                        "contacts_write_scope_missing": (
+                            contacts_access["write_scope_missing"]
+                        ),
+                        "contacts_google_connection_available": (
+                            contacts_access["google_connection_available"]
+                        ),
+                        "drive_connection_id": None,
+                        "drive_enabled": False,
+                        "drive_selection_required": False,
+                        "drive_selected_account_email": (
+                            None
+                        ),
+                        "drive_candidate_emails": (
+                            []
+                        ),
+                        "drive_read_scope_missing": (
+                            False
+                        ),
+                        "drive_default_connection_invalid": (
+                            False
+                        ),
+                        "drive_default_connection_selected": (
+                            False
+                        ),
                     },
                 )
             finally:
@@ -1210,6 +1790,37 @@ class ChatService:
                 raise RuntimeError(
                     "The AI workflow returned an empty response."
                 )
+
+            # Minimal redacted lifecycle diagnostics (request -> intent/route -> graph outcome -> response).
+            try:
+                metrics = current_request_metrics.get()
+                plan = result.get("gmail_plan") if isinstance(result.get("gmail_plan"), dict) else {}
+                lifecycle_event(
+                    "chat.graph.completed",
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    assistant_route=result.get("assistant_route"),
+                    intent=plan.get("intent"),
+                    integration=(
+                        "gmail" if result.get("assistant_route") == "gmail"
+                        else "google_calendar" if result.get("assistant_route") == "google_calendar"
+                        else "google_contacts" if result.get("assistant_route") == "google_contacts"
+                        else "google_drive" if result.get("assistant_route") == "google_drive"
+                        else "general"
+                    ),
+                    provider_call_occurred=bool(
+                        (getattr(metrics, "google_calendar_api_call_count", 0) > 0)
+                        or (getattr(metrics, "gmail_api_call_count", 0) > 0)
+                        or (getattr(metrics, "google_oauth_call_count", 0) > 0)
+                    ),
+                    llm_call_occurred=bool(
+                        (getattr(metrics, "llm_call_count", 0) > 0)
+                        or (getattr(metrics, "llm_provider_call_count", 0) > 0)
+                    ),
+                )
+            except Exception:
+                logger.debug("chat.graph.completed diagnostics emission failed", exc_info=True)
             # Save memory from the user's message only.
             # Existing memory retrieval remains enabled even when
             # automatic memory storage is disabled.
@@ -1341,6 +1952,64 @@ class ChatService:
                         assistant_metadata["calendar_create_draft"] = (
                             result["calendar_create_draft"]
                         )
+                    if "pending_calendar_delete_selection" in result:
+                        assistant_metadata["pending_calendar_delete_selection"] = (
+                            result["pending_calendar_delete_selection"]
+                        )
+                    if "pending_calendar_read" in result:
+                        assistant_metadata["pending_calendar_read"] = (
+                            result["pending_calendar_read"]
+                        )
+                    if "pending_contacts_clarification" in result:
+                        assistant_metadata["pending_contacts_clarification"] = (
+                            result["pending_contacts_clarification"]
+                        )
+                    result_pending_gmail = result.get("pending_gmail_clarification") if "pending_gmail_clarification" in result else None
+                    if "pending_gmail_clarification" in result:
+                        assistant_metadata["pending_gmail_clarification"] = result_pending_gmail
+                    # If a valid pending Gmail clarification existed and this turn did not
+                    # intentionally keep/refresh it, supersede/clear deterministically.
+                    if pending_gmail_clarification is not None:
+                        kept = assistant_metadata.get("pending_gmail_clarification")
+                        if kept is None:
+                            pass
+                        elif isinstance(kept, dict):
+                            same_pending = (
+                                kept.get("type") == pending_gmail_clarification.get("type")
+                                and kept.get("user_id") == pending_gmail_clarification.get("user_id")
+                                and kept.get("conversation_id") == pending_gmail_clarification.get("conversation_id")
+                                and kept.get("created_at") == pending_gmail_clarification.get("created_at")
+                                and kept.get("expires_at") == pending_gmail_clarification.get("expires_at")
+                                and kept.get("target_date") == pending_gmail_clarification.get("target_date")
+                                and kept.get("period") == pending_gmail_clarification.get("period")
+                            )
+                            if same_pending:
+                                # Keep only for explicit Gmail clarification continuation/keep flows
+                                # (e.g. ambiguous fallback clarification) that intentionally preserve
+                                # the same pending state. Other requests (including mixed-service
+                                # clarifications) must clear stale pending.
+                                clarification_reason = (
+                                    (result.get("gmail_plan") or {}).get("clarification_reason")
+                                    if isinstance(result.get("gmail_plan"), dict)
+                                    else None
+                                )
+                                is_keep_continuation = (
+                                    result.get("assistant_route") == "gmail"
+                                    and isinstance(result.get("gmail_plan"), dict)
+                                    and result.get("gmail_plan", {}).get("intent") == "clarify"
+                                    and "pending_gmail_clarification" in result
+                                    and result.get("pending_gmail_clarification") == pending_gmail_clarification
+                                    and clarification_reason == "gmail_search_fallback_ambiguous"
+                                )
+                                if not is_keep_continuation:
+                                    assistant_metadata["pending_gmail_clarification"] = None
+                            # else: different/new pending clarification payload -> keep (e.g. emitted this turn)
+
+                        else:
+                            assistant_metadata["pending_gmail_clarification"] = None
+                    elif "pending_gmail_clarification" not in assistant_metadata and "pending_gmail_clarification" not in result:
+                        # No prior pending and none produced/cleared explicitly; leave absent.
+                        pass
                     if isinstance(result.get("calendar_events"), list):
                         assistant_metadata["calendar_events"] = (
                             result["calendar_events"]
@@ -1515,6 +2184,117 @@ class ChatService:
                             "content": assistant_content,
                         }
 
+            contacts_action = result.get("contacts_action_proposal")
+            if contacts_action is not None:
+                try:
+                    write_connection_id = contacts_write_connection_id
+                    if (
+                        not isinstance(contacts_action, dict)
+                        or not contacts_enabled
+                        or not write_connection_id
+                        or self.user_connection_service is None
+                    ):
+                        raise PermissionError(
+                            "Contacts write permission is unavailable."
+                        )
+                    action_type = contacts_action.get("action_type")
+                    contacts_parameters = contacts_action.get("parameters")
+                    if (
+                        action_type
+                        not in {
+                            "contacts.create_contact",
+                            "contacts.update_contact",
+                            "contacts.delete_contact",
+                        }
+                        or not isinstance(contacts_parameters, dict)
+                    ):
+                        raise ValueError(
+                            "Contacts proposal payload is invalid."
+                        )
+                    source_message_id = UUID(str(assistant_message["id"]))
+                    stable_proposal_id = uuid5(
+                        NAMESPACE_URL,
+                        f"contacts-action-proposal:{user_id}:{request_id}:"
+                        f"{action_type}",
+                    )
+                    proposal = ActionApprovalService(
+                        self.user_connection_service.db
+                    ).create_proposal(
+                        user_id=user_id,
+                        proposal_id=stable_proposal_id,
+                        payload=ApprovalProposalCreate.model_validate({
+                            "conversation_id": conversation_id,
+                            "source_message_id": source_message_id,
+                            "connection_id": UUID(str(write_connection_id)),
+                            "action_type": action_type,
+                            "parameters": contacts_parameters,
+                        }),
+                    )
+                    assistant_metadata = dict(
+                        assistant_message.get("metadata") or {}
+                    )
+                    assistant_metadata["action_approval"] = (
+                        proposal.model_dump(mode="json")
+                    )
+                    assistant_message = {
+                        **assistant_message,
+                        "metadata": assistant_metadata,
+                    }
+                except Exception as exc:
+                    if isinstance(exc, PermissionError):
+                        failure_message = (
+                            "Google Contacts write permission is not granted "
+                            "for the selected account"
+                        )
+                    elif isinstance(exc, LookupError):
+                        failure_message = (
+                            "the conversation, source message, or selected "
+                            "Google account could not be verified"
+                        )
+                    elif isinstance(exc, ValueError):
+                        failure_message = (
+                            "the Contacts approval details failed validation"
+                        )
+                    else:
+                        failure_message = (
+                            "a server-side storage error occurred"
+                        )
+                    logger.error(
+                        "contacts_approval_proposal_persistence_failed "
+                        "| conversation_id=%s | request_id=%s "
+                        "| error_type=%s",
+                        conversation_id,
+                        request_id,
+                        type(exc).__name__,
+                    )
+                    assistant_content = (
+                        "I couldn’t save the Contacts approval request because "
+                        f"{failure_message}. No contact was changed. Please "
+                        "check the Connected Apps permissions and try again."
+                    )
+                    try:
+                        updated_message = (
+                            self.message_service.update_request_message_content(
+                                user_id=user_id,
+                                conversation_id=conversation_id,
+                                chat_request_id=request_id,
+                                message_id=UUID(str(assistant_message["id"])),
+                                content=assistant_content,
+                            )
+                        )
+                        if updated_message is not None:
+                            assistant_message = updated_message
+                        else:
+                            assistant_message = {
+                                **assistant_message,
+                                "content": assistant_content,
+                            }
+                    except Exception:
+                        assistant_message = {
+                            **assistant_message,
+                            "content": assistant_content,
+                        }
+
             # 15. Complete request using worker fencing.
             completed = self.request_repository.update_status(
                 user_id=user_id,
@@ -1534,6 +2314,19 @@ class ChatService:
 
             # 16. Return the response.
             metadata = assistant_message.get("metadata") or {}
+            try:
+                lifecycle_event(
+                    "chat.response.completed",
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    assistant_route=result.get("assistant_route") if isinstance(result, dict) else None,
+                    intent=((result.get("gmail_plan") or {}).get("intent") if isinstance(result, dict) and isinstance(result.get("gmail_plan"), dict) else None),
+                    proposal_id=(metadata.get("action_approval") or {}).get("id") if isinstance(metadata.get("action_approval"), dict) else None,
+                    status_transition="processing->completed",
+                )
+            except Exception:
+                logger.debug("chat.response.completed diagnostics emission failed", exc_info=True)
 
             return {
                 "conversation_id": conversation_id,

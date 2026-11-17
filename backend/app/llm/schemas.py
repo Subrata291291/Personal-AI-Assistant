@@ -26,6 +26,10 @@ class LLMRequest(BaseModel):
         gt=0,
     )
 
+    # Per-attempt timeout override (seconds). When set, providers should use the
+    # smaller of their configured timeout and this value. Managed by fallback/router.
+    timeout_seconds: float | None = Field(default=None, gt=0)
+
 
 class LLMUsage(BaseModel):
     prompt_tokens: int | None = None
@@ -79,6 +83,17 @@ class LLMResponse(BaseModel):
                 else None
             ),
         }
+
+
+class LLMStreamChunk(BaseModel):
+    """Incremental chunk emitted by provider streaming APIs."""
+
+    content: str = ""
+    provider: str
+    model: str
+    finish_reason: str | None = None
+    usage: LLMUsage | None = None
+    is_final: bool = False
 
 
 def provider_output_token_limit(

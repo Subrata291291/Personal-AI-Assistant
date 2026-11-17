@@ -109,16 +109,34 @@ ACTION_PARAMETER_FIELDS: dict[str, tuple[set[str], set[str]]] = {
     ),
     "contacts.create_contact": (
         {"display_name"},
-        {"email", "phone"},
+        {
+            "given_name",
+            "family_name",
+            "email",
+            "phone",
+            "organization",
+            "job_title",
+            "address",
+        },
     ),
     "contacts.update_contact": (
-        {"contact_id"},
-        {"display_name", "email", "phone"},
+        {"contact_id", "etag"},
+        {
+            "display_name",
+            "given_name",
+            "family_name",
+            "email",
+            "phone",
+            "organization",
+            "job_title",
+            "address",
+        },
     ),
     "contacts.delete_contact": ({"contact_id"}, set()),
 }
 
 _RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,512}$")
+_CONTACT_ID_PATTERN = re.compile(r"^people/[A-Za-z0-9._-]{1,505}\Z")
 _CALENDAR_ID_PATTERN = re.compile(r"^[A-Za-z0-9._@+-]{1,1024}$")
 _SAFE_RESULT_DENIED_KEYS = re.compile(
     r"(?:access|refresh|client)?_?(?:token|secret|credential|authorization|"
@@ -219,7 +237,17 @@ class ApprovalProposalCreate(BaseModel):
                     raise ValueError("email is not a valid email address.")
                 self.parameters[key] = normalized_email
 
-        for key in ("subject", "title", "name", "display_name"):
+        for key in (
+            "subject",
+            "title",
+            "name",
+            "display_name",
+            "given_name",
+            "family_name",
+            "organization",
+            "job_title",
+            "address",
+        ):
             value = self.parameters.get(key)
             if isinstance(value, str) and not value.strip():
                 raise ValueError(f"{key} cannot be empty.")
@@ -238,11 +266,15 @@ class ApprovalProposalCreate(BaseModel):
             "thread_id",
             "file_id",
             "event_id",
-            "contact_id",
         ):
             value = self.parameters.get(key)
             if isinstance(value, str) and not _RESOURCE_ID_PATTERN.fullmatch(value):
                 raise ValueError(f"{key} is invalid.")
+        contact_id = self.parameters.get("contact_id")
+        if isinstance(contact_id, str) and not _CONTACT_ID_PATTERN.fullmatch(
+            contact_id
+        ):
+            raise ValueError("contact_id is invalid.")
         calendar_id = self.parameters.get("calendar_id")
         if calendar_id is not None and (
             not isinstance(calendar_id, str)
@@ -298,14 +330,26 @@ class ApprovalProposalCreate(BaseModel):
             set(self.parameters) - {"file_id"}
         ):
             raise ValueError("At least one file change is required.")
-        if self.action_type == "contacts.update_contact" and not (
-            set(self.parameters) - {"contact_id"}
-        ):
-            raise ValueError("At least one contact change is required.")
-        if self.action_type == "contacts.create_contact" and not (
-            self.parameters.get("email") or self.parameters.get("phone")
-        ):
-            raise ValueError("A new contact requires an email or phone number.")
+        if self.action_type == "contacts.update_contact":
+            if not (set(self.parameters) - {"contact_id", "etag"}):
+                raise ValueError("At least one contact change is required.")
+            etag = self.parameters.get("etag")
+            if not isinstance(etag, str) or not etag.strip():
+                raise ValueError("etag is required for contact updates.")
+        if self.action_type == "contacts.create_contact":
+            detail_keys = {
+                "email",
+                "phone",
+                "organization",
+                "job_title",
+                "address",
+                "given_name",
+                "family_name",
+            }
+            if not any(self.parameters.get(key) for key in detail_keys):
+                raise ValueError(
+                    "A new contact requires at least one detail such as email, phone, organization, job title, or address."
+                )
         return self
 
 

@@ -134,10 +134,15 @@ class GoogleOAuthCallbackService:
             if state_data.get("service") in {
                 "calendar_write",
                 "calendar_list_read",
-            }:
+                "contacts_write",
+                "drive_write",
+            } or (
+                state_data.get("service") == "drive_file"
+                and target_connection_id is not None
+            ):
                 if target_connection_id is None:
                     raise ValueError(
-                        "Incremental Calendar consent has no selected account."
+                        "Incremental Google consent has no selected account."
                     )
                 target_connection = UserConnectionRepository(
                     self.db

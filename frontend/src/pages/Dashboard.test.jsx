@@ -217,7 +217,11 @@ describe('Dashboard fresh-user states', () => {
     expect(within(gmailRow).getByText(statuses[0])).toBeInTheDocument()
     expect(within(calendarRow).getByText(statuses[1])).toBeInTheDocument()
     expect(screen.getByText('Google Drive')).toBeInTheDocument()
-    expect(screen.getAllByText('Coming soon').length).toBe(2)
+    const driveRow = screen.getByText('Google Drive').parentElement.parentElement
+    const contactsRow = screen.getByText('Google Contacts').parentElement.parentElement
+    expect(within(driveRow).getByText('Coming soon')).toBeInTheDocument()
+    expect(within(contactsRow).getByText('Disconnected')).toBeInTheDocument()
+    expect(screen.getAllByText('Coming soon').length).toBeGreaterThan(0)
     expect(api.get).not.toHaveBeenCalledWith('/api/v1/oauth/connections')
   })
 

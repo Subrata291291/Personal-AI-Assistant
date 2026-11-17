@@ -20,17 +20,20 @@ describe('Google Workspace capability counting', () => {
   it.each([
     [{ gmail: true }, 1],
     [{ gmail: true, calendar_events_read: true }, 2],
-    [{ gmail: true, calendar_events_read: true, drive_files_read: true }, 2],
-    [{
-      gmail: true,
-      calendar_events_read: true,
-      drive_files_read: true,
-      contacts_read: true,
-    }, 2],
-  ])('counts each granted service once: %j', (capabilities, expected) => {
+  ])('counts each granted available service once: %j', (capabilities, expected) => {
     expect(getConnectedGoogleServiceCount([
       connection('google-account', capabilities),
     ])).toBe(expected)
+  })
+
+  it('does not count Drive while it is temporarily unavailable/coming soon', () => {
+    expect(getConnectedGoogleServiceCount([
+      connection('google-account', {
+        gmail: true,
+        calendar_events_read: true,
+        drive_contracts_read: true,
+      }),
+    ])).toBe(2)
   })
 
   it('does not count the same service across multiple Google accounts twice', () => {
@@ -77,16 +80,30 @@ describe('Google Workspace capability counting', () => {
     expect(getGoogleServiceStatus([], 'gmail')).toBe('Disconnected')
   })
 
-  it('excludes coming-soon services from counts but reports granted capabilities', () => {
+  it('reports Drive as coming soon/unavailable even when scopes exist', () => {
     const connections = [
       connection('google-account', {
-        drive_files_read: true,
+        drive_contracts_read: true,
         contacts_read: true,
       }),
     ]
 
-    expect(getConnectedGoogleServiceCount(connections)).toBe(0)
-    expect(isGoogleServiceConnected(connections, 'drive')).toBe(true)
+    expect(getConnectedGoogleServiceCount(connections)).toBe(1)
+    expect(getConnectedGoogleServices(connections)).toEqual(
+      new Set(['drive', 'contacts']),
+    )
+    expect(getGoogleServiceStatus(connections, 'drive')).toBe('Coming soon')
     expect(isGoogleServiceConnected(connections, 'contacts')).toBe(true)
+  })
+
+  it('does not treat Contacts as connected without its scopes', () => {
+    const connections = [
+      connection('google-account', {
+        gmail: true,
+        contacts_write_permission_granted: true,
+      }),
+    ]
+
+    expect(isGoogleServiceConnected(connections, 'contacts')).toBe(false)
   })
 })

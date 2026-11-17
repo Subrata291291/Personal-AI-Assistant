@@ -24,7 +24,9 @@ def test_oauth_state_service_constraint_matches_migration():
     assert len(constraints) == 1
     assert str(constraints[0].sqltext) == (
         "service IS NULL OR service IN "
-        "('gmail', 'calendar', 'calendar_write', 'calendar_list_read')"
+        "('gmail', 'calendar', 'calendar_write', 'calendar_list_read', "
+        "'contacts_read', 'contacts_write', 'drive_read', 'drive_write', "
+        "'drive_file')"
     )
     assert OAuthState.__table__.c.service.type.length == 50
     assert OAuthState.__table__.c.service.nullable
@@ -59,13 +61,18 @@ def test_oauth_state_service_constraint_accepts_allowed_values_and_rejects_other
                     "calendar",
                     "calendar_write",
                     "calendar_list_read",
+                    "contacts_read",
+                    "contacts_write",
+                    "drive_read",
+                    "drive_write",
+                    "drive_file",
                 )],
             )
 
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.execute(
-                    insert(table).values(service="drive"),
+                    insert(table).values(service="tasks"),
                 )
     finally:
         engine.dispose()

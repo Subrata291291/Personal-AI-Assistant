@@ -76,6 +76,28 @@ def test_connections_endpoint_returns_authoritative_aggregate_capabilities(
         def aggregate_calendar_capabilities(_connections):
             return capabilities
 
+        @staticmethod
+        def aggregate_contacts_capabilities(_connections):
+            return {"connected": False}
+
+        @staticmethod
+        def get_user_contacts_access(*, user_id, default_connection_id=None):
+            assert user_id == expected_user_id
+            assert default_connection_id is None
+            return {
+                "read_connection_id": None,
+                "selection_required": False,
+                "default_connection_invalid": False,
+                "default_connection_selected": False,
+                "read_scope_missing": False,
+                "selected_connection_email": None,
+                "candidate_emails": [],
+            }
+
+        @staticmethod
+        def aggregate_drive_capabilities(_connections):
+            return {"connected": False}
+
     monkeypatch.setattr(
         "app.api.v1.endpoints.oauth.UserConnectionService",
         FakeConnectionService,
@@ -88,6 +110,11 @@ def test_connections_endpoint_returns_authoritative_aggregate_capabilities(
 
     assert response["calendar_capabilities"] == capabilities
     assert response["total"] == 1
+    assert response["contacts_capabilities"]["connected"] is False
+    assert response["contacts_capabilities"]["read_available"] is False
+    assert response["contacts_capabilities"]["chat_available"] is False
+    assert response["contacts_capabilities"]["selection_required"] is False
+    assert response["contacts_capabilities"]["read_scope_missing"] is False
 
 
 def test_connections_api_serializes_configured_calendar_capabilities(

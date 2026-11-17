@@ -92,7 +92,7 @@ describe('Public policy pages and auth links', () => {
 
   it.each([
     ['/dashboard/drive', 'Google Drive'],
-    ['/dashboard/contacts', 'Google Contacts'],
+    ['/dashboard/contacts', 'Contacts'],
   ])('opens the independent route %s', async (path, title) => {
     authState.authenticated = true
     window.history.pushState({}, '', path)

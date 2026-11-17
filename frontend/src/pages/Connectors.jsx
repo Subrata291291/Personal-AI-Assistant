@@ -99,6 +99,22 @@ function removeDisconnectedConnections(data, connectionIds) {
   const deleteFeatureEnabled = capabilities.some(
     (item) => item.calendar_delete_feature_enabled,
   )
+  const contactsRead = capabilities.some((item) => item.contacts_read)
+  const contactsWriteGranted = capabilities.some(
+    (item) => item.contacts_write_permission_granted,
+  )
+  const contactsCreateAvailable = capabilities.some(
+    (item) => item.contacts_create_execution_available,
+  )
+  const contactsUpdateAvailable = capabilities.some(
+    (item) => item.contacts_update_execution_available,
+  )
+  const contactsDeleteAvailable = capabilities.some(
+    (item) => item.contacts_delete_execution_available,
+  )
+  const driveContractsRead = capabilities.some(
+    (item) => item.drive_contracts_read,
+  )
 
   return {
     ...data,
@@ -126,6 +142,29 @@ function removeDisconnectedConnections(data, connectionIds) {
       write_available:
         createAvailable || updateAvailable || deleteAvailable,
     },
+    contacts_capabilities: {
+      connected: capabilities.some((item) => item.contacts),
+      read: contactsRead,
+      write_permission_granted: contactsWriteGranted,
+      google_connection_available: googleConnections.length > 0,
+      permissions_need_consent:
+        googleConnections.length > 0 && !contactsRead,
+      create_execution_available: contactsCreateAvailable,
+      update_execution_available: contactsUpdateAvailable,
+      delete_execution_available: contactsDeleteAvailable,
+      write_execution_available:
+        contactsCreateAvailable ||
+        contactsUpdateAvailable ||
+        contactsDeleteAvailable,
+    },
+    drive_capabilities: {
+      connected: capabilities.some((item) => item.drive),
+      read: driveContractsRead,
+      contracts_read: driveContractsRead,
+      google_connection_available: googleConnections.length > 0,
+      permissions_need_consent:
+        googleConnections.length > 0 && !driveContractsRead,
+    },
   }
 }
 
@@ -148,6 +187,37 @@ function getCalendarDescription(capabilities) {
       : `Create is ${capabilityStatus(featureStates[0], 'enabled', 'disabled').toLowerCase()}, update is ${capabilityStatus(featureStates[1], 'enabled', 'disabled').toLowerCase()}, and delete is ${capabilityStatus(featureStates[2], 'enabled', 'disabled').toLowerCase()}.`
 
   return `Access calendar events and availability. ${permissionText}, but ${executionText}`
+}
+
+function getContactsDescription(capabilities) {
+  const permission = capabilities.write_permission_granted
+  const permissionText = permission === true
+    ? 'Google Contacts write permission is currently granted on this account. The Assistant uses read-only Contacts access; to remove write permission, revoke or reauthorize this Google connection.'
+    : permission === false
+      ? 'Read-only Google Contacts access is requested. Write permission is not granted.'
+      : 'Contacts permission status is unavailable.'
+  const featureStates = [
+    capabilities.create_feature_enabled,
+    capabilities.update_feature_enabled,
+    capabilities.delete_feature_enabled,
+  ]
+  const executionText = featureStates.every((enabled) => enabled === false)
+    ? 'Contact creation, updates, and deletion are disabled in the Assistant.'
+    : featureStates.every((enabled) => enabled === true)
+      ? 'Contact creation, updates, and deletion are enabled.'
+      : `Create is ${capabilityStatus(featureStates[0], 'enabled', 'disabled').toLowerCase()}, update is ${capabilityStatus(featureStates[1], 'enabled', 'disabled').toLowerCase()}, and delete is ${capabilityStatus(featureStates[2], 'enabled', 'disabled').toLowerCase()}.`
+
+  return `Search and view your Google Contacts. ${permissionText} ${executionText}`
+}
+
+function getDriveDescription(capabilities) {
+  const permission = capabilities.contracts_read
+  const permissionText = permission === true
+    ? 'selected-file read access is granted'
+    : permission === false
+      ? 'selected-file read access is not granted'
+      : 'selected-file read access status is unavailable'
+  return `Select PDF, DOCX, or Google Docs contracts with Google Picker. Access is read-only; ${permissionText}, and contract text is processed on demand without being stored.`
 }
 
 function Connectors() {
@@ -210,6 +280,28 @@ function Connectors() {
   const gmailConnections = connectedGoogleConnections.filter(
     (connection) => connection.capabilities?.gmail === true,
   )
+  const selectedGmailConnection =
+    gmailConnections.find(
+      (connection) =>
+        connection.id === user?.user_metadata?.default_gmail_connection_id,
+    ) || gmailConnections[0] || null
+  const gmailAccountLabel =
+    selectedGmailConnection?.email ||
+    selectedGmailConnection?.account_email ||
+    (gmailConnections.length > 0 ? 'Connected Google account' : 'Not connected')
+  const gmailCapabilities = selectedGmailConnection?.capabilities || {}
+  const gmailReadGranted =
+    gmailCapabilities.gmail_read === true ||
+    gmailCapabilities.gmail === true
+  const gmailModifyGranted =
+    gmailCapabilities.gmail_modify === true ||
+    gmailCapabilities.gmail_write === true
+  const gmailSendGranted =
+    gmailCapabilities.gmail_send === true
+  const gmailCapabilitiesAvailable = isGoogleServiceEnabled(
+    'gmail',
+    user?.user_metadata,
+  )
   const calendarCapabilities =
     connectionsQuery.data?.calendar_capabilities || {}
   const connectedCalendarCapabilities = connectedGoogleConnections.map(
@@ -258,7 +350,93 @@ function Connectors() {
     isCalendarConnected === true && !isCalendarEventReadAvailable
   const configuredDefaultConnectionId =
     user?.user_metadata?.default_calendar_connection_id
+  const configuredDefaultContactsConnectionId =
+    user?.user_metadata?.default_contacts_connection_id
   const isGmailConnected = gmailConnections.length > 0
+
+  const contactsCapabilities =
+    connectionsQuery.data?.contacts_capabilities || {}
+  const driveCapabilities =
+    connectionsQuery.data?.drive_capabilities || {}
+  const aggregateServiceCapability = (
+    aggregateCapabilities,
+    connectionKey,
+    aggregateKey,
+  ) => {
+    if (typeof aggregateCapabilities[aggregateKey] === 'boolean') {
+      return aggregateCapabilities[aggregateKey]
+    }
+    const values = connectedCalendarCapabilities.map(
+      (capability) => capability[connectionKey],
+    )
+    if (values.some((value) => value === true)) return true
+    if (values.length > 0 && values.every((value) => value === false)) {
+      return false
+    }
+    return undefined
+  }
+  const aggregateContactsCapability = (aggregateKey, connectionKey) =>
+    aggregateServiceCapability(
+      contactsCapabilities,
+      connectionKey,
+      aggregateKey,
+    )
+  const aggregateDriveCapability = (aggregateKey, connectionKey) =>
+    aggregateServiceCapability(
+      driveCapabilities,
+      connectionKey,
+      aggregateKey,
+    )
+  const isContactsReadAvailable =
+    aggregateContactsCapability('read', 'contacts_read') === true
+  const contactsReadAvailableForAssistant =
+    typeof contactsCapabilities.chat_available === 'boolean'
+      ? contactsCapabilities.chat_available
+      : typeof contactsCapabilities.read_available === 'boolean'
+        ? contactsCapabilities.read_available
+        : isContactsReadAvailable
+  const contactsSelectionRequired =
+    contactsCapabilities.selection_required === true
+  const contactsDefaultInvalid =
+    contactsCapabilities.default_connection_invalid === true
+  const isContactsConnected =
+    contactsReadAvailableForAssistant ||
+    (isContactsReadAvailable &&
+      !contactsSelectionRequired &&
+      !contactsDefaultInvalid)
+  const contactsNeedsConsent =
+    contactsCapabilities.permissions_need_consent ??
+    (connectedGoogleConnections.length > 0 && !isContactsReadAvailable)
+  const _isDriveReadAvailable =
+    aggregateDriveCapability('contracts_read', 'drive_contracts_read') === true
+  const _isDriveConnected =
+    aggregateDriveCapability('connected', 'drive') === true
+  const _driveNeedsConsent =
+    driveCapabilities.permissions_need_consent ??
+    (connectedGoogleConnections.length > 0 && !_isDriveReadAvailable)
+  const contactsCandidates = connectedGoogleConnections.filter(
+    (connection) =>
+      connection.capabilities?.contacts_read === true ||
+      connection.capabilities?.contacts_write_permission_granted === true,
+  )
+  const contactsDescription = (() => {
+    if (contactsSelectionRequired) {
+      return 'Search and view your Google Contacts. More than one connected Google account has Contacts access; choose which account to use below.'
+    }
+    if (contactsDefaultInvalid) {
+      return 'Search and view your Google Contacts. The selected Contacts account is unavailable; choose a different account below.'
+    }
+    if (contactsReadAvailableForAssistant || isContactsReadAvailable) {
+      return 'Search and view your Google Contacts. Contact information is read-only in this app.'
+    }
+    return 'Search and view your Google Contacts. Connect a Google account and grant Contacts read access to use this feature.'
+  })()
+  const _driveDescription = getDriveDescription({
+    contracts_read: aggregateDriveCapability(
+      'contracts_read',
+      'drive_contracts_read',
+    ),
+  })
 
   const integrationPreferenceMutation = useMutation({
     mutationFn: ({ preference, enabled }) =>
@@ -291,6 +469,9 @@ function Connectors() {
     if (connectionIds.includes(configuredDefaultConnectionId)) {
       metadata.default_calendar_connection_id = null
     }
+    if (connectionIds.includes(configuredDefaultContactsConnectionId)) {
+      metadata.default_contacts_connection_id = null
+    }
     if (Object.keys(metadata).length === 0) return false
 
     try {
@@ -311,13 +492,26 @@ function Connectors() {
 
   function handleIntegrationToggle(integration, enabled) {
     setNotice(null)
-    const service = integration === 'gmail'
-      ? 'gmail'
-      : 'calendar'
-    const connected = service === 'gmail'
-      ? isGmailConnected
-      : isCalendarEventReadAvailable
-    if (enabled && !connected) {
+    if (integration === 'drive') {
+      setNotice({
+        type: 'info',
+        message: 'Google Drive is coming soon and is not available yet.',
+      })
+      return
+    }
+    const serviceById = {
+      gmail: 'gmail',
+      calendar: 'calendar',
+      contacts: 'contacts_read',
+    }
+    const connectedByIntegration = {
+      gmail: isGmailConnected,
+      calendar: isCalendarEventReadAvailable,
+      contacts: isContactsReadAvailable,
+    }
+    const service = serviceById[integration]
+    const connected = connectedByIntegration[integration] === true
+    if (enabled && !connected && service) {
       integrationPreferenceMutation.mutate({
         integration,
         enabled: true,
@@ -485,6 +679,8 @@ function Connectors() {
         .flatMap((connection) => [
           ...(connection.capabilities?.gmail ? ['Gmail'] : []),
           ...(connection.capabilities?.calendar ? ['Google Calendar'] : []),
+          ...(connection.capabilities?.contacts ? ['Google Contacts'] : []),
+          ...(connection.capabilities?.drive ? ['Google Drive'] : []),
         ]),
     )
     const servicesText = [...affectedServices].join(' and ') || 'Google services'
@@ -503,8 +699,14 @@ function Connectors() {
   function handleConnect(service) {
     if (connectionsQuery.isLoading || connectionsQuery.isError) return
 
+    const serviceMap = {
+      contacts: 'contacts_read',
+      drive: 'drive_file',
+    }
+    const resolvedService = serviceMap[service] || service
+
     setNotice(null)
-    connectMutation.mutate({ service })
+    connectMutation.mutate({ service: resolvedService })
   }
 
   return (
@@ -582,18 +784,22 @@ function Connectors() {
             {
               id: 'drive',
               name: 'Google Drive',
-              description: 'Access and organize your files.',
+              description:
+                'Coming soon. Google Drive integration is temporarily unavailable and will be available in a future update.',
               available: false,
+              comingSoon: true,
               connected: false,
+              partial: false,
               enabled: false,
             },
             {
               id: 'contacts',
               name: 'Google Contacts',
-              description: 'Access and manage your contacts.',
-              available: false,
-              connected: false,
-              enabled: false,
+              description: contactsDescription,
+              available: true,
+              connected: isContactsConnected,
+              partial: contactsNeedsConsent || contactsSelectionRequired || contactsDefaultInvalid,
+              enabled: isGoogleServiceEnabled('contacts', user?.user_metadata),
             },
           ].map((service) => {
             const isConnected = service.connected
@@ -641,52 +847,52 @@ function Connectors() {
                       {service.description}
                     </p>
                   </div>
-                  {service.available && (
+                  {(service.available || service.comingSoon) && (
                     <div className="flex shrink-0 items-center gap-2">
                       <span
                         aria-live="polite"
                         className={`text-xs font-bold tracking-wide ${
-                          serviceEnabled
+                          serviceEnabled && !service.comingSoon
                             ? SEMANTIC_STATUS_STYLES.positive.text
                             : isDark
                               ? 'text-slate-400'
                               : 'text-slate-500'
                         }`}
                       >
-                        {service.enabled ? 'ON' : 'OFF'}
+                        {service.comingSoon ? 'OFF' : service.enabled ? 'ON' : 'OFF'}
                       </span>
                       <button
                         type="button"
                         role="switch"
                         aria-label={`Enable ${service.name}`}
-                        aria-checked={serviceEnabled}
-                        aria-busy={integrationPreferenceMutation.isPending}
-                        title={`${service.name} ${serviceEnabled ? 'ON' : 'OFF'}`}
-                        disabled={toggleDisabled}
+                        aria-checked={service.comingSoon ? false : serviceEnabled}
+                        aria-busy={integrationPreferenceMutation.isPending && !service.comingSoon}
+                        title={service.comingSoon ? `${service.name} coming soon` : `${service.name} ${serviceEnabled ? 'ON' : 'OFF'}`}
+                        disabled={toggleDisabled || service.comingSoon}
                         onClick={() => handleIntegrationToggle(
                           service.id,
                           !serviceEnabled,
                         )}
-                        className={`group relative inline-flex h-7 w-[3.25rem] shrink-0 cursor-pointer items-center rounded-full p-1 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-60 ${
+                        className={`group relative inline-flex h-7 w-[3.25rem] shrink-0 cursor-pointer items-center rounded-full p-1 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 ${
                           isDark
                             ? 'focus-visible:ring-offset-slate-900'
                             : 'focus-visible:ring-offset-white'
                         } ${
-                          serviceEnabled
+                          serviceEnabled && !service.comingSoon
                             ? SEMANTIC_STATUS_STYLES.positive.toggle
                             : isDark
-                              ? 'bg-slate-700 hover:bg-slate-600'
-                              : 'bg-slate-300 hover:bg-slate-400'
+                              ? 'bg-slate-700'
+                              : 'bg-slate-300'
                         }`}
                       >
                         <span
                           aria-hidden="true"
                           className={`h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                            integrationPreferenceMutation.isPending
+                            integrationPreferenceMutation.isPending && !service.comingSoon
                               ? 'animate-pulse'
                               : ''
                           } ${
-                            serviceEnabled
+                            serviceEnabled && !service.comingSoon
                               ? 'translate-x-5'
                               : 'translate-x-0'
                           }`}
@@ -705,11 +911,15 @@ function Connectors() {
 
                       {connectedGoogleConnections.length > 0 && !isConnected && (
                         <p className={`mt-2 text-xs ${colors.muted}`}>
-                          {service.partial
+                          {service.partial && service.id === 'calendar'
                             ? calendarCapabilities.connected
                               ? 'Calendar is connected with partial access. Grant the missing read-only permissions to enable the requested Calendar operations.'
                               : 'Calendar is not connected. Grant Calendar event-read and, if needed, separate free/busy permission in Connected Apps.'
-                            : `A Google account is connected, but ${service.name} permission has not been granted.`}
+                            : service.partial && service.id === 'contacts' && contactsSelectionRequired
+                              ? 'More than one connected Google account has Contacts access. Choose which account to use below so the Assistant can read contacts.'
+                              : service.partial && service.id === 'contacts' && contactsDefaultInvalid
+                                ? 'The selected Contacts account is no longer available. Choose a different Contacts account below.'
+                                : `A Google account is connected, but ${service.name} permission has not been granted.`}
                         </p>
                       )}
 
@@ -773,6 +983,137 @@ function Connectors() {
                         </div>
                       )}
 
+                      {service.id === 'contacts'
+                        && connectedGoogleConnections.length > 0 && (
+                        <div className={`mt-3 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-2 ${colors.muted}`}>
+                          <p>
+                            Read permission:{' '}
+                            {capabilityStatus(aggregateContactsCapability(
+                              'read',
+                              'contacts_read',
+                            ))}
+                          </p>
+                          <p>
+                            Write permission:{' '}
+                            {capabilityStatus(aggregateContactsCapability(
+                              'write_permission_granted',
+                              'contacts_write_permission_granted',
+                            ))}
+                          </p>
+                          {['create', 'update', 'delete'].map((action) => {
+                            const featureEnabled = aggregateContactsCapability(
+                              `${action}_feature_enabled`,
+                              `contacts_${action}_feature_enabled`,
+                            )
+                            const executionAvailable = aggregateContactsCapability(
+                              `${action}_execution_available`,
+                              `contacts_${action}_execution_available`,
+                            )
+                            return (
+                              <p key={action}>
+                                {action[0].toUpperCase() + action.slice(1)}:{' '}
+                                {capabilityStatus(
+                                  featureEnabled,
+                                  'Enabled',
+                                  'Disabled',
+                                )}
+                                {' · Execution '}
+                                {capabilityStatus(
+                                  executionAvailable,
+                                  'available',
+                                  'not available',
+                                )}
+                              </p>
+                            )
+                          })}
+                        </div>
+                      )}
+
+                      {service.id === 'gmail'
+                        && connectedGoogleConnections.length > 0 && (
+                        <div className={`mt-3 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-2 ${colors.muted}`}>
+                          <p>
+                            Connected account:{' '}
+                            <span className={isDark ? 'text-slate-200' : 'text-slate-700'}>
+                              {gmailAccountLabel || 'Not available'}
+                            </span>
+                          </p>
+                          <p>
+                            Read permission:{' '}
+                            {capabilityStatus(gmailReadGranted)}
+                          </p>
+                          <p>
+                            Modify/Draft permission:{' '}
+                            {capabilityStatus(gmailModifyGranted)}
+                          </p>
+                          <p>
+                            Send permission:{' '}
+                            {capabilityStatus(gmailSendGranted)}
+                          </p>
+                          <p>
+                            Email search:{' '}
+                            {gmailCapabilitiesAvailable ? 'Available' : gmailReadGranted ? 'Disabled in settings' : 'Not available'}
+                          </p>
+                          <p>
+                            Email summary:{' '}
+                            {gmailCapabilitiesAvailable ? 'Available' : gmailReadGranted ? 'Disabled in settings' : 'Not available'}
+                          </p>
+                          <p className="sm:col-span-2">
+                            Draft/reply/compose actions:{' '}
+                            {gmailCapabilitiesAvailable && (gmailModifyGranted || gmailSendGranted)
+                              ? 'Available (subject to permissions and review flows)'
+                              : gmailReadGranted
+                                ? 'Limited by granted permissions or settings'
+                                : 'Not available'}
+                          </p>
+                        </div>
+                      )}
+
+                      {service.id === 'contacts'
+                        && contactsCandidates.length > 1 && (
+                        <label className={`mt-3 block text-xs ${colors.muted}`}>
+                          Contacts account
+                          <select
+                            className={`mt-1 block w-full rounded-lg border px-2 py-1.5 text-xs ${
+                              isDark
+                                ? 'border-slate-700 bg-slate-900 text-slate-200'
+                                : 'border-slate-200 bg-white text-slate-700'
+                            }`}
+                            value={configuredDefaultContactsConnectionId || ''}
+                            onChange={(event) => {
+                              const value = event.target.value || null
+                              updateUserMetadata({
+                                default_contacts_connection_id: value,
+                              })
+                            }}
+                          >
+                            <option value="">Choose an account</option>
+                            {contactsCandidates.map((connection) => (
+                              <option key={connection.id} value={connection.id}>
+                                {connection.email || 'Google account'}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+
+                      {service.id === 'drive'
+                        && connectedGoogleConnections.length > 0 && (
+                        <div className={`mt-3 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-2 ${colors.muted}`}>
+                          <p>
+                            Selected-file read access:{' '}
+                            {capabilityStatus(aggregateDriveCapability(
+                              'contracts_read',
+                              'drive_contracts_read',
+                            ))}
+                          </p>
+                          <p>
+                            File operations: Read-only (no upload, edit,
+                            delete, or sharing)
+                          </p>
+                        </div>
+                      )}
+
                       <div className="mt-4 flex flex-wrap items-center gap-3">
                         {!isConnected && (
                           <button
@@ -786,7 +1127,9 @@ function Connectors() {
                             }`}
                           >
                             {service.partial
-                              ? 'Grant missing Calendar permissions'
+                              ? service.id === 'calendar'
+                                ? 'Grant missing Calendar permissions'
+                                : `Grant missing ${service.name} permissions`
                               : `Connect ${service.name}`}
                           </button>
                         )}
@@ -794,11 +1137,11 @@ function Connectors() {
                     </>
                   ) : (
                     <div className="flex items-center justify-between">
-                      <span className={`text-xs ${colors.muted}`}>
-                        Coming soon
+                      <span className={`text-xs font-medium ${SEMANTIC_STATUS_STYLES.warning?.text || 'text-amber-400'}`}>
+                        {service.comingSoon ? 'Under development' : 'Coming soon'}
                       </span>
                       <span className={`text-xs ${colors.muted}`}>
-                        Not connected
+                        {service.comingSoon ? 'Unavailable' : 'Not connected'}
                       </span>
                     </div>
                   )}
@@ -831,6 +1174,15 @@ function Connectors() {
                     Gmail: {connection.capabilities?.gmail ? 'Connected' : 'Not connected'}
                     {' · '}
                     Google Calendar: {connection.capabilities?.calendar ? 'Connected' : 'Not connected'}
+                  </p>
+                  <p className={`mt-1 text-xs ${colors.muted}`}>
+                    Google Contacts: {connection.capabilities?.contacts ? 'Connected' : 'Not connected'}
+                    {' · Read: '}
+                    {capabilityStatus(connection.capabilities?.contacts_read)}
+                    {' · Write: '}
+                    {capabilityStatus(
+                      connection.capabilities?.contacts_write_permission_granted,
+                    )}
                   </p>
                   <p className={`mt-1 text-xs ${colors.muted}`}>
                     Assistant Calendar context: {capabilityStatus(
@@ -914,6 +1266,24 @@ function Connectors() {
                     </button>
                   </div>
                 )}
+                {connection.capabilities?.contacts_read === false && (
+                  <button
+                    type="button"
+                    onClick={() => connectMutation.mutate({
+                      service: 'contacts_read',
+                      connectionId: connection.id,
+                    })}
+                    disabled={connectMutation.isPending}
+                    className={`shrink-0 rounded-lg border px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                      isDark
+                        ? 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                        : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    Grant Contacts read access
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={() => handleDisconnect(connection.id)}

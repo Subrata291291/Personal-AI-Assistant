@@ -8,6 +8,7 @@ from fastapi import (
     Depends,
     Header,
     HTTPException,
+    Query,
     status,
 )
 from sqlalchemy.orm import Session
@@ -22,7 +23,11 @@ from app.memory.memory_pipeline import MemoryPipeline
 from app.repositories.chat_request_repository import (
     IdempotencyConflictError,
 )
-from app.schemas.chat import ChatRequest, ChatResponse
+from app.schemas.chat import (
+    ChatRequest,
+    ChatResponse,
+    ChatRequestStatusResponse,
+)
 from app.services.chat_service import (
     ChatService,
     ChatRequestInProgressError,
@@ -97,6 +102,20 @@ def chat(
                 if isinstance(user_metadata, dict)
                 else None
             ),
+            default_contacts_connection_id=(
+                user_metadata.get(
+                    "default_contacts_connection_id"
+                )
+                if isinstance(user_metadata, dict)
+                else None
+            ),
+            default_drive_connection_id=(
+                user_metadata.get(
+                    "default_drive_connection_id"
+                )
+                if isinstance(user_metadata, dict)
+                else None
+            ),
             gmail_enabled=(
                 user_metadata.get("gmail_enabled") is not False
                 if isinstance(user_metadata, dict)
@@ -104,6 +123,16 @@ def chat(
             ),
             calendar_enabled=(
                 user_metadata.get("calendar_enabled") is not False
+                if isinstance(user_metadata, dict)
+                else True
+            ),
+            contacts_enabled=(
+                user_metadata.get("contacts_enabled") is not False
+                if isinstance(user_metadata, dict)
+                else True
+            ),
+            drive_enabled=(
+                user_metadata.get("drive_enabled") is not False
                 if isinstance(user_metadata, dict)
                 else True
             ),
@@ -198,4 +227,38 @@ def chat(
                 "The assistant encountered an unexpected error. "
                 "Please try again later."
             ),
+        )
+
+
+@router.get(
+    "/requests/{idempotency_key}",
+    response_model=ChatRequestStatusResponse,
+    status_code=status.HTTP_200_OK,
+)
+def get_chat_request_status(
+    idempotency_key: UUID,
+    conversation_id: Annotated[UUID, Query(...)],
+    user: CurrentUser,
+    service: ChatServiceDependency,
+):
+    try:
+        return service.get_chat_request_status(
+            user_id=UUID(str(user["id"])),
+            conversation_id=conversation_id,
+            idempotency_key=idempotency_key,
+        )
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat request not found.",
+        )
+    except Exception as exc:
+        log_exception_traceback(
+            logger,
+            "Failed to retrieve chat request status.",
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to retrieve chat request status.",
         )

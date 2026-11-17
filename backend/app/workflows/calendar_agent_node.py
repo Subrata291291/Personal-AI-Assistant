@@ -203,10 +203,23 @@ def _requested_calendar_name(message: str) -> str | None:
     if not name:
         return None
     words = name.split()
-    if all(
-        word.casefold() in {"google", "primary", "my", "me", "the"}
-        for word in words
+    lowered_words = [word.casefold() for word in words]
+    temporal_modifiers = {
+        "upcoming", "next", "today", "todays", "tomorrow",
+        "yesterday", "yesterdays", "this", "current",
+    }
+    if name.casefold() in temporal_modifiers or any(
+        word in temporal_modifiers for word in lowered_words
     ):
+        # Temporal phrases like "upcoming calendar"/"today's calendar" are not
+        # explicit calendar-name selections.
+        return None
+    non_name_modifiers = {"google", "primary", "my", "me", "the", "all"}
+    if "all" in lowered_words:
+        return None
+    if name.casefold() in {"all", "all my", "me all my"}:
+        return None
+    if all(word in non_name_modifiers for word in lowered_words):
         return None
     if name.casefold() in {
         "google", "primary", "my", "the", "me", "me my",
@@ -328,6 +341,27 @@ def _select_next_event(
 
 def _clarification(state: ChatState) -> str:
     lowered = state["user_message"].casefold()
+    text = state["user_message"].strip()
+    # Generic Calendar requests should default to a useful overview, not force IDs.
+    if re.fullmatch(
+        r"\s*(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*(?:please\s+)?(?:check|show|open|view)\s+"
+        r"(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*(?:what(?:'s| is)\s+on\s+)?(?:my\s+)?"
+        r"(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ):
+        return (
+            "Let me show your Google Calendar for today in your selected "
+            "timezone."
+        )
     if re.search(r"\b(?:free|available|availability)\b", lowered):
         if re.search(
             r"\b(?:utc|gmt|pst|pdt|mst|mdt|cst|cdt|est|edt|bst)\b",
@@ -373,7 +407,8 @@ def _clarification(state: ChatState) -> str:
         )
     return (
         "I couldn’t determine which Calendar information you want. Please "
-        "specify a date range, event title, or event ID."
+        "tell me what to check (for example, today's events, a date range, "
+        "or a specific event title)."
     )
 
 
@@ -381,12 +416,50 @@ def _format_event_time(
     event_time: dict[str, Any] | None,
     timezone: str,
 ) -> str:
+    if isinstance(event_time, datetime):
+        # Some call sites may pass a boundary value directly.
+        try:
+            parsed = event_time
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return "time unavailable"
+            return parsed.astimezone(ZoneInfo(timezone)).strftime("%Y-%m-%d %I:%M %p %Z")
+        except Exception:
+            return "time unavailable"
+    if isinstance(event_time, date) and not isinstance(event_time, datetime):
+        return f"{event_time.isoformat()} (all day)"
+    if isinstance(event_time, str):
+        try:
+            parsed = datetime.fromisoformat(
+                event_time[:-1] + "+00:00" if event_time.endswith("Z") else event_time
+            )
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                # Treat plain YYYY-MM-DD strings as all-day dates.
+                raise ValueError("no offset")
+            return parsed.astimezone(ZoneInfo(timezone)).strftime("%Y-%m-%d %I:%M %p %Z")
+        except Exception:
+            try:
+                return f"{date.fromisoformat(event_time)} (all day)"
+            except Exception:
+                return "time unavailable"
     if not isinstance(event_time, dict):
         return "time unavailable"
     all_day = event_time.get("date")
     if isinstance(all_day, str):
         return f"{all_day} (all day)"
+    if isinstance(all_day, date) and not isinstance(all_day, datetime):
+        return f"{all_day.isoformat()} (all day)"
     raw = event_time.get("date_time")
+    if raw is None:
+        raw = event_time.get("dateTime")
+    if isinstance(raw, datetime):
+        try:
+            parsed = raw
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return "time unavailable"
+            local = parsed.astimezone(ZoneInfo(timezone))
+        except Exception:
+            return "time unavailable"
+        return local.strftime("%Y-%m-%d %I:%M %p %Z")
     if not isinstance(raw, str):
         return "time unavailable"
     try:
@@ -396,7 +469,7 @@ def _format_event_time(
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             return "time unavailable"
         local = parsed.astimezone(ZoneInfo(timezone))
-    except (ValueError, KeyError):
+    except Exception:
         return "time unavailable"
     return local.strftime("%Y-%m-%d %I:%M %p %Z")
 
@@ -404,20 +477,25 @@ def _format_event_time(
 def _format_local_datetime(value: Any, timezone: str) -> str:
     if isinstance(value, datetime):
         parsed = value
+    elif isinstance(value, date) and not isinstance(value, datetime):
+        return f"{value.isoformat()} (all day)"
     elif isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(
                 value[:-1] + "+00:00" if value.endswith("Z") else value
             )
         except ValueError:
-            return "time unavailable"
+            try:
+                return f"{date.fromisoformat(value)} (all day)"
+            except Exception:
+                return "time unavailable"
     else:
         return "time unavailable"
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return "time unavailable"
     try:
         local = parsed.astimezone(ZoneInfo(timezone))
-    except (ValueError, KeyError):
+    except Exception:
         return "time unavailable"
     return local.strftime("%Y-%m-%d %I:%M %p %Z")
 
@@ -886,6 +964,12 @@ def _event_snapshot(event: dict[str, Any]) -> dict[str, Any]:
     recurrence = event.get("recurrence")
     if isinstance(recurrence, list):
         snapshot["recurrence"] = recurrence
+    recurring_event_id = event.get("recurring_event_id")
+    if isinstance(recurring_event_id, str) and recurring_event_id.strip():
+        snapshot["recurring_event_id"] = recurring_event_id
+    original_start_time = snapshot_time(event.get("original_start_time"))
+    if original_start_time is not None:
+        snapshot["original_start_time"] = original_start_time
     return snapshot
 
 
@@ -1597,7 +1681,12 @@ def _prepare_event_mutation(
                     {"role": "assistant", "content": response},
                 ],
             }
-    elif event_id is None and event_query is None:
+    elif event_id is None and event_query is None and not (
+        action_type == "calendar.delete_event"
+        and delete_details
+        and delete_details.get("generic_event_discovery")
+        and delete_details.get("event_date") is not None
+    ):
         response = (
             "Which Calendar event do you mean? Please include its title, "
             "time, or event ID in your latest message. Nothing was changed."
@@ -1683,8 +1772,16 @@ def _prepare_event_mutation(
                     }
                 calendar_id = matches[0]["id"]
             selected = None
+            generic_delete_discovery = bool(
+                action_type == "calendar.delete_event"
+                and delete_details
+                and delete_details.get("generic_event_discovery")
+                and not isinstance(event_id, str)
+            )
             if not isinstance(event_id, str) or not event_id.strip():
-                if not isinstance(event_query, str) or not event_query.strip():
+                if (
+                    not isinstance(event_query, str) or not event_query.strip()
+                ) and not generic_delete_discovery:
                     raise ValueError("An event ID or event search is required.")
                 lookup_time_min = (
                     lookup_details.get("lookup_time_min")
@@ -1710,7 +1807,7 @@ def _prepare_event_mutation(
                             page_token=page_token,
                             time_min=lookup_time_min,
                             time_max=lookup_time_max,
-                            query=event_query,
+                            query=(None if generic_delete_discovery else event_query),
                             time_zone=(
                                 lookup_details.get("time_zone")
                                 if lookup_details
@@ -1756,6 +1853,11 @@ def _prepare_event_mutation(
                         delete_details.get("delete_entire_series")
                         or delete_details.get("event_title_is_explicit")
                     )
+                ) or (
+                    action_type == "calendar.delete_event"
+                    and delete_details
+                    and delete_details.get("event_date") is not None
+                    and not delete_details.get("generic_event_discovery")
                 ):
                     events = [
                         event for event in events
@@ -1767,10 +1869,34 @@ def _prepare_event_mutation(
                         )
                     ]
                 if not events:
-                    response = (
-                        "I couldn’t find an existing Calendar event matching "
-                        "the requested title and date/time. Nothing was changed."
-                    )
+                    if generic_delete_discovery:
+                        day_label = "that day"
+                        if delete_details and delete_details.get("event_date") is not None:
+                            try:
+                                tz_name = state.get("user_timezone", "UTC") or "UTC"
+                                req_t = state.get("request_time")
+                                if req_t:
+                                    now_dt = datetime.fromisoformat(str(req_t).replace("Z", "+00:00"))
+                                else:
+                                    now_dt = datetime.now(timezone.utc)
+                                today_local = now_dt.astimezone(ZoneInfo(tz_name)).date()
+                                ev_date = delete_details.get("event_date")
+                                if ev_date == today_local:
+                                    day_label = "today"
+                                elif ev_date == today_local - timedelta(days=1):
+                                    day_label = "yesterday"
+                                elif ev_date == today_local + timedelta(days=1):
+                                    day_label = "tomorrow"
+                                else:
+                                    day_label = ev_date.isoformat()
+                            except Exception:
+                                day_label = "that day"
+                        response = f"I couldn't find any events on your calendar for {day_label}. Nothing was changed."
+                    else:
+                        response = (
+                            "I couldn’t find an existing Calendar event matching "
+                            "the requested title and date/time. Nothing was changed."
+                        )
                     return {
                         "assistant_response": response,
                         "calendar_action_details": {
@@ -1785,6 +1911,7 @@ def _prepare_event_mutation(
                         ],
                     }
                 if len(events) != 1 or matches.get("next_page_token"):
+                    choice_events = [e for e in events[:5] if isinstance(e, dict)]
                     choices = "\n".join(
                         _format_event(
                             event,
@@ -1793,15 +1920,65 @@ def _prepare_event_mutation(
                             if isinstance(matches.get("calendar_id"), str)
                             else None,
                         )
-                        for event in events[:5]
-                        if isinstance(event, dict)
+                        for event in choice_events
                     )
-                    response = (
-                        "I found multiple possible Calendar events. Which one "
-                        "do you mean? Please identify it by title and time:\n\n"
-                        f"{choices}"
-                    )
-                    return {
+                    user_msg_lower = str(state.get("user_message") or "").casefold()
+                    bulk_delete_requested = bool(re.search(
+                        r"\b(?:remove|delete|cancel)\s+(?:all|every|everything)\b|"
+                        r"\b(?:remove|delete|cancel)\s+all\s+(?:the\s+)?(?:events?|meetings?|appointments?)\b|"
+                        r"\ball\s+(?:the\s+)?(?:events?|meetings?|appointments?)\b",
+                        user_msg_lower,
+                    ))
+                    if generic_delete_discovery:
+                        day_label = "that day"
+                        if delete_details and delete_details.get("event_date") is not None:
+                            try:
+                                tz_name = state.get("user_timezone", "UTC") or "UTC"
+                                req_t = state.get("request_time")
+                                if req_t:
+                                    now_dt = datetime.fromisoformat(str(req_t).replace("Z", "+00:00"))
+                                else:
+                                    now_dt = datetime.now(timezone.utc)
+                                today_local = now_dt.astimezone(ZoneInfo(tz_name)).date()
+                                ev_date = delete_details.get("event_date")
+                                if ev_date == today_local:
+                                    day_label = "today"
+                                elif ev_date == today_local - timedelta(days=1):
+                                    day_label = "yesterday"
+                                elif ev_date == today_local + timedelta(days=1):
+                                    day_label = "tomorrow"
+                                else:
+                                    day_label = ev_date.isoformat()
+                            except Exception:
+                                day_label = "that day"
+                        if (
+                            action_type == "calendar.delete_event"
+                            and bulk_delete_requested
+                            and not matches.get("next_page_token")
+                            and len(events) >= 2
+                        ):
+                            response = (
+                                f"You asked to delete all {len(events)} events on {day_label}. "
+                                "I will not delete anything without explicit confirmation.\n\n"
+                                "Affected events:\n"
+                                f"{choices}\n\n"
+                                f"To proceed, reply with the exact confirmation: "
+                                f"\"confirm delete all {len(events)} events\". "
+                                "To cancel, reply \"cancel\". To delete only one event, reply with its number or title."
+                            )
+                        else:
+                            response = (
+                                f"I found multiple events on your calendar for {day_label}. "
+                                "Which one do you want to delete? Please reply with the number (for example, \"delete the second one\") or title/time:\n\n"
+                                f"{choices}"
+                            )
+                    else:
+                        response = (
+                            "I found multiple possible Calendar events. Which one "
+                            "do you mean? Please reply with the number (for example, \"delete the second one\") or title/time:\n\n"
+                            f"{choices}"
+                        )
+                    payload: dict[str, Any] = {
                         "assistant_response": response,
                         "calendar_action_details": {
                             "calendar_id": calendar_id,
@@ -1814,6 +1991,64 @@ def _prepare_event_mutation(
                             {"role": "assistant", "content": response},
                         ],
                     }
+                    if action_type == "calendar.delete_event" and not matches.get("next_page_token"):
+                        req_time = state.get("request_time")
+                        try:
+                            now_dt = datetime.fromisoformat(str(req_time).replace("Z", "+00:00")) if req_time else datetime.now(timezone.utc)
+                        except Exception:
+                            now_dt = datetime.now(timezone.utc)
+                        def _json_safe_event_boundary(value: Any) -> Any:
+                            if isinstance(value, datetime):
+                                return value.isoformat()
+                            if isinstance(value, date):
+                                return value.isoformat()
+                            return value
+
+                        candidates = []
+                        for event in choice_events:
+                            eid = event.get("id")
+                            if not isinstance(eid, str) or not eid:
+                                continue
+                            start = event.get("start") if isinstance(event.get("start"), dict) else {}
+                            end = event.get("end") if isinstance(event.get("end"), dict) else {}
+                            candidates.append({
+                                "event_id": eid,
+                                "calendar_id": calendar_id,
+                                "summary": event.get("summary"),
+                                "start": _json_safe_event_boundary(start.get("date_time") or start.get("date")),
+                                "end": _json_safe_event_boundary(end.get("date_time") or end.get("date")),
+                                "time_zone": start.get("time_zone") or end.get("time_zone") or state.get("user_timezone", "UTC"),
+                            })
+                        if candidates:
+                            pending_selection = {
+                                "version": 1,
+                                "operation": "delete_selection",
+                                "user_id": str(state.get("user_id") or user_id),
+                                "conversation_id": str(state.get("conversation_id") or ""),
+                                "connection_id": str(connection_id),
+                                "calendar_id": calendar_id,
+                                "candidates": candidates,
+                                "created_at": now_dt.isoformat(),
+                                "expires_at": (now_dt + timedelta(minutes=10)).isoformat(),
+                                "original_request": state.get("user_message"),
+                                "generic_event_discovery": bool(generic_delete_discovery),
+                            }
+                            if (
+                                action_type == "calendar.delete_event"
+                                and bulk_delete_requested
+                                and generic_delete_discovery
+                                and not matches.get("next_page_token")
+                                and len(candidates) >= 2
+                            ):
+                                bound_ids = [c.get("event_id") for c in candidates if isinstance(c.get("event_id"), str)]
+                                pending_selection.update({
+                                    "awaiting_bulk_confirmation": True,
+                                    "bulk_candidate_event_ids": bound_ids,
+                                    "bulk_candidate_count": len(candidates),
+                                    "bulk_confirmation_phrase": f"confirm delete all {len(candidates)} events",
+                                })
+                            payload["pending_calendar_delete_selection"] = pending_selection
+                    return payload
                 selected = events[0]
                 event_id = selected.get("id") if isinstance(selected, dict) else None
                 if not isinstance(event_id, str) or not event_id:
@@ -2187,6 +2422,30 @@ def calendar_agent_node(
     runtime: Runtime[ChatContext],
 ) -> dict[str, Any]:
     plan = state.get("gmail_plan") or {}
+    if state.get("calendar_passthrough_response") and isinstance(
+        state.get("assistant_response"), str
+    ):
+        response = state["assistant_response"]
+        out: dict[str, Any] = {
+            "assistant_response": response,
+            "provider": state.get("provider", ""),
+            "model": state.get("model", ""),
+            "messages": [
+                {"role": "user", "content": state.get("user_message", "")},
+                {"role": "assistant", "content": response},
+            ],
+        }
+        # Preserve pending-state updates emitted by router (e.g. bulk confirmation binding).
+        for key in (
+            "pending_calendar_delete_selection",
+            "pending_calendar_action",
+            "pending_calendar_read",
+            "pending_contacts_clarification",
+            "calendar_action_details",
+        ):
+            if key in state:
+                out[key] = state.get(key)
+        return out
     if plan.get("intent") == "calendar_action_cancelled":
         response = (
             "The pending Google Calendar request was canceled. "
@@ -2323,6 +2582,7 @@ def calendar_agent_node(
         delete_details = parse_calendar_delete_request(
             state["user_message"],
             planner_time_zone=planner_time_zone,
+            reference_time=state.get("request_time"),
         )
         arguments = dict(planner_arguments)
         if delete_details.get("event_query"):
@@ -2628,38 +2888,161 @@ def calendar_agent_node(
         not isinstance(arguments, dict)
         and tool_name != "create_calendar_event_proposal"
     ):
-        if (
-            re.search(
-                r"\b(?:create|add|book|schedule|move|update|edit|change|"
-                r"modify|reschedule|delete|remove|cancel)\b",
-                state["user_message"],
-                re.IGNORECASE,
+        generic_overview = (
+            state.get("gmail_plan", {}).get("intent") == "google_calendar"
+            and (
+                re.fullmatch(
+                    r"\s*(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+                    state["user_message"].strip(),
+                    re.IGNORECASE,
+                )
+                or re.fullmatch(
+                    r"\s*(?:please\s+)?(?:check|show|open|view)\s+"
+                    r"(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+                    state["user_message"].strip(),
+                    re.IGNORECASE,
+                )
+                or re.fullmatch(
+                    r"\s*(?:what(?:'s| is)\s+on\s+)?(?:my\s+)?"
+                    r"(?:google\s+)?calendar\s*[.!?]*\s*",
+                    state["user_message"].strip(),
+                    re.IGNORECASE,
+                )
+                or re.fullmatch(
+                    r"\s*show\s+my\s+calendar\s*[.!?]*\s*",
+                    state["user_message"].strip(),
+                    re.IGNORECASE,
+                )
             )
-            and state.get("gmail_plan", {}).get("intent") == "google_calendar"
-        ):
-            if runtime.context.get("calendar_enabled", True) is False:
-                response = (
-                    "Google Calendar is turned off in Connected Apps. Turn it "
-                    "on there to use Calendar; your Google account remains connected."
+        )
+        if generic_overview:
+            tool_name = "get_today_schedule"
+            arguments = {
+                "time_zone": state.get("user_timezone") or "UTC",
+                "calendar_id": "primary",
+            }
+            # continue to read-tool execution below
+        else:
+            if (
+                re.search(
+                    r"\b(?:create|add|book|schedule|move|update|edit|change|"
+                    r"modify|reschedule|delete|remove|cancel)\b",
+                    state["user_message"],
+                    re.IGNORECASE,
                 )
-            elif not runtime.context.get("google_connection_available", False):
-                response = (
-                    "Google Calendar is not connected. Connect a Google "
-                    "account in Connected Apps. No event was created."
-                )
+                and state.get("gmail_plan", {}).get("intent") == "google_calendar"
+            ):
+                if runtime.context.get("calendar_enabled", True) is False:
+                    response = (
+                        "Google Calendar is turned off in Connected Apps. Turn it "
+                        "on there to use Calendar; your Google account remains connected."
+                    )
+                elif not runtime.context.get("google_connection_available", False):
+                    response = (
+                        "Google Calendar is not connected. Connect a Google "
+                        "account in Connected Apps. No event was created."
+                    )
+                else:
+                    response = _clarification(state)
             else:
                 response = _clarification(state)
-        else:
-            response = _clarification(state)
-        return {
-            "assistant_response": response,
-            "provider": "",
-            "model": "",
-            "messages": [
-                {"role": "user", "content": state["user_message"]},
-                {"role": "assistant", "content": response},
-            ],
-        }
+
+            pending_read: dict[str, Any] | None = None
+            try:
+                message_text = (state.get("user_message") or "").strip()
+                lowered_msg = message_text.casefold()
+                is_month_like_read = bool(
+                    re.search(
+                        r"\b(this|next|current)\s+months?\b|"
+                        r"\b(?:this|next|current)\s+month(?:['’]s)?\b|"
+                        r"\b(january|february|march|april|may|june|july|august|"
+                        r"september|october|november|december)\b",
+                        lowered_msg,
+                    )
+                    and re.search(r"\b(?:calendar|schedule|events?|meetings?)\b", lowered_msg)
+                    and not re.search(
+                        r"\b(?:create|add|book|schedule|move|update|edit|change|"
+                        r"modify|reschedule|delete|remove|cancel)\b",
+                        lowered_msg,
+                    )
+                )
+                if is_month_like_read:
+                    timezone_name = state.get("user_timezone") or "UTC"
+                    try:
+                        ZoneInfo(timezone_name)
+                    except Exception:
+                        timezone_name = "UTC"
+                    req_time = state.get("request_time")
+                    if isinstance(req_time, datetime):
+                        now_dt = req_time
+                    elif isinstance(req_time, str):
+                        now_dt = datetime.fromisoformat(req_time.replace("Z", "+00:00"))
+                    else:
+                        now_dt = datetime.now(timezone.utc)
+                    today_local = now_dt.astimezone(ZoneInfo(timezone_name)).date()
+                    rel = re.search(
+                        r"\b(this|next|current)\s+months?\b|\b(?:this|next|current)\s+month(?:['’]s)?\b",
+                        lowered_msg,
+                    )
+                    named = re.search(
+                        r"\b(january|february|march|april|may|june|july|august|"
+                        r"september|october|november|december)\b(?:\s+(20\d{2}))?\b",
+                        lowered_msg,
+                    )
+                    month_start: date | None = None
+                    if rel:
+                        token_match = re.search(r"\b(this|next|current)\b", rel.group(0), re.IGNORECASE)
+                        token = token_match.group(1).casefold() if token_match else "this"
+                        offset = 1 if token == "next" else 0
+                        month_start = date(
+                            today_local.year + (today_local.month - 1 + offset) // 12,
+                            (today_local.month - 1 + offset) % 12 + 1,
+                            1,
+                        )
+                    elif named:
+                        month_names = (
+                            "january", "february", "march", "april", "may", "june",
+                            "july", "august", "september", "october", "november", "december",
+                        )
+                        month_num = month_names.index(named.group(1).casefold()) + 1
+                        month_year = int(named.group(2)) if named.group(2) else today_local.year
+                        month_start = date(month_year, month_num, 1)
+                    if month_start is not None:
+                        preserved_arguments = {
+                            "date": month_start.isoformat(),
+                            "period": "month",
+                            "time_zone": timezone_name,
+                            "calendar_id": "primary",
+                        }
+                        pending_read = {
+                            "version": 1,
+                            "type": "calendar_read_continuation",
+                            "user_id": str(state.get("user_id")),
+                            "conversation_id": str(state.get("conversation_id")),
+                            "expires_at": (now_dt + timedelta(minutes=10)).isoformat(),
+                            "calendar_id": "primary",
+                            "time_zone": timezone_name,
+                            "last_tool": "get_calendar_schedule",
+                            "last_request": message_text,
+                            "intent": "google_calendar",
+                            "tool": "get_calendar_schedule",
+                            "arguments": preserved_arguments,
+                        }
+            except Exception:
+                pending_read = None
+
+            result = {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+            if pending_read is not None:
+                result["pending_calendar_read"] = pending_read
+            return result
 
 
     def _create_event_proposal(
@@ -2688,10 +3071,53 @@ def calendar_agent_node(
         connection_id = context.get("calendar_write_connection_id")
         user_id = context.get("user_id")
         if not connection_id or not user_id:
-            response = (
-                "I couldn’t safely select an authorized Google Calendar account "
-                "for this event. Nothing was created."
-            )
+            if not user_id:
+                response = "Calendar access is unavailable for this request. Nothing was created."
+            elif not context.get("google_connection_available", False):
+                response = (
+                    "Google Calendar is not connected. Connect a Google account "
+                    "in Connected Apps. No event was created."
+                )
+            elif context.get("calendar_default_connection_invalid", False):
+                response = (
+                    "Your saved default Google Calendar account is unavailable. "
+                    "Choose a connected Google Calendar account in Connected Apps, "
+                    "then try again. Nothing was created."
+                )
+            elif context.get("calendar_write_selection_required", False):
+                response = (
+                    "More than one connected Google account can create Calendar "
+                    "events, and no valid default is selected. Choose your default "
+                    "Google Calendar account in Connected Apps, then try again. "
+                    "Nothing was created."
+                )
+            elif context.get("calendar_selected_write_scope_missing", False):
+                response = (
+                    "Your selected Google account is missing the required Calendar "
+                    "event write permission (calendar.events). Re-consent that "
+                    "account in Connected Apps for Calendar event changes. I will "
+                    "not switch to another account. Nothing was created."
+                )
+            elif not capabilities.get("create_feature_enabled", False):
+                response = (
+                    "Calendar event creation is currently unavailable in this "
+                    "environment. Your Google account was not used and nothing was "
+                    "created."
+                )
+            elif not capabilities.get("write_permission_granted", False):
+                response = (
+                    "No eligible connected Google Calendar account with Calendar "
+                    "event write permission is available for this user. Grant "
+                    "Calendar event write access (calendar.events) in Connected "
+                    "Apps, then try again. Nothing was created."
+                )
+            else:
+                response = (
+                    "I couldn’t safely select an authorized Google Calendar account "
+                    "for this event. Please verify your connected Google Calendar "
+                    "account permissions and default selection in Connected Apps. "
+                    "Nothing was created."
+                )
             return {
                 "assistant_response": response,
                 "provider": "",
@@ -3470,7 +3896,8 @@ def calendar_agent_node(
             )
     except Exception:
         calendar_events = []
-    return {
+
+    result: dict[str, Any] = {
         "assistant_response": response,
         "provider": "",
         "model": "",
@@ -3480,3 +3907,32 @@ def calendar_agent_node(
             {"role": "assistant", "content": response},
         ],
     }
+    # Persist scoped Calendar read context for legitimate date/refinement follow-ups.
+    try:
+        if tool_name in {
+            "list_calendar_events",
+            "get_calendar_event",
+            "get_today_schedule",
+            "get_calendar_schedule",
+            "check_calendar_availability",
+            "list_calendars",
+        }:
+            req_time = state.get("request_time")
+            now_dt = datetime.fromisoformat(str(req_time).replace("Z", "+00:00")) if req_time else datetime.now(timezone.utc)
+            pending_read = {
+                "version": 1,
+                "type": "calendar_read_continuation",
+                "user_id": str(state.get("user_id")),
+                "conversation_id": str(state.get("conversation_id")),
+                "expires_at": (now_dt + timedelta(minutes=10)).isoformat(),
+                "calendar_id": (arguments.get("calendar_id") if isinstance(arguments, dict) and isinstance(arguments.get("calendar_id"), str) else "primary"),
+                "time_zone": state.get("user_timezone", "UTC"),
+                "last_tool": tool_name,
+                "last_request": state.get("user_message"),
+            }
+            if isinstance(arguments, dict) and isinstance(arguments.get("query"), str):
+                pending_read["query"] = arguments.get("query")
+            result["pending_calendar_read"] = pending_read
+    except Exception:
+        pass
+    return result

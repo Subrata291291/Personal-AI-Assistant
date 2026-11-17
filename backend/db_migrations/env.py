@@ -5,6 +5,7 @@ from alembic import context
 from app.db.base import Base
 from app.db.session import engine, build_database_url
 from app.db.models import (
+    ContactsActionIdempotency,
     Conversation,
     ConversationMessage,
     Memory,

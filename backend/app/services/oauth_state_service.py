@@ -86,13 +86,22 @@ class OAuthStateService:
             "calendar",
             "calendar_write",
             "calendar_list_read",
+            "contacts_read",
+            "contacts_write",
+            "drive_read",
+            "drive_write",
+            "drive_file",
         }:
             raise ValueError("Unsupported Google OAuth service.")
-        if service in {"calendar_write", "calendar_list_read"} \
-                and target_connection_id is None:
+        if service in {
+            "calendar_write",
+            "calendar_list_read",
+            "contacts_write",
+            "drive_write",
+        } and target_connection_id is None:
             raise ValueError(
-                "Calendar write and Calendar List consent must target an "
-                "existing connection."
+                "Incremental Google consent must target an existing "
+                "connection."
             )
 
         original_state = self._generate_state()

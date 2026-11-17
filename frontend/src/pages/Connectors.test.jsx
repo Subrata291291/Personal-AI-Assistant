@@ -80,10 +80,11 @@ const noCalendarCapabilities = {
   write_available: false,
 }
 
-function connectedResponse(connections, calendarCapabilities) {
+function connectedResponse(connections, calendarCapabilities, extra = {}) {
   return {
     connections,
     calendar_capabilities: calendarCapabilities || noCalendarCapabilities,
+    ...extra,
   }
 }
 
@@ -169,7 +170,9 @@ describe('Connected Apps', () => {
     renderConnectors()
 
     const gmailSwitch = await screen.findByRole('switch', { name: 'Enable Gmail' })
-    expect(await screen.findAllByText('Disconnected')).toHaveLength(2)
+    // Google Drive is temporarily disabled/coming soon and is not shown as disconnected.
+    expect(await screen.findAllByText('Disconnected')).toHaveLength(3)
+    expect(screen.getByText('Under development')).toBeInTheDocument()
     fireEvent.click(gmailSwitch)
 
     await waitFor(() => {
@@ -178,7 +181,8 @@ describe('Connected Apps', () => {
       '/api/v1/oauth/google/connect?service=gmail',
     )
     })
-    expect(screen.getAllByText('Disconnected')).toHaveLength(2)
+    // Google Drive is temporarily disabled/coming soon and is not shown as disconnected.
+    expect(screen.getAllByText('Disconnected')).toHaveLength(3)
   })
 
   it('requests Calendar scopes independently', async () => {
@@ -559,8 +563,13 @@ describe('Connected Apps', () => {
     }))
     renderConnectors()
 
-    const account = await screen.findByText('person@example.com')
-    const accountCard = account.closest('article')
+    const accountMatches = await screen.findAllByText('person@example.com')
+    const accountCard = accountMatches
+      .map((element) => element.closest('article'))
+      .find((article) =>
+        article && within(article).queryByText(/Gmail: Connected/),
+      )
+    expect(accountCard).toBeTruthy()
     expect(within(accountCard).getByText(/Write permission: Not available/))
       .toBeInTheDocument()
     expect(within(accountCard).queryByRole('button', {
@@ -657,14 +666,201 @@ describe('Connected Apps', () => {
     )).toBe(0)
   })
 
-  it('keeps Calendar and unrelated Google services distinct', async () => {
+  it('shows Google Drive as coming soon/unavailable while Contacts remains available', async () => {
     renderConnectors()
 
-    expect(await screen.findAllByText('Coming soon')).toHaveLength(2)
+    expect(await screen.findByRole('heading', { name: 'Google Drive' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Connect Google Drive' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Grant missing Google Drive permissions' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Grant Drive file access' })).not.toBeInTheDocument()
+    const contactsConnectButton = await screen.findByRole('button', { name: 'Connect Google Contacts' })
+    await waitFor(() => expect(contactsConnectButton).toBeEnabled())
+    const driveCard = screen.getByRole('heading', { name: 'Google Drive' }).closest('article')
+    expect(within(driveCard).getByText(/Coming soon/i)).toBeInTheDocument()
+    expect(within(driveCard).getByText(/available in a future update/i)).toBeInTheDocument()
+    expect(within(driveCard).getByText('Under development')).toBeInTheDocument()
+    expect(within(driveCard).getByText('Unavailable')).toBeInTheDocument()
+    const driveToggle = within(driveCard).getByRole('switch', { name: 'Enable Google Drive' })
+    expect(driveToggle).toBeDisabled()
+    expect(driveToggle).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('does not display Drive as connected or operational even if backend reports grants', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        gmail: false,
+        calendar: false,
+        drive: true,
+        drive_contracts_read: true,
+      },
+    }], noCalendarCapabilities, {
+      drive_capabilities: {
+        connected: true,
+        read: true,
+        contracts_read: true,
+        google_connection_available: true,
+        permissions_need_consent: false,
+      },
+    }))
+    renderConnectors()
+
+    const driveCard = screen.getByRole('heading', { name: 'Google Drive' }).closest('article')
+    expect(await within(driveCard).findByText('Under development')).toBeInTheDocument()
+    expect(within(driveCard).getByText('Unavailable')).toBeInTheDocument()
+    expect(within(driveCard).queryByText('Connected · Enabled')).not.toBeInTheDocument()
+    expect(within(driveCard).queryByText('Permissions incomplete')).not.toBeInTheDocument()
+    expect(within(driveCard).queryByText('Selected-file read access: Granted')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Grant Drive file access' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/Google Drive: Connected/)).not.toBeInTheDocument()
+  })
+
+  it('keeps Contacts permission status accurate while Drive remains coming soon', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: { gmail: true, calendar: false },
+    }], noCalendarCapabilities, {
+      contacts_capabilities: {
+        connected: false,
+        read: false,
+        write_permission_granted: false,
+      },
+    }))
+    renderConnectors()
+
+    const driveCard = screen.getByRole('heading', { name: 'Google Drive' }).closest('article')
+    const contactsCard = screen.getByRole('heading', { name: 'Google Contacts' }).closest('article')
+    expect(await within(driveCard).findByText('Under development')).toBeInTheDocument()
+    expect(within(driveCard).getByText('Unavailable')).toBeInTheDocument()
+    expect(within(driveCard).queryByText('Permissions incomplete')).not.toBeInTheDocument()
+    expect(within(driveCard).queryByText('Selected-file read access: Not granted')).not.toBeInTheDocument()
+    expect(await within(contactsCard).findByText('Permissions incomplete')).toBeInTheDocument()
+    expect(within(contactsCard).getByText('Read permission: Not granted')).toBeInTheDocument()
+    expect(within(contactsCard).queryByText('Connected · Enabled')).not.toBeInTheDocument()
+  })
+
+  it('requires an explicit Contacts account when several accounts grant access', async () => {
+    api.get.mockResolvedValue(connectedResponse([
+      {
+        ...googleConnection,
+        id: 'contacts-one',
+        email: 'one@example.com',
+        capabilities: { gmail: false, calendar: false, contacts_read: true },
+      },
+      {
+        ...googleConnection,
+        id: 'contacts-two',
+        email: 'two@example.com',
+        capabilities: { gmail: false, calendar: false, contacts_read: true },
+      },
+    ], noCalendarCapabilities, {
+      contacts_capabilities: {
+        connected: true,
+        read: true,
+        write_permission_granted: false,
+        google_connection_available: true,
+        permissions_need_consent: false,
+      },
+    }))
+    renderConnectors()
+
+    const selector = await screen.findByLabelText('Contacts account')
+    expect(within(selector).getByRole('option', { name: 'one@example.com' }))
+      .toBeInTheDocument()
+    fireEvent.change(selector, { target: { value: 'contacts-two' } })
+
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Connect Google Calendar' }))
-        .toBeEnabled()
+      expect(updateUserMetadata).toHaveBeenCalledWith({
+        default_contacts_connection_id: 'contacts-two',
+      })
     })
+  })
+
+  it('turns Contacts off without disconnecting the shared Google account', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: { gmail: false, calendar: false, contacts_read: true },
+    }], noCalendarCapabilities, {
+      contacts_capabilities: {
+        connected: true,
+        read: true,
+        write_permission_granted: false,
+        google_connection_available: true,
+        permissions_need_consent: false,
+      },
+    }))
+    renderConnectors()
+
+    const contactsSwitch = await screen.findByRole('switch', {
+      name: 'Enable Google Contacts',
+    })
+    await waitFor(() => expect(contactsSwitch).toBeEnabled())
+    fireEvent.click(contactsSwitch)
+
+    await waitFor(() => {
+      expect(updateUserMetadata).toHaveBeenCalledWith({
+        contacts_enabled: false,
+      })
+    })
+    expect(api.delete).not.toHaveBeenCalled()
+    expect(await screen.findByText('Connected · Disabled'))
+      .toBeInTheDocument()
+  })
+
+  it('requests Contacts read consent for the exact connected account when read is not granted', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        gmail: false,
+        calendar: false,
+        contacts_read: false,
+        contacts_write_permission_granted: false,
+      },
+    }], noCalendarCapabilities, {
+      contacts_capabilities: {
+        connected: false,
+        read: false,
+        write_permission_granted: false,
+        google_connection_available: true,
+        permissions_need_consent: true,
+      },
+    }))
+    renderConnectors()
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Grant Contacts read access',
+    }))
+
+    await waitFor(() => {
+      expect(api.post).toHaveBeenCalledWith(
+        `/api/v1/oauth/google/connect?service=contacts_read&connection_id=${googleConnection.id}`,
+      )
+    })
+  })
+
+  it('does not offer Drive file consent actions while Drive is coming soon', async () => {
+    api.get.mockResolvedValue(connectedResponse([{
+      ...googleConnection,
+      capabilities: {
+        gmail: false,
+        calendar: false,
+        drive: true,
+        drive_contracts_read: false,
+      },
+    }], noCalendarCapabilities, {
+      drive_capabilities: {
+        connected: true,
+        read: false,
+        contracts_read: false,
+        google_connection_available: true,
+        permissions_need_consent: true,
+      },
+    }))
+    renderConnectors()
+
+    expect(await screen.findByRole('heading', { name: 'Google Drive' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Grant Drive file access' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Grant missing Google Drive permissions' })).not.toBeInTheDocument()
   })
 
   it('does not report a service connected after a failed authorization request', async () => {

@@ -15,7 +15,7 @@ export const GOOGLE_WORKSPACE_SERVICES = [
     id: 'drive',
     label: 'Google Drive',
     path: '/dashboard/drive',
-    capability: 'drive_files_read',
+    capability: 'drive_contracts_read',
     comingSoon: true,
   },
   {
@@ -23,7 +23,6 @@ export const GOOGLE_WORKSPACE_SERVICES = [
     label: 'Google Contacts',
     path: '/dashboard/contacts',
     capability: 'contacts_read',
-    comingSoon: true,
   },
 ]
 

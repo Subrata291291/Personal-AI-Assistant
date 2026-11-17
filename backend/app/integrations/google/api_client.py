@@ -693,6 +693,97 @@ class GoogleAPIClient:
                         max_retries=max_retries,
                     )
 
+    async def download_bytes(
+        self,
+        db: Session,
+        user_id: str,
+        connection_id: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        max_bytes: int | None = None,
+    ) -> tuple[bytes, str]:
+        """Download a read-only provider document as bytes.
+
+        Used only for user-selected Drive files. The response body is never
+        logged or persisted by this client.
+        """
+        self._validate_url(url)
+
+        normalized_user_id = UUID(str(user_id))
+        normalized_connection_id = UUID(str(connection_id))
+
+        credential_service = OAuthCredentialService(db)
+        try:
+            access_token = await credential_service.get_valid_access_token(
+                user_id=normalized_user_id,
+                connection_id=normalized_connection_id,
+            )
+            db.commit()
+        except GoogleOAuthAuthorizationError as exc:
+            self._clear_revoked_connection_credentials(
+                db,
+                normalized_user_id,
+                normalized_connection_id,
+            )
+            raise exc
+        except Exception:
+            db.rollback()
+            raise
+
+        async with self._client_context(http_client) as client:
+            async with self._active_connection_request(
+                db,
+                normalized_user_id,
+                normalized_connection_id,
+            ):
+                started_at = perf_counter()
+                try:
+                    response = await client.request(
+                        method="GET",
+                        url=url,
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Accept": "*/*",
+                        },
+                        params=params,
+                    )
+                except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                    raise GoogleAPIError(
+                        status_code=503,
+                        message="Google Drive download failed.",
+                        retryable=True,
+                    ) from exc
+                finally:
+                    record_timing(
+                        "drive_api",
+                        (perf_counter() - started_at) * 1000,
+                    )
+                    logger.info(
+                        "google_drive_download_completed | request_id=%s "
+                        "| duration_ms=%.2f",
+                        request_id(),
+                        (perf_counter() - started_at) * 1000,
+                    )
+
+                if not response.is_success:
+                    raise GoogleAPIError(
+                        status_code=response.status_code,
+                        message="Google Drive download was rejected.",
+                        retryable=response.status_code in self.RETRYABLE_STATUS_CODES,
+                        reason=self._error_reason(response),
+                    )
+
+                content = response.content
+                if max_bytes is not None and len(content) > max_bytes:
+                    raise GoogleAPIError(
+                        status_code=413,
+                        message="Selected Drive file is too large to process.",
+                        retryable=False,
+                    )
+
+                return content, response.headers.get("content-type", "")
+
     async def request_mutation(
         self,
         db: Session,

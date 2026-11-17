@@ -112,6 +112,8 @@ def build_runtime_capabilities(
     granted_scopes: set[str],
     unavailable_routes: set[str],
     calendar_capabilities: dict[str, bool] | None = None,
+    drive_capabilities: dict[str, bool] | None = None,
+    contacts_capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build safe capability flags from grants and executable workflows."""
     send_scope = GmailService.REQUIRED_SEND_SCOPE
@@ -133,6 +135,8 @@ def build_runtime_capabilities(
         "tasks": "Tasks and reminders",
     }
     calendar = calendar_capabilities or {}
+    drive = drive_capabilities or {}
+    contacts = contacts_capabilities or {}
     calendar_chat_available = (
         "google_calendar" not in unavailable_routes
         and bool(
@@ -207,6 +211,49 @@ def build_runtime_capabilities(
                 calendar.get("delete_feature_enabled", False)
             ),
             "write_available": False,
+        },
+        "google_drive": {
+            "connected": False,
+            "google_connection_available": False,
+            "contracts_read": False,
+            "chat_available": False,
+            "integration_enabled": False,
+            "selection_required": False,
+            "default_connection_invalid": False,
+            "default_connection_selected": False,
+            "read_scope_missing": False,
+            "read_only": True,
+            "temporarily_unavailable": True,
+        },
+        "google_contacts": {
+            "connected": bool(
+                contacts.get("connected", False)
+                or contacts.get("read_available", False)
+            ),
+            "google_connection_available": bool(
+                contacts.get("google_connection_available", False)
+            ),
+            "chat_available": (
+                "google_contacts" not in unavailable_routes
+                and bool(contacts.get("chat_available", False))
+            ),
+            "read_available": bool(contacts.get("read_available", False)),
+            "integration_enabled": bool(
+                contacts.get("integration_enabled", True)
+            ),
+            "selection_required": bool(
+                contacts.get("selection_required", False)
+            ),
+            "default_connection_invalid": bool(
+                contacts.get("default_connection_invalid", False)
+            ),
+            "default_connection_selected": bool(
+                contacts.get("default_connection_selected", False)
+            ),
+            "read_scope_missing": bool(
+                contacts.get("read_scope_missing", False)
+            ),
+            "read_only": True,
         },
         "unavailable_integrations": [
             label
@@ -314,10 +361,13 @@ def _plan_prompt(state: ChatState) -> str:
         "prepare a proposal must use their Calendar proposal tool. "
         "Never create a proposal or execute an action from a planner decision. "
         "Use general for "
-        "non-integration requests. Use google_drive, google_contacts, or tasks "
-        "only when the user explicitly asks the Assistant to retrieve or manage "
-        "information in that integration; those integrations are not "
-        "implemented and must not pretend to access data. Use unsupported for Gmail changes not covered by an "
+        "non-integration requests. Use google_drive when the user asks about "
+        "contracts or agreements they selected for this app; Drive access is "
+        "read-only and limited to those selected files. Use google_contacts "
+        "or tasks only when the user explicitly asks the Assistant to retrieve "
+        "or manage information in that integration; those integrations are "
+        "not implemented and must not pretend to access data. Use unsupported "
+        "for Gmail changes not covered by an "
         "editable draft preview or the separate approval workflow. Classify "
         "new-email requests as gmail_compose, gmail_save_draft, or gmail_send "
         "as appropriate. All three produce an editable preview, never send "
@@ -471,8 +521,8 @@ def _calendar_create_followup_text(state: ChatState) -> str | None:
         current_message.casefold(),
     ))
     has_date = re.search(
-        r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|"
-        r"saturday|sunday|20\d{2}-\d{2}-\d{2})\b",
+        r"\b(?:today|tomorrow|(?:monday|tuesday|wednesday|thursday|friday|"
+        r"saturday|sunday)(?:'s|s)?|20\d{2}-\d{2}-\d{2})\b",
         current_message,
         re.IGNORECASE,
     )
@@ -771,6 +821,23 @@ def _pending_calendar_availability_resolution(
         <= _request_time(state).astimezone(ZoneInfo("UTC"))
     ):
         return None
+
+    text = (state.get("user_message") or "").strip()
+    lowered = text.casefold()
+    # Never consume independent Gmail/Contacts/Drive/Tasks requests or clear
+    # calendar non-availability intents. "whole day" follow-ups for other
+    # workflows must not be hijacked by stale calendar availability state.
+    if re.search(
+        r"\b(?:gmail|e-?mail|emails?|inbox|message|messages|thread|draft|reply|forward|send|"
+        r"contact|contacts|phone|mobile|number|drive|file|files|document|documents|pdf|task|tasks|reminder|reminders)\b",
+        lowered,
+    ):
+        # Allow only explicit availability/free/busy follow-ups that also mention calendar context.
+        if not re.search(r"\b(?:free|available|availability|busy|calendar|schedule)\b", lowered):
+            return None
+    if _is_explicit_new_intent(text) and not re.search(r"\b(?:free|available|availability|busy|whole day)\b", lowered):
+        return None
+
     timezone_name = (
         pending.get("time_zone")
         or state.get("user_timezone")
@@ -803,6 +870,487 @@ def _pending_calendar_availability_resolution(
             "time_max": end.isoformat(),
             "time_zone": timezone_name,
             "calendar_ids": ["primary"],
+        },
+    )
+
+
+def _gmail_date_range_clarification_payload(
+    state: ChatState,
+    *,
+    period: str,
+    target_date: date | None,
+    time_zone: str,
+) -> dict[str, Any]:
+    now_dt = _request_time(state).astimezone(ZoneInfo("UTC"))
+    payload: dict[str, Any] = {
+        "version": 1,
+        "type": "gmail_date_range_clarification",
+        "user_id": str(state.get("user_id") or ""),
+        "conversation_id": str(state.get("conversation_id") or ""),
+        "created_at": now_dt.isoformat(),
+        "expires_at": (now_dt + timedelta(minutes=10)).isoformat(),
+        "period": period,
+        "time_zone": time_zone,
+        "original_request": str(state.get("user_message") or "")[:500],
+    }
+    if target_date is not None:
+        payload["target_date"] = target_date.isoformat()
+    return payload
+
+
+def _gmail_search_fallback_clarification_payload(
+    state: ChatState,
+    *,
+    from_intent: str,
+    fallback_intent: str,
+    fallback_query: str | None = None,
+) -> dict[str, Any]:
+    now_dt = _request_time(state).astimezone(ZoneInfo("UTC"))
+    payload: dict[str, Any] = {
+        "version": 1,
+        "type": "gmail_search_fallback_clarification",
+        "user_id": str(state.get("user_id") or ""),
+        "conversation_id": str(state.get("conversation_id") or ""),
+        "created_at": now_dt.isoformat(),
+        "expires_at": (now_dt + timedelta(minutes=10)).isoformat(),
+        "from_intent": from_intent,
+        "fallback_intent": fallback_intent,
+        "original_request": str(state.get("user_message") or "")[:500],
+    }
+    if fallback_query:
+        payload["fallback_query"] = fallback_query
+    return payload
+
+
+def _is_affirmative_gmail_fallback_response(text: str) -> bool:
+    lowered = (text or "").strip().casefold()
+    if not lowered:
+        return False
+    normalized = re.sub(r"[\s,]+", " ", lowered).strip()
+    normalized = normalized.strip(" .!?")
+    if re.fullmatch(
+        r"(?:yes|yep|yeah|yup|sure|ok|okay|go ahead|please do|do it|sounds good|"
+        r"that works|yes please|please|search unread(?: inbox)?(?: emails?)?|"
+        r"sure go ahead|ok go ahead|okay go ahead|yes go ahead)",
+        normalized,
+    ):
+        return True
+    # Natural confirmations in context of this specific clarification.
+    if re.search(
+        r"\b(?:yes|yeah|yep|yup|sure|okay|ok)\b",
+        normalized,
+    ) and re.search(
+        r"\b(?:search|show|check|look|try|unread|inbox|instead|please|go ahead|do)\b",
+        normalized,
+    ) and len(normalized.split()) <= 12:
+        return True
+    if re.search(r"\bsearch (?:my )?unread(?: inbox)?(?: emails?)?\b", normalized):
+        return True
+    return False
+
+
+
+
+def _is_negative_gmail_fallback_response(text: str) -> bool:
+    lowered = (text or "").strip().casefold()
+    if not lowered:
+        return False
+    return bool(
+        re.fullmatch(
+            r"\s*(?:no|nope|nah|not now|don't|do not|dont|cancel|never ?mind|nevermind|"
+            r"no thanks|no,? thanks|forget it|ignore it|stop)\s*[.!?]*\s*",
+            lowered,
+        )
+        or re.search(r"\b(?:don'?t|do not)\s+do\s+that\b", lowered)
+        or re.search(r"\bno\b.*\b(?:thanks|need|search|don'?t)\b", lowered)
+    )
+
+
+def _build_gmail_unread_inbox_fallback_plan() -> dict[str, Any]:
+    """Use existing read intent for unread Inbox summarization/search."""
+    return SummarizeUnreadPlan(intent="summarize_unread").model_dump(mode="json")
+
+
+
+def _gmail_date_range_clarification_from_request(
+    state: ChatState,
+) -> tuple[dict[str, Any], str] | None:
+    """Return (pending_payload, clarification_text) for Gmail-only date-range clarifications.
+
+    Only for requests that are clearly Gmail email/message reads and require a day/date-range
+    clarification (e.g. whole day vs specific time range) for a specific day reference.
+    Never for Calendar/Contacts/Drive/tasks/mixed requests or unambiguous direct executions.
+    """
+    text = (state.get("user_message") or "").strip()
+    lowered = text.casefold()
+    if not text:
+        return None
+    # Must be email-focused and not compose/draft/send/reply/forward/mutation.
+    if not re.search(r"\b(?:email|emails|e-?mail|mail|messages?|inbox)\b", lowered):
+        return None
+    if re.search(r"\b(?:draft|write|compose|reply|forward|send|archive|delete|trash|label)\b", lowered):
+        return None
+    # Exclude other integrations/mixed intents.
+    if re.search(
+        r"\b(?:calendar|calender|schedule|meeting|meetings|event|events|appointment|appointments|"
+        r"contact|contacts|phone|mobile|number|drive|file|files|document|documents|pdf|"
+        r"task|tasks|reminder|reminders)\b",
+        lowered,
+    ):
+        return None
+    # "today" is unambiguous and must go directly to summarize_today.
+    if re.search(r"\b(?:today|todays|today's)\b", lowered):
+        return None
+    # If user already specified explicit clock times, not a date-range clarification.
+    if re.search(r"\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(?:am|pm|a\.m\.|p\.m\.)\b", lowered):
+        return None
+    # Avoid inventing clarification for generic "whole day/full day/all day" without a valid pending state.
+    if re.search(r"\b(?:whole\s+day|full\s+day|all\s+day)\b", lowered):
+        return None
+
+    timezone_name = _validated_timezone(state)
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+        timezone_name = "UTC"
+    now_local = _request_time(state).astimezone(tz)
+    today = now_local.date()
+
+    target_date: date | None = None
+    period = "date"
+    # Explicit ISO date or month/day/year forms handled conservatively.
+    iso = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    if iso:
+        try:
+            target_date = date.fromisoformat(iso.group(1))
+        except Exception:
+            target_date = None
+    if target_date is None and re.search(r"\byesterday\b", lowered):
+        # "yesterday" is normally resolved directly, but keep support for clarification payloads if emitted.
+        target_date = today - timedelta(days=1)
+        period = "yesterday"
+    if target_date is None:
+        # Reuse calendar-style relative/weekday parsing for a specific day reference.
+        rel = _relative_calendar_date(text, state)
+        if rel is not None and rel != today:
+            target_date = rel
+            period = "date"
+
+    # Require a concrete day reference to be a date-range clarification (not "show important emails").
+    if target_date is None:
+        return None
+
+    day_label = target_date.strftime("%B %d, %Y")
+    clarification = (
+        f"Do you want emails for the whole day on {day_label} "
+        f"({timezone_name}), or a specific start and end time?"
+    )
+    payload = _gmail_date_range_clarification_payload(
+        state,
+        period=period,
+        target_date=target_date,
+        time_zone=timezone_name,
+    )
+    payload["clarification_kind"] = "gmail_day_scope"
+    return payload, clarification
+
+
+def _pending_gmail_clarification_resolution(
+    state: ChatState,
+) -> dict[str, Any] | None:
+    pending = state.get("pending_gmail_clarification")
+    if not isinstance(pending, dict) or pending.get("version") != 1:
+        return None
+    pending_type = pending.get("type")
+    if pending_type not in {
+        "gmail_date_range_clarification",
+        "gmail_search_fallback_clarification",
+    }:
+        return None
+    user_id = state.get("user_id")
+    conversation_id = state.get("conversation_id")
+    if str(pending.get("user_id")) != str(user_id) or str(
+        pending.get("conversation_id")
+    ) != str(conversation_id):
+        return None
+    try:
+        expires_at = datetime.fromisoformat(
+            str(pending["expires_at"]).replace("Z", "+00:00")
+        )
+    except Exception:
+        # Invalid/malformed pending state: deterministic clear, continue normal routing.
+        return {"pending_gmail_clarification": None, "_gmail_clarification_clear_only": True}
+    now_dt = _request_time(state).astimezone(ZoneInfo("UTC"))
+    if expires_at.tzinfo is None or expires_at.astimezone(ZoneInfo("UTC")) <= now_dt:
+        # Expired: deterministic clear (cannot be consumed), continue normal routing.
+        return {"pending_gmail_clarification": None, "_gmail_clarification_clear_only": True}
+
+    text = (state.get("user_message") or "").strip()
+    lowered = text.casefold()
+
+    # Fallback clarification: "no important emails found -> search unread Inbox instead?"
+    if pending_type == "gmail_search_fallback_clarification":
+        fallback_intent = str(pending.get("fallback_intent") or "").strip()
+        from_intent = str(pending.get("from_intent") or "").strip()
+        # Decline/cancel: resolve pending without executing alternative search.
+        if _is_negative_gmail_fallback_response(text):
+            return {
+                "gmail_plan": {
+                    "intent": "clarify",
+                    "clarification_reason": "gmail_search_fallback_declined",
+                },
+                "assistant_route": "gmail",
+                "pending_gmail_clarification": None,
+                "assistant_response": (
+                    "Okay, I won’t search your unread Inbox emails right now."
+                ),
+            }
+
+        # Affirmative/contextual acceptance: execute the intended alternative Gmail search.
+        if _is_affirmative_gmail_fallback_response(text):
+            if fallback_intent == "summarize_unread":
+                plan = _build_gmail_unread_inbox_fallback_plan()
+                return {
+                    "gmail_plan": plan,
+                    "assistant_route": "gmail",
+                    "pending_gmail_clarification": None,
+                }
+            if fallback_intent == "search_emails" and pending.get("fallback_query"):
+                plan = SearchEmailsPlan(
+                    intent="search_emails",
+                    query=str(pending["fallback_query"]),
+                    max_results=10,
+                ).model_dump(mode="json")
+                return {
+                    "gmail_plan": plan,
+                    "assistant_route": "gmail",
+                    "pending_gmail_clarification": None,
+                }
+            # Unknown fallback target: clear safely and let normal routing handle.
+            return {
+                "pending_gmail_clarification": None,
+                "_gmail_clarification_clear_only": True,
+            }
+        # Independent/new request unrelated to this pending fallback: supersede/clear and continue routing.
+        if _is_explicit_new_intent(text) and not re.search(
+            r"\b(?:unread|inbox|important|email|emails|mail|messages?)\b",
+            lowered,
+        ):
+            return {
+                "pending_gmail_clarification": None,
+                "_gmail_clarification_clear_only": True,
+            }
+        # Explicit Gmail request that is clearly different from this fallback (not a yes/no) should supersede.
+        if _requires_intent_planning(text) and not re.fullmatch(
+            r"\s*(?:yes|yep|yeah|yup|sure|ok|okay|no|nope|nah)\s*[.!?]*\s*",
+            lowered,
+        ) and not re.search(r"\b(?:unread|inbox)\b", lowered):
+            return {
+                "pending_gmail_clarification": None,
+                "_gmail_clarification_clear_only": True,
+            }
+        # Keep scoped pending clarification active for ambiguous replies; ask user to clarify choice.
+        return {
+            "gmail_plan": {
+                "intent": "clarify",
+                "clarification_reason": "gmail_search_fallback_ambiguous",
+            },
+            "assistant_route": "gmail",
+            "pending_gmail_clarification": pending,
+            "assistant_response": (
+                "I can search your unread Inbox emails instead if you’d like. "
+                "Please reply with “yes” to proceed, or “no” to stop."
+            ),
+        }
+
+
+    # Scoped continuation only for this Gmail date-range clarification.
+    if re.search(
+        r"\b(?:calendar|calender|schedule|meeting|meetings|event|events|"
+        r"contact|contacts|phone|mobile|number|drive|file|files|document|documents|pdf|"
+        r"task|tasks|reminder|reminders)\b",
+        lowered,
+    ) and not re.search(r"\b(?:email|emails|e-?mail|mail|messages?|inbox)\b", lowered):
+        # Unrelated to this Gmail clarification: supersede/clear deterministically.
+        return {"pending_gmail_clarification": None, "_gmail_clarification_clear_only": True}
+
+    period = str(pending.get("period") or "").strip().lower()
+    target_date_raw = pending.get("target_date")
+    tz_name = str(pending.get("time_zone") or state.get("user_timezone") or "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+        tz_name = "UTC"
+
+    # Cancellation/decline of this clarification.
+    if re.fullmatch(
+        r"\s*(?:cancel|stop|never ?mind|nevermind|no thanks|no,? thanks|forget it|ignore it)\s*[.!?]*\s*",
+        lowered,
+    ):
+        return {
+            "gmail_plan": {"intent": "clarify"},
+            "assistant_route": "gmail",
+            "pending_gmail_clarification": None,
+            "assistant_response": "Okay, I won’t apply that email date-range clarification.",
+        }
+
+    # "whole day" / full day follow-up should continue Gmail only for this clarification.
+    whole_day_reply = bool(re.search(r"\b(?:whole\s+day|full\s+day|all\s+day)\b", lowered))
+    if whole_day_reply and period in {"today", "yesterday"}:
+        if period == "today":
+            plan = SummarizeTodayPlan(intent="summarize_today").model_dump(mode="json")
+            return {
+                "gmail_plan": plan,
+                "assistant_route": "gmail",
+                "pending_gmail_clarification": None,
+            }
+        # yesterday
+        if isinstance(target_date_raw, str):
+            try:
+                target_date = date.fromisoformat(target_date_raw)
+            except Exception:
+                target_date = _request_time(state).astimezone(tz).date() - timedelta(days=1)
+        else:
+            target_date = _request_time(state).astimezone(tz).date() - timedelta(days=1)
+        start = datetime.combine(target_date, datetime_time.min, tzinfo=tz)
+        end = start + timedelta(days=1)
+        query = f"after:{int(start.timestamp()) - 1} before:{int(end.timestamp())} -from:me"
+        plan = SearchEmailsPlan(
+            intent="search_emails",
+            query=query,
+            max_results=10,
+        ).model_dump(mode="json")
+        return {
+            "gmail_plan": plan,
+            "assistant_route": "gmail",
+            "pending_gmail_clarification": None,
+        }
+
+    # "whole day" for a specific clarified date.
+    if whole_day_reply and period == "date" and isinstance(target_date_raw, str):
+        try:
+            target_date = date.fromisoformat(target_date_raw)
+        except Exception:
+            return {"pending_gmail_clarification": None, "_gmail_clarification_clear_only": True}
+        start = datetime.combine(target_date, datetime_time.min, tzinfo=tz)
+        end = start + timedelta(days=1)
+        query = f"after:{int(start.timestamp()) - 1} before:{int(end.timestamp())} -from:me"
+        plan = SearchEmailsPlan(intent="search_emails", query=query, max_results=10).model_dump(mode="json")
+        return {
+            "gmail_plan": plan,
+            "assistant_route": "gmail",
+            "pending_gmail_clarification": None,
+        }
+
+    # Independent new intent should not be consumed; supersede pending clarification safely.
+    if _is_explicit_new_intent(text):
+        return {"pending_gmail_clarification": None, "_gmail_clarification_clear_only": True}
+
+    # Short, ambiguous follow-up to a Gmail clarification stays in Gmail context (keeps pending)
+    # only when it looks like a clarification response, not a new/unrelated request.
+    if (
+        len(text.split()) <= 4
+        and not re.search(r"\b(?:email|emails|mail|messages|inbox)\b", lowered)
+        and not re.search(
+            r"\b(?:what|who|where|when|why|how|can|could|show|list|find|search|get|open|check|"
+            r"create|add|schedule|book|delete|remove|cancel|update|edit|change|contact|contacts|"
+            r"calendar|calender|event|events|meeting|meetings|drive|file|files|task|tasks|reminder|help)\b",
+            lowered,
+        )
+    ):
+        return {
+            "gmail_plan": {"intent": "clarify"},
+            "assistant_route": "gmail",
+            "pending_gmail_clarification": pending,
+        }
+    # Unrelated/unconsumable follow-up: supersede/clear deterministically.
+    return {"pending_gmail_clarification": None, "_gmail_clarification_clear_only": True}
+
+
+
+def _pending_calendar_read_resolution(
+    state: ChatState,
+) -> tuple[dict[str, Any], str] | None:
+    pending = state.get("pending_calendar_read")
+    if not isinstance(pending, dict) or pending.get("version") != 1:
+        return None
+    if pending.get("type") != "calendar_read_continuation":
+        return None
+    if str(pending.get("user_id")) != str(state.get("user_id")) or str(
+        pending.get("conversation_id")
+    ) != str(state.get("conversation_id")):
+        return None
+    try:
+        expires_at = datetime.fromisoformat(
+            str(pending["expires_at"]).replace("Z", "+00:00")
+        )
+    except Exception:
+        return None
+    now_dt = _request_time(state).astimezone(ZoneInfo("UTC"))
+    if expires_at.tzinfo is None or expires_at.astimezone(ZoneInfo("UTC")) <= now_dt:
+        return None
+    text = (state.get("user_message") or "").strip()
+    lowered = text.casefold()
+    # Only continue for scoped refinements, not independent intents or actions.
+    if _is_explicit_new_intent(text):
+        return None
+    if re.search(
+        r"\b(?:create|add|schedule|book|delete|remove|cancel|update|edit|change|move|reschedule|send|reply|forward|draft|drive|file|contact|gmail|email)\b",
+        lowered,
+    ):
+        return None
+
+    pending_tool = pending.get("tool")
+    pending_arguments = pending.get("arguments")
+    pending_plan_intent = pending.get("intent")
+    if (
+        isinstance(pending_tool, str)
+        and isinstance(pending_arguments, dict)
+        and (
+            pending_plan_intent == "google_calendar"
+            or pending_tool.startswith("get_")
+            or pending_tool.startswith("list_")
+            or pending_tool.startswith("check_")
+        )
+        and _is_bare_calendar_refinement(text)
+    ):
+        # Bare refinement like "google calendar" continues the preserved read intent.
+        return _calendar_plan(pending_tool, pending_arguments)
+
+    timezone_name = state.get("user_timezone") or pending.get("time_zone") or "UTC"
+    try:
+        ZoneInfo(timezone_name)
+    except Exception:
+        timezone_name = "UTC"
+    today = _request_time(state).astimezone(ZoneInfo(timezone_name)).date()
+    target_date = _relative_calendar_date(text, {**state, "user_timezone": timezone_name})
+    if target_date is None:
+        target_date = _extract_explicit_calendar_date(text, reference_date=today)
+    if target_date is None:
+        return None
+    # Require message to be primarily a date refinement (avoid hijacking unrelated requests).
+    cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", lowered)
+    cleaned = re.sub(r"\b(?:on|for|the|of|calendar|calender|events?|meetings?|schedule|day|please|show|me|what|is|are|my)\b", " ", cleaned)
+    cleaned = " ".join(cleaned.split())
+    # If too many residual tokens remain, it's not a simple date follow-up.
+    if len(cleaned.split()) > 4:
+        return None
+    cal_id = pending.get("calendar_id") if isinstance(pending.get("calendar_id"), str) else "primary"
+    if (
+        isinstance(pending_arguments, dict)
+        and pending_arguments.get("period") == "month"
+        and _is_bare_calendar_refinement(text)
+    ):
+        return _calendar_plan(str(pending_tool or "get_calendar_schedule"), pending_arguments)
+    return _calendar_plan(
+        "get_calendar_schedule",
+        {
+            "date": target_date.isoformat(),
+            "period": "day",
+            "time_zone": timezone_name,
+            "calendar_id": cal_id or "primary",
         },
     )
 
@@ -1016,7 +1564,7 @@ def _relative_calendar_date(text: str, state: ChatState) -> date | None:
         return today + timedelta(days=1)
     weekday_match = re.search(
         r"\b(?:(next|this)\s+)?"
-        r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:'s|s)?\b",
         lowered,
     )
     if not weekday_match:
@@ -1179,15 +1727,22 @@ def _calendar_create_draft_plan(
                 # clarification answer, not a new independent request.
                 if re.search(
                     r"\b(?:block|reserve|add|create|schedule|book|for|tomorrow|"
-                    r"today|monday|tuesday|wednesday|thursday|friday|saturday|"
-                    r"sunday)\b",
+                    r"today|(?:monday|tuesday|wednesday|thursday|friday|saturday|"
+                    r"sunday)(?:'s|s)?)\b",
                     current_message,
                     re.IGNORECASE,
                 ) or has_date:
                     new_create_request = True
             else:
+                # Heuristic for create requests not caught by strict patterns.
+                # Require an actual create/schedule verb and calendar/event context cues;
+                # avoid generic words like "for" (e.g. "check what emails i have for today").
                 if has_date and re.search(
-                    r"\b(?:block|reserve|add|create|schedule|book|for)\b",
+                    r"\b(?:block|reserve|add|create|schedule|book)\b",
+                    current_message,
+                    re.IGNORECASE,
+                ) and re.search(
+                    r"\b(?:calendar|event|meeting|appointment|session|class|call|reminder|gym|lunch|dinner|break)\b",
                     current_message,
                     re.IGNORECASE,
                 ):
@@ -1203,6 +1758,10 @@ def _calendar_create_draft_plan(
     if not new_create_request and existing_draft is None:
         return None
 
+    # Stale/orphaned create drafts must never hijack unrelated independent requests.
+    # Only continue a draft when the message is a demonstrably scoped follow-up.
+    if existing_draft is not None and _is_explicit_new_intent(current_message):
+        return None
     if existing_draft is not None and re.search(
         r"\b(?:gmail|inbox|e-?mails?|mail|drive|files?|documents?|"
         r"spreadsheets?|contacts?|address book)\b",
@@ -1210,6 +1769,39 @@ def _calendar_create_draft_plan(
         re.IGNORECASE,
     ):
         return None
+    if existing_draft is not None and not new_create_request:
+        calendar_context_cue = bool(re.search(
+            r"\b(?:calendar|event|meeting|appointment|schedule|proposal|"
+            r"invite|attendee|time zone|timezone)\b",
+            current_message,
+            re.IGNORECASE,
+        ))
+        detail_or_control_cue = bool(re.search(
+            r"\b(?:today|tomorrow|yesterday|monday|tuesday|wednesday|thursday|"
+            r"friday|saturday|sunday|am|pm|:\d{2}|20\d{2}-\d{2}-\d{2}|"
+            r"\d{1,2}(?:st|nd|rd|th)?|january|february|march|april|may|june|"
+            r"july|august|september|october|november|december|morning|afternoon|"
+            r"evening|night|noon|midnight|asia/|utc|gmt|"
+            r"title|date|time|start|end|duration|location|attendees?|calendar|"
+            r"retain|keep|provided|previous|details?|prepare|proposal|propose|"
+            r"save|confirm|approve|change|update|edit|use|set)\b",
+            current_message,
+            re.IGNORECASE,
+        )) or bool(_calendar_create_title(current_message))
+        is_calendar_req = _is_calendar_request(current_message)
+        # Allow legitimate create clarifications/follow-ups (including longer
+        # "retain details / prepare proposal" replies). Reject unrelated messages
+        # (e.g. general knowledge questions) that do not carry create context.
+        if not (is_calendar_req or calendar_context_cue or detail_or_control_cue):
+            return None
+        # Extra safety: very long messages with no calendar/event/proposal cues
+        # are unlikely to be a scoped create clarification.
+        if (
+            len(current_message.split()) > 30
+            and not calendar_context_cue
+            and not is_calendar_req
+        ):
+            return None
 
     timezone = _validated_timezone(state)
     updates = extract_calendar_create_draft(
@@ -1392,6 +1984,44 @@ def _calendar_intent(text: str) -> str | None:
     return None
 
 
+def _is_bare_calendar_refinement(text: str) -> bool:
+    return bool(re.fullmatch(
+        r"\s*(?:my\s+)?(?:google\s+)?(?:calendar|calender|calander|calder|calendr)\s*[.!?]*\s*",
+        text or "",
+        re.IGNORECASE,
+    ))
+
+
+def _is_probable_monthly_calendar_request(text: str) -> bool:
+    lowered = (text or "").casefold()
+    if not lowered or not _is_calendar_request(text):
+        return False
+    month_read_request = bool(re.search(
+        r"\b(?:show|list|find|get|open|check|what|when|tell me|"
+        r"do i have|have|calendar|schedule|events?|meetings?|for|of)\b",
+        lowered,
+    ))
+    relative_month = re.search(
+        r"\b(this|next|current)\s+months?\b|\b(?:this|next|current)\s+month(?:['’]s)?\b",
+        lowered,
+    )
+    if month_read_request and relative_month:
+        return True
+    named_month = re.search(
+        r"\b(january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\b(?:\s+(20\d{2}))?\b",
+        lowered,
+    )
+    has_explicit_day = bool(re.search(
+        r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:january|february|march|april|may|june|"
+        r"july|august|september|october|november|december)\b|"
+        r"\b(?:january|february|march|april|may|june|july|august|september|"
+        r"october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?\b",
+        lowered,
+    ))
+    return bool(month_read_request and named_month and not has_explicit_day)
+
+
 def _deterministic_calendar_plan(
     state: ChatState,
 ) -> tuple[dict[str, Any], str] | None:
@@ -1500,17 +2130,20 @@ def _deterministic_calendar_plan(
     zone = ZoneInfo(timezone)
     request_now = _request_time(state).astimezone(zone)
     today = request_now.date()
-    explicit_date = _extract_explicit_calendar_date(text)
+    explicit_date = _extract_explicit_calendar_date(text, reference_date=today)
     explicit_date_matches = re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", text)
-    date_match = re.search(r"\b(today|tomorrow)(?:'s|s)?\b", lowered)
+    date_match = re.search(r"\b(today|tomorrow|yesterday)(?:'s|s)?\b", lowered)
     weekday_match = re.search(
         r"\b(?:(next|this)\s+)?"
-        r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:'s|s)?\b",
         lowered,
     )
-    target_date = today + timedelta(days=1) if (
-        date_match and date_match.group(1) == "tomorrow"
-    ) else today
+    if date_match and date_match.group(1) == "tomorrow":
+        target_date = today + timedelta(days=1)
+    elif date_match and date_match.group(1) == "yesterday":
+        target_date = today - timedelta(days=1)
+    else:
+        target_date = today
     if weekday_match:
         weekdays = (
             "monday",
@@ -1553,8 +2186,8 @@ def _deterministic_calendar_plan(
     ))
     if creation_request:
         if not re.search(
-            r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|"
-            r"friday|saturday|sunday|20\d{2}-\d{2}-\d{2})\b",
+            r"\b(?:today|tomorrow|(?:monday|tuesday|wednesday|thursday|"
+            r"friday|saturday|sunday)(?:'s|s)?|20\d{2}-\d{2}-\d{2})\b",
             lowered,
         ):
             return _calendar_plan("create_calendar_event_proposal")
@@ -1828,36 +2461,52 @@ def _deterministic_calendar_plan(
             arguments["query"] = title_contains_match.group(1).strip()[:500]
         return _calendar_plan("list_calendar_events", arguments)
 
+    month_names = (
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    )
     natural_exact_date_match = re.search(
         rf"\b({month_pattern})\s+"
         r"(\d{1,2})(?:st|nd|rd|th)?(?:,\s*|\s+)(20\d{2})\b",
         text,
         re.IGNORECASE,
     )
-    if natural_exact_date_match and re.search(
+    exact_month_text = exact_day_text = exact_year_text = None
+    if natural_exact_date_match:
+        exact_month_text = natural_exact_date_match.group(1)
+        exact_day_text = natural_exact_date_match.group(2)
+        exact_year_text = natural_exact_date_match.group(3)
+    else:
+        day_first_exact_match = re.search(
+            r"(\d{1,2})(?:st|nd|rd|th)?\s+"
+            rf"({month_pattern})(?:,\s*|\s+)(20\d{{2}})\b",
+            text,
+            re.IGNORECASE,
+        )
+        if day_first_exact_match:
+            exact_day_text = day_first_exact_match.group(1)
+            exact_month_text = day_first_exact_match.group(2)
+            exact_year_text = day_first_exact_match.group(3)
+    if exact_month_text and exact_day_text and exact_year_text and re.search(
         r"\b(?:show|list|find|get|open|check|what|when|tell me|"
         r"do i have|have|calendar|events?|meetings?|schedule)\b",
         lowered,
     ):
-        month_names = (
-            "january",
-            "february",
-            "march",
-            "april",
-            "may",
-            "june",
-            "july",
-            "august",
-            "september",
-            "october",
-            "november",
-            "december",
-        )
         try:
             exact_date = date(
-                int(natural_exact_date_match.group(3)),
-                month_names.index(natural_exact_date_match.group(1).casefold()) + 1,
-                int(natural_exact_date_match.group(2)),
+                int(exact_year_text),
+                month_names.index(exact_month_text.casefold()) + 1,
+                int(exact_day_text),
             )
         except ValueError:
             return _calendar_plan("clarify")
@@ -1873,18 +2522,120 @@ def _deterministic_calendar_plan(
 
     month_read_request = re.search(
         r"\b(?:show|list|find|get|open|check|what|when|tell me|"
-        r"do i have|have)\b",
+        r"do i have|have|calendar|schedule|events?|meetings?)\b",
         lowered,
     )
-    relative_month_match = re.search(r"\b(this|next)\s+month\b", lowered)
+    relative_month_match = re.search(
+        r"\b(this|next|current)\s+months?\b|\b(?:this|next|current)\s+month(?:['’]s)?\b",
+        lowered,
+    )
+    if relative_month_match:
+        # Normalize to this/next/current token for offset calculation.
+        rel_token = re.search(r"\b(this|next|current)\b", relative_month_match.group(0), re.IGNORECASE)
+        relative_month_match = rel_token
     named_month_match = re.search(
         r"\b(january|february|march|april|may|june|july|august|"
         r"september|october|november|december)\b(?:\s+(20\d{2}))?\b",
         lowered,
     )
+    # Do not treat an explicit calendar date (e.g. "21 November 2026") as a
+    # whole-month request just because a month name is present.
+    has_explicit_day_in_month = bool(re.search(
+        r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:january|february|march|april|may|june|"
+        r"july|august|september|october|november|december)\b|"
+        r"\b(?:january|february|march|april|may|june|july|august|september|"
+        r"october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?\b",
+        lowered,
+    ))
+    if month_read_request and relative_month_match:
+        pass  # handled below
+    elif month_read_request and named_month_match and not has_explicit_day_in_month:
+        pass  # handled below
+    else:
+        relative_month_match = None
+        named_month_match = None
+    def _month_schedule_plan_for_text(
+        source_text: str,
+    ) -> tuple[dict[str, Any], str] | None:
+        source_lower = (source_text or "").casefold()
+        source_month_read_request = bool(re.search(
+            r"\b(?:show|list|find|get|open|check|what|when|tell me|"
+            r"do i have|have|calendar|schedule|events?|meetings?|for|of)\b",
+            source_lower,
+        ))
+        source_relative = re.search(
+            r"\b(this|next|current)\s+months?\b|\b(?:this|next|current)\s+month(?:['’]s)?\b",
+            source_lower,
+        )
+        if source_relative:
+            source_relative = re.search(
+                r"\b(this|next|current)\b",
+                source_relative.group(0),
+                re.IGNORECASE,
+            )
+        source_named = re.search(
+            r"\b(january|february|march|april|may|june|july|august|"
+            r"september|october|november|december)\b(?:\s+(20\d{2}))?\b",
+            source_lower,
+        )
+        source_has_explicit_day = bool(re.search(
+            r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:january|february|march|april|may|june|"
+            r"july|august|september|october|november|december)\b|"
+            r"\b(?:january|february|march|april|may|june|july|august|september|"
+            r"october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?\b",
+            source_lower,
+        ))
+        if not (
+            source_month_read_request
+            and (source_relative or (source_named and not source_has_explicit_day))
+        ):
+            return None
+        if source_relative:
+            month_offset = 1 if source_relative.group(1).casefold() == "next" else 0
+            month_start = date(
+                today.year + (today.month - 1 + month_offset) // 12,
+                (today.month - 1 + month_offset) % 12 + 1,
+                1,
+            )
+        else:
+            assert source_named is not None
+            month_names = (
+                "january",
+                "february",
+                "march",
+                "april",
+                "may",
+                "june",
+                "july",
+                "august",
+                "september",
+                "october",
+                "november",
+                "december",
+            )
+            month_number = month_names.index(source_named.group(1).casefold()) + 1
+            month_year = (
+                int(source_named.group(2))
+                if source_named.group(2)
+                else today.year
+            )
+            month_start = date(month_year, month_number, 1)
+        return _calendar_plan(
+            "get_calendar_schedule",
+            {
+                "date": month_start.isoformat(),
+                "period": "month",
+                "time_zone": timezone,
+                "calendar_id": "primary",
+            },
+        )
+
     if month_read_request and (
         relative_month_match or named_month_match
     ):
+        month_plan = _month_schedule_plan_for_text(text)
+        if month_plan is not None:
+            return month_plan
         if relative_month_match:
             month_offset = (
                 1 if relative_month_match.group(1) == "next" else 0
@@ -1985,7 +2736,7 @@ def _deterministic_calendar_plan(
         )
 
     if re.search(r"\b(?:weekly|week|this week|next week)\b", lowered) and (
-        re.search(r"\b(?:schedule|meetings?|events?|calendar)\b", lowered)
+        re.search(r"\b(?:schedule|meetings?|events?|calendar|calender|calander|calder|calendr)\b", lowered)
     ):
         week_date = today + timedelta(days=7) if "next week" in lowered else today
         return _calendar_plan(
@@ -1999,8 +2750,8 @@ def _deterministic_calendar_plan(
         )
 
     if weekday_match and not creation_request and re.search(
-        r"\b(?:show|list|find|get|open|view|what|when|tell me|"
-        r"do i have|have|schedule|meetings?|events?|calendar)\b",
+        r"\b(?:show|list|find|get|open|view|check|what|when|tell me|"
+        r"do i have|have|schedule|meetings?|events?|calendar|calender|calander|calder|calendr)\b",
         lowered,
     ):
         return _calendar_plan(
@@ -2015,7 +2766,7 @@ def _deterministic_calendar_plan(
 
     if re.search(r"\bweekend\b", lowered) and re.search(
         r"\b(?:show|list|find|get|open|view|what|when|tell me|"
-        r"do i have|have|schedule|meetings?|events?|calendar|free|"
+        r"do i have|have|schedule|meetings?|events?|calendar|calender|calander|calder|calendr|free|"
         r"available|busy)\b",
         lowered,
     ) and not creation_request:
@@ -2047,14 +2798,19 @@ def _deterministic_calendar_plan(
             },
         )
 
-    if date_match or explicit_date is not None:
-        if re.search(r"\b(?:schedule|meetings?|events?|calendar)\b", lowered):
+    if date_match or explicit_date is not None or weekday_match is not None:
+        # "upcoming calendar/events/meetings" is temporal, not a specific date schedule name.
+        is_relative_day = bool(date_match and date_match.group(1) in {"today", "tomorrow", "yesterday"})
+        if re.search(r"\b(?:upcoming|next)\b", lowered) and not explicit_date and not is_relative_day and weekday_match is None:
+            pass
+        elif re.search(r"\b(?:schedule|meetings?|events?|calendar|calender|calander|calder|calendr)\b", lowered):
             return _calendar_plan(
                 "get_today_schedule" if target_date == today and
+                date_match and date_match.group(1) == "today" and
                 explicit_date is None else "get_calendar_schedule",
                 (
                     {"time_zone": timezone, "calendar_id": "primary"}
-                    if target_date == today and explicit_date is None
+                    if target_date == today and date_match and date_match.group(1) == "today" and explicit_date is None
                     else {
                         "date": target_date.isoformat(),
                         "period": "day",
@@ -2063,6 +2819,31 @@ def _deterministic_calendar_plan(
                     }
                 ),
             )
+        else:
+            # Bare date/day refinement (e.g. "21th november") should continue prior Calendar read intent
+            # only when a valid scoped read continuation exists. Standalone date-only requests must not invent context.
+            bare_explicit_date_only = bool(explicit_date is not None and not date_match and weekday_match is None)
+            if (
+                bare_explicit_date_only
+                and isinstance(state.get("pending_calendar_read"), dict)
+                and not _calendar_event_creation_request(text)
+                and not re.search(r"\b(?:create|add|schedule|book|delete|remove|cancel|update|edit|change|move|reschedule)\b", lowered)
+            ):
+                pending_read = state.get("pending_calendar_read") or {}
+                cal_id = pending_read.get("calendar_id") if isinstance(pending_read.get("calendar_id"), str) else "primary"
+                return _calendar_plan(
+                    "get_calendar_schedule",
+                    {
+                        "date": target_date.isoformat(),
+                        "period": "day",
+                        "time_zone": timezone,
+                        "calendar_id": cal_id or "primary",
+                    },
+                )
+            # Standalone bare date without valid scoped Calendar continuation: do not invent context.
+            # Let other planners/clarification handle as appropriate.
+            if bare_explicit_date_only and not isinstance(state.get("pending_calendar_read"), dict):
+                return _calendar_plan("clarify")
 
     next_person_match = re.search(
         r"\b(?:next|upcoming)\s+(?:meeting|event)\s+with\s+(.+?)[?.!]*$",
@@ -2095,19 +2876,32 @@ def _deterministic_calendar_plan(
             or named_calendar_match.group(2)
             or ""
         ).strip()
+        temporal_calendar_modifiers = {
+            "upcoming", "next", "today", "todays", "tomorrow",
+            "yesterday", "yesterdays", "this", "current",
+        }
+        name_words = [w.casefold() for w in calendar_name.split() if w]
+        non_name_modifiers = {"my", "me", "the", "primary", "google", "all"}
+        is_temporal_calendar_phrase = bool(
+            calendar_name.casefold() in temporal_calendar_modifiers
+            or any(w in temporal_calendar_modifiers for w in name_words)
+        )
         if (
-            calendar_name.casefold() not in {
+            not is_temporal_calendar_phrase
+            and calendar_name.casefold() not in {
                 "google", "primary", "my", "the", "me", "me my",
-                "my primary", "the primary",
+                "my primary", "the primary", "all", "all my", "me all my",
             }
-            and not all(
-                word.casefold() in {"my", "me", "the", "primary", "google"}
-                for word in calendar_name.split()
-            )
+            and not all(word in non_name_modifiers for word in name_words)
+            and "all" not in name_words
         ):
+            # Treat as explicit calendar-name selection only when the name is not
+            # a temporal modifier/generic read qualifier (e.g. "upcoming calendar",
+            # "all my calendar events from yesterday").
             return _calendar_plan(
                 "list_calendar_events",
                 {
+                    "calendar_name": calendar_name,
                     "time_min": request_now.isoformat(),
                     "time_zone": timezone,
                     "max_results": 100,
@@ -2143,18 +2937,55 @@ def _deterministic_calendar_plan(
                 "time_min": request_now.isoformat(),
                 "time_zone": timezone,
                 "max_results": 10,
+                "calendar_id": "primary",
             },
         )
 
     if re.search(
-        r"\b(?:show|list|find|what are|what's|what is)\b.{0,40}"
-        r"\b(?:upcoming|next)\s+(?:meetings?|events?)\b|"
-        r"\b(?:upcoming|next)\s+(?:meetings?|events?)\b",
+        r"\b(?:show|list|find|what are|what's|what is|what do i have|do i have|any)\b.{0,60}"
+        r"\b(?:upcoming|next)\b.{0,30}\b(?:calendar|calender|meetings?|events?|schedule)\b|"
+        r"\b(?:upcoming|next)\s+(?:calendar|calender)\b|"
+        r"\b(?:my\s+)?(?:upcoming|next)\s+(?:calendar\s+)?(?:meetings?|events?)\b",
         lowered,
     ):
+        # Bound default upcoming reads to avoid flooding with distant recurring
+        # instances (e.g. yearly birthdays far in the future) while preserving
+        # pagination indication for additional in-horizon results.
+        upcoming_horizon_end = request_now + timedelta(days=30)
         return _calendar_plan(
             "list_calendar_events",
-            {"time_zone": timezone, "max_results": 10},
+            {
+                "time_min": request_now.isoformat(),
+                "time_max": upcoming_horizon_end.isoformat(),
+                "time_zone": timezone,
+                "max_results": 10,
+                "calendar_id": "primary",
+            },
+        )
+
+    generic_calendar_request = bool(re.fullmatch(
+        r"\s*(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*(?:please\s+)?(?:check|show|open|view)\s+"
+        r"(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*(?:what(?:'s| is)\s+on\s+)?(?:my\s+)?"
+        r"(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*show\s+my\s+calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ))
+    if generic_calendar_request:
+        return _calendar_plan(
+            "get_today_schedule",
+            {"time_zone": timezone, "calendar_id": "primary"},
         )
 
     if re.search(r"\b(?:overlapping|conflicts?)\b", lowered) and re.search(
@@ -2305,6 +3136,141 @@ def _deterministic_assistant_plan(
     if pending_availability is not None:
         return pending_availability
 
+    pending_read = _pending_calendar_read_resolution(state)
+    if pending_read is not None:
+        return pending_read
+
+    # Unambiguous Gmail day-read requests must resolve locally without asking for start/end times.
+    # Keep this before calendar heuristics so "today" email checks are not misrouted.
+    if re.search(r"\b(?:email|emails|e-?mail|mail|messages?|inbox)\b", lowered) and not re.search(
+        r"\b(?:draft|write|compose|reply|forward|send)\b", lowered
+    ):
+        if re.search(r"\b(?:today|todays|today's)\b", lowered) and not re.search(
+            r"\b(?:schedule|calendar|calender|event|events|meeting|meetings|free|available|availability|busy)\b",
+            lowered,
+        ):
+            return SummarizeTodayPlan(intent="summarize_today").model_dump(mode="json"), "gmail"
+        if re.search(r"\byesterday\b", lowered) and not re.search(
+            r"\b(?:schedule|calendar|calender|event|events|meeting|meetings)\b",
+            lowered,
+        ):
+            tz_name = _validated_timezone(state)
+            try:
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = ZoneInfo("UTC")
+                tz_name = "UTC"
+            target_date = _request_time(state).astimezone(tz).date() - timedelta(days=1)
+            start = datetime.combine(target_date, datetime_time.min, tzinfo=tz)
+            end = start + timedelta(days=1)
+            query = f"after:{int(start.timestamp()) - 1} before:{int(end.timestamp())} -from:me"
+            return SearchEmailsPlan(intent="search_emails", query=query, max_results=10).model_dump(mode="json"), "gmail"
+
+    pending_contacts_clarification = state.get("pending_contacts_clarification")
+    if isinstance(pending_contacts_clarification, dict):
+        # Preserve/follow up trusted Contacts clarification context (selection, attribute follow-ups, "No"/repeats).
+        if not re.search(
+            r"\b(?:compose|draft|send|reply|forward|archive|label|inbox|"
+            r"unsubscribe|thread|message|attachment|calendar|event|meeting|"
+            r"schedule|drive|file|document)\b",
+            lowered,
+        ):
+            return (
+                {"intent": "google_contacts"},
+                "google_contacts",
+            )
+
+    contacts_entity_signal = bool(re.search(
+        r"\b(?:contact|contacts|address book|people)\b",
+        lowered,
+    ))
+    contact_field_signal = bool(re.search(
+        r"\b(?:phone(?:\s+(?:number|no|num))?|mobile(?:\s+(?:number|no|num))?|"
+        r"telephone|tel|contact\s+(?:number|no\.?)|"
+        r"email\s+address|email\s+id|e-mail\s+address|e-mail\s+id|mail\s+id|"
+        r"contact\s+details|contact\s+info|contact\s+information)\b",
+        lowered,
+    ))
+    # Standalone contact-field words for person-detail lookups (e.g. "Home Baba number"),
+    # but not when the user is operating on an email/message medium.
+    loose_contact_field_signal = bool(re.search(
+        r"\b(?:phone|mobile|number|no\.?|email|e-mail|details)\b",
+        lowered,
+    ))
+    contacts_action_signal = bool(re.search(
+        r"\b(?:find|search|show|list|get|look\s*up|lookup|who(?:'s| is)|"
+        r"what(?:'s| is| are)|tell\s+me|give\s+me|do\s+i\s+have|how\s+many|"
+        r"count|need|want)\b",
+        lowered,
+    ))
+    # Person-specific detail lookup, e.g. "Show me Pihu's number/email" or "Home Baba number".
+    person_detail_lookup = bool(re.search(
+        r"(?:[A-Za-z][A-Za-z0-9'.\u2764\ufe0f-]*'s|\bof\b|\bfor\b|\bassociated\s+with\b|\brelated\s+to\b|\bbelonging\s+to\b)\s+"
+        r"(?:phone(?:\s+(?:numbers?|no|num))?|mobile(?:\s+(?:numbers?|no|num))?|"
+        r"numbers?|no\.?|emails?(?:\s+addresses?|\s+ids?)?|e-mails?(?:\s+addresses?|\s+ids?)?|"
+        r"contact\s*(?:numbers?|no|details|info|information)?|details)\b|"
+        r"\b(?:phone|mobile|email|e-mail|number|numbers|no\.?)\s+(?:of|for|associated\s+with)\s+|"
+        r"\b(?:show|find|search|get|give|tell|need|want|what(?:'s| is| are)|list)\b.{0,120}"
+        r"\b[A-Za-z0-9'\u2764\ufe0f._-]+(?:\s+[A-Za-z0-9'\u2764\ufe0f._-]+){0,5}\s+"
+        r"(?:phone(?:\s+(?:numbers?|no|num))?|mobile(?:\s+(?:numbers?|no|num))?|"
+        r"contact\s*(?:numbers?|no\.?|details|info)?|numbers?|no\.?|"
+        r"emails?(?:\s+addresses?|\s+ids?)?|e-mails?(?:\s+addresses?|\s+ids?)?|details)\b|"
+        r"\b(?:all|every)\b.{0,40}\b(?:phone|mobile|contact|email|e-mail)?\s*numbers?\b.{0,60}\b(?:of|for|associated\s+with|named|called)\b",
+        lowered,
+    ))
+    gmail_medium_signal = bool(re.search(
+        r"\b(?:compose|draft|send|reply|forward|archive|delete|trash|label|inbox|"
+        r"unsubscribe|thread|threads|message|messages|attachment|attachments|"
+        r"\ban?\s+email\b|\bthe\s+email\b|\bthis\s+email\b|\bthat\s+email\b|"
+        r"\bproposal\s+email\b|\bwrite\s+(?:an?\s+)?email\b|\bcreate\s+(?:an?\s+)?email\b|"
+        r"\bemail\s+to\b|mailto:)\b",
+        lowered,
+    ))
+    # Gmail read/list domain: emails/messages/inbox/threads as mailbox content.
+    # Must not be mistaken for "person's email address/id" contact lookups.
+    contact_email_field_phrase = bool(re.search(
+        r"\b(?:e-?mail\s+(?:address|addresses|id|ids)|"
+        r"[A-Za-z0-9'.\u2764\ufe0f_-]+(?:\s+[A-Za-z0-9'.\u2764\ufe0f_-]+){0,4}'s\s+e-?mail\b|"
+        r"\b(?:his|her|their|someone'?s|person'?s)\s+e-?mail\b)\b",
+        lowered,
+    ))
+    gmail_read_domain_signal = bool(re.search(
+        r"\b(?:inbox|threads?|messages?|attachments?)\b|"
+        r"\b(?:latest|recent|new|unread|important|starred|all|today'?s?|yesterday'?s?)\s+e-?mails?\b|"
+        r"\be-?mails?\s+(?:from|about|with|in|today|yesterday|this\s+week|last\s+week)\b|"
+        r"\b(?:show|find|search|list|get|read|check|open|fetch)\b.{0,40}\b(?:inbox|threads?|messages?|e-?mails)\b",
+        lowered,
+    )) and not contact_email_field_phrase
+    non_contact_context_signal = bool(re.search(
+        r"\b(?:calendar|event|events|meeting|meetings|appointment|appointments|"
+        r"schedule|scheduled|reschedul|availability|free\s*/\s*busy|freebusy|"
+        r"drive|file|files|document|documents|doc|docs|pdf)\b",
+        lowered,
+    ))
+    effective_person_detail_lookup = bool(
+        person_detail_lookup
+        and not (non_contact_context_signal and not contacts_entity_signal and not contact_field_signal)
+        and not gmail_read_domain_signal
+    )
+    if (contacts_entity_signal and contacts_action_signal) or (
+        contact_field_signal and contacts_action_signal
+    ) or (
+        loose_contact_field_signal
+        and contacts_action_signal
+        and not gmail_medium_signal
+        and not gmail_read_domain_signal
+        and not non_contact_context_signal
+    ) or effective_person_detail_lookup:
+        # Avoid hijacking Gmail/Calendar/Drive flows that mention "email/number/details"
+        # as medium/context rather than a contact field to look up.
+        if not gmail_medium_signal and not gmail_read_domain_signal and not (
+            non_contact_context_signal and not contacts_entity_signal and not contact_field_signal
+        ):
+            return (
+                {"intent": "google_contacts"},
+                "google_contacts",
+            )
+
     current_calendar_intent = _calendar_intent(text)
     if current_calendar_intent == "DELETE_EVENT":
         return _calendar_plan("delete_calendar_event_proposal")
@@ -2400,6 +3366,31 @@ def _deterministic_assistant_plan(
             return gmail_read_plan, "gmail"
         return _fallback_plan(), "gmail"
 
+    # Generic Calendar requests (including bare "Google Calendar") should enter
+    # Calendar context and provide a useful overview instead of Gmail routing or
+    # asking for an event ID.
+    if re.fullmatch(
+        r"\s*(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*(?:please\s+)?(?:check|show|open|view)\s+"
+        r"(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*show\s+my\s+calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ):
+        return _calendar_plan(
+            "get_today_schedule",
+            {
+                "time_zone": _validated_timezone(state),
+                "calendar_id": "primary",
+            },
+        )
+
     if (
         re.search(
             r"\b(?:plan|make|create|build|organize|structure|generate)\b",
@@ -2494,7 +3485,7 @@ def _deterministic_integration_plan(
     )
     if not asks_to_access:
         return None
-    if re.search(r"\b(?:drive|files?|documents?|spreadsheets?)\b", lowered):
+    if re.search(r"\b(?:drive|files?|documents?|spreadsheets?|contracts?|agreements?)\b", lowered):
         return IntegrationPlan(intent="google_drive")
     if re.search(
         r"\b(?:contacts?|address book|phone numbers?|mobile numbers?)\b",
@@ -2602,6 +3593,24 @@ def _deterministic_read_plan(
             intent="summarize_attention",
         ).model_dump(mode="json")
 
+    # Gmail "today"/"yesterday"/"whole day" read intents must resolve to local-day
+    # ranges automatically (no manual start/end time prompts).
+    if re.search(r"\b(?:email|emails|e-?mail|mail|messages?|inbox)\b", lowered):
+        if re.search(r"\btoday\b", lowered) and not re.search(
+            r"\b(?:schedule|calendar|event|events|meeting|meetings|free|available|availability)\b",
+            lowered,
+        ):
+            return SummarizeTodayPlan(intent="summarize_today").model_dump(
+                mode="json",
+            )
+        if re.search(r"\byesterday\b", lowered) and not re.search(
+            r"\b(?:schedule|calendar|event|events|meeting|meetings)\b",
+            lowered,
+        ):
+            # Reuse search planning path with explicit local-day bounds handled by executor/tools via query/date logic.
+            # Fall back to summarize_today-style day query if planner supports yesterday-specific handling elsewhere.
+            pass
+
     if re.search(r"\b(?:receiv(?:e|ed)|got)\b", lowered) and re.search(
         r"\btoday\b",
         lowered,
@@ -2690,7 +3699,8 @@ def _deterministic_read_plan(
 def _requires_intent_planning(user_message: str) -> bool:
     return bool(re.search(
         r"\b(?:gmail|inbox|e-?mails?|messages?|mail|google|drive|files?|"
-        r"documents?|spreadsheets?|calendar|meetings?|events?|sessions?|"
+        r"documents?|spreadsheets?|calendar|calender|calander|calder|calendr|"
+        r"meetings?|events?|sessions?|"
         r"classes?|schedule|"
         r"contacts?|address book|phone numbers?|mobile numbers?|"
         r"reminders?|to-?dos?|tasks?|"
@@ -2702,11 +3712,39 @@ def _requires_intent_planning(user_message: str) -> bool:
 
 def _is_calendar_request(user_message: str) -> bool:
     lowered = user_message.casefold()
+    text = user_message.strip()
     if _is_explicit_memory_request(user_message):
         return False
+    # Bare/generic Calendar requests must stay in Calendar context (overview).
+    if re.fullmatch(
+        r"\s*(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*(?:please\s+)?(?:check|show|open|view)\s+"
+        r"(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*(?:what(?:'s| is)\s+on\s+)?(?:my\s+)?"
+        r"(?:google\s+)?calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r"\s*show\s+my\s+calendar\s*[.!?]*\s*",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
     asks_calendar = bool(re.search(
-        r"\b(?:calendars?|meetings?|events?|appointments?|sessions?|classes?|"
+        r"\b(?:calendars?|calenders?|calanders?|calders?|calendrs?|"
+        r"meetings?|events?|appointments?|sessions?|classes?|"
         r"schedules?|scheduled)\b",
+        lowered,
+    ))
+    # "google calder/calendar..." with a read/check intent should be treated as Calendar.
+    google_calendar_phrase = bool(re.search(
+        r"\bgoogle\s+(?:calendars?|calenders?|calanders?|calders?|calendrs?)\b",
         lowered,
     ))
     has_action = bool(re.search(
@@ -2718,6 +3756,7 @@ def _is_calendar_request(user_message: str) -> bool:
     ))
     return (
         asks_calendar and has_action
+        or (google_calendar_phrase and has_action)
         or bool(re.search(
             r"\b(?:am i|are we|is it)\b.{0,30}\b(?:free|available)\b",
             lowered,
@@ -2944,6 +3983,32 @@ def _is_explicit_new_intent(text: str) -> bool:
         return True
     if _is_calendar_update_request(text):
         return True
+    lowered = text.casefold()
+    # Clear cross-service / independent intents must never be treated as a
+    # continuation of a pending Calendar clarification/action.
+    if re.search(
+        r"\b(?:gmail|e-?mail|inbox|drive|file|files|document|documents|pdf|"
+        r"task|tasks|reminder|reminders|contact|contacts|address book|"
+        r"phone number|mobile number|telephone|email address)\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        r"\b(?:number|phone|mobile|email|e-mail)\b.{0,40}\b(?:of|for)\b|"
+        r"\b(?:show|find|search|get|give|tell|what(?:'s| is)|who(?:'s| is))\b.{0,80}"
+        r"\b(?:number|phone|mobile|email|e-mail|contact details|details)\b",
+        lowered,
+    ):
+        return True
+    if re.search(
+        r"\b(?:check|show|list|open|view|what(?:'s| is)|do i have)\b.{0,40}"
+        r"\b(?:calendar|calender|schedule|meeting|meetings|event|events|today|tomorrow)\b",
+        lowered,
+    ):
+        # "check what emails i have for today" is a Gmail request, not a calendar intent.
+        if not re.search(r"\b(?:gmail|e-?mail|emails?|inbox|mail|message|messages|thread)\b", lowered):
+            return True
+        return False
     return bool(re.search(
         r"\b(?:send|reply|forward|draft|search|find|delete|archive|trash|"
         r"create|add|update|change|rename|move|schedule|book|block|reserve)\b.{0,100}"
@@ -2975,8 +4040,25 @@ def _pending_calendar_continuation(
             "gmail_plan": {"intent": "calendar_action_cancelled"},
             "assistant_route": "google_calendar",
         }
+    # A new independent request (Contacts/Gmail/Drive/Calendar/etc.) must be
+    # classified by its own content; pending calendar state may only continue a
+    # legitimate scoped clarification/follow-up.
     if _is_explicit_new_intent(text):
         return None
+    # If a scoped Gmail date-range clarification is pending, do not let stale
+    # calendar action continuation consume "whole day"/related Gmail follow-ups.
+    pending_gmail = state.get("pending_gmail_clarification")
+    if isinstance(pending_gmail, dict) and re.search(r"\b(?:whole\s+day|full\s+day|all\s+day)\b", lowered):
+        return None
+    # Heuristic guard: if deterministic routing/classification signals indicate a
+    # different strong service intent, do not force calendar continuation.
+    try:
+        if _deterministic_assistant_plan({**state, "pending_contacts_clarification": None}) is not None:
+            # Deterministic planner can resolve independent intents (contacts, gmail reads, etc.).
+            # Allow continuation only for clearly referential/short clarifications.
+            pass
+    except Exception:
+        pass
 
     operation = pending.get("operation")
     tool = {
@@ -2991,6 +4073,31 @@ def _pending_calendar_continuation(
         or not original_request.strip()
     ):
         return None
+
+    # Only continue for plausible clarification/selection/confirmation replies.
+    # Prevent stale pending calendar actions from hijacking unrelated requests.
+    is_short_reply = len(text.split()) <= 12
+    looks_like_selection = bool(re.search(
+        r"\b(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th|one|two|three|#?\d+)\b",
+        lowered,
+    ))
+    looks_like_time_or_date = bool(re.search(
+        r"\b(?:today|tomorrow|yesterday|am|pm|:\d{2}|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}[/-]\d{1,2})\b",
+        lowered,
+    ))
+    looks_like_title_or_event_ref = bool(re.search(
+        r"\b(?:event|meeting|appointment|title|called|named)\b",
+        lowered,
+    ))
+    confirms = bool(re.match(r"^(?:yes|yep|yeah|confirm|approved?|delete it|remove it)\b", lowered))
+    rejects = bool(re.match(r"^(?:no|nope|keep it|don'?t delete|do not delete)\b", lowered))
+    if not (is_short_reply or looks_like_selection or looks_like_time_or_date or looks_like_title_or_event_ref or confirms or rejects):
+        # If message contains strong non-calendar/service cues, treat as new request.
+        if re.search(r"\b(?:contact|contacts|number|phone|mobile|email|e-?mail|gmail|inbox|drive|file|document|pdf)\b", lowered):
+            return None
+        # Default: avoid stealing potentially unrelated longer requests.
+        if len(text.split()) > 6:
+            return None
 
     arguments = pending.get("known_event_details")
     if isinstance(arguments, dict):
@@ -3068,12 +4175,330 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             "assistant_route": "capabilities",
         }
 
+    # Trusted ordinal/title/bulk follow-up for a previously listed delete selection
+    # (must use verified event/calendar IDs). Must not be interpreted as Gmail/other intents.
+    pending_delete_selection = state.get("pending_calendar_delete_selection")
+    if isinstance(pending_delete_selection, dict):
+        msg = state["user_message"].strip()
+        lowered_msg = msg.casefold()
+        candidates = (
+            pending_delete_selection.get("candidates")
+            if isinstance(pending_delete_selection.get("candidates"), list)
+            else []
+        )
+        # Validate selection scope against current request context (user/conversation).
+        selection_user = str(pending_delete_selection.get("user_id") or "")
+        selection_conv = str(pending_delete_selection.get("conversation_id") or "")
+        state_user = str(state.get("user_id") or "")
+        state_conv = str(state.get("conversation_id") or "")
+        if (selection_user and state_user and selection_user != state_user) or (
+            selection_conv and state_conv and selection_conv != state_conv
+        ):
+            # Do not trust cross-user/conversation state; let normal routing/classification proceed.
+            pass
+        else:
+            if re.match(r"^(?:no|nope|cancel|never\s*mind|nevermind|stop|keep it)\b", lowered_msg):
+                return {
+                    "gmail_plan": {"intent": "calendar_action_cancelled"},
+                    "assistant_route": "google_calendar",
+                    "pending_calendar_delete_selection": None,
+                }
+
+            # Helpers for bulk handling/formatting of trusted candidates.
+            from zoneinfo import ZoneInfo as _ZI
+
+            tz_name = (
+                state.get("user_timezone")
+                or (candidates[0].get("time_zone") if candidates and isinstance(candidates[0], dict) else None)
+                or "UTC"
+            )
+
+            def _fmt_candidate_time(cand: dict[str, Any], key: str) -> str:
+                val = cand.get(key)
+                if isinstance(val, str):
+                    try:
+                        dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                        if dt.tzinfo is not None:
+                            return dt.astimezone(_ZI(tz_name)).strftime("%Y-%m-%d %I:%M %p %Z")
+                        return val
+                    except Exception:
+                        try:
+                            return date.fromisoformat(val).isoformat() + " (all day)"
+                        except Exception:
+                            return val
+                if isinstance(val, dict):
+                    try:
+                        from app.workflows.calendar_agent_node import _format_event_time as _fet
+                        return _fet(val, tz_name)
+                    except Exception:
+                        return "time unavailable"
+                return "time unavailable" if val is None else str(val)
+
+            def _bulk_response() -> dict[str, Any]:
+                if len(candidates) < 2:
+                    plan, route = _calendar_plan("clarify")
+                    return {"gmail_plan": plan, "assistant_route": route}
+                lines = []
+                for idx, c in enumerate(candidates, start=1):
+                    if not isinstance(c, dict):
+                        continue
+                    summary = c.get("summary") or "Untitled event"
+                    start_s = _fmt_candidate_time(c, "start")
+                    end_s = _fmt_candidate_time(c, "end")
+                    lines.append(f"{idx}. {summary} — {start_s} to {end_s}")
+                day_label = "the selected day"
+                try:
+                    first = candidates[0] if candidates else {}
+                    sval = first.get("start") if isinstance(first, dict) else None
+                    if isinstance(sval, str):
+                        dt = datetime.fromisoformat(sval.replace("Z", "+00:00"))
+                        if dt.tzinfo is not None:
+                            day_label = dt.astimezone(_ZI(tz_name)).date().isoformat()
+                        else:
+                            day_label = sval[:10]
+                except Exception:
+                    pass
+                response = (
+                    f"You asked to delete all {len(candidates)} events on {day_label}. "
+                    "I will not delete anything without explicit confirmation.\n\n"
+                    "Affected events:\n"
+                    + "\n".join(lines)
+                    + "\n\nTo proceed, reply with the exact confirmation: "
+                    f"\"confirm delete all {len(candidates)} events\". "
+                    "To cancel, reply \"cancel\". To delete only one event, reply with its number or title."
+                )
+                bound_ids = [
+                    c.get("event_id")
+                    for c in candidates
+                    if isinstance(c, dict) and isinstance(c.get("event_id"), str)
+                ]
+                return {
+                    "assistant_response": response,
+                    "assistant_route": "google_calendar",
+                    "gmail_plan": {"intent": "google_calendar", "calendar_tool": "clarify"},
+                    "provider": "",
+                    "model": "",
+                    "messages": [
+                        {"role": "user", "content": state["user_message"]},
+                        {"role": "assistant", "content": response},
+                    ],
+                    "pending_calendar_delete_selection": {
+                        **pending_delete_selection,
+                        "awaiting_bulk_confirmation": True,
+                        "bulk_candidate_event_ids": bound_ids,
+                        "bulk_candidate_count": len(candidates),
+                        "bulk_confirmation_phrase": f"confirm delete all {len(candidates)} events",
+                    },
+                    "calendar_passthrough_response": True,
+                }
+
+            bulk_requested = bool(re.search(
+                r"\b(?:remove|delete|cancel)\s+(?:all|everything|all of them|them all)\b|"
+                r"\b(?:remove|delete|cancel)\s+all\s+(?:the\s+)?events?\b|"
+                r"\ball\s+of\s+them\b",
+                lowered_msg,
+            ))
+            required_bulk_phrase = str(
+                pending_delete_selection.get("bulk_confirmation_phrase") or ""
+            ).casefold().strip()
+            is_exact_bulk_confirmation = bool(
+                pending_delete_selection.get("awaiting_bulk_confirmation") is True
+                and required_bulk_phrase
+                and lowered_msg.strip(" .!\"'") == required_bulk_phrase.strip(" .!\"'")
+            )
+            if bulk_requested and not is_exact_bulk_confirmation:
+                return _bulk_response()
+
+            # Explicit bulk confirmation follow-up (bound to exact trusted candidates/count).
+            if is_exact_bulk_confirmation:
+                bound_ids = pending_delete_selection.get("bulk_candidate_event_ids")
+                expected_count = pending_delete_selection.get("bulk_candidate_count")
+                if (
+                    isinstance(bound_ids, list)
+                    and isinstance(expected_count, int)
+                    and expected_count == len(candidates)
+                    and len(bound_ids) == len(candidates)
+                ):
+                    # Existing architecture supports one approval/proposal at a time per action.
+                    # Start safely with the first bound event and keep remaining events bound for follow-up.
+                    first = candidates[0] if candidates and isinstance(candidates[0], dict) else None
+                    if isinstance(first, dict):
+                        event_id = first.get("event_id")
+                        calendar_id = first.get("calendar_id") or pending_delete_selection.get("calendar_id") or "primary"
+                        if isinstance(event_id, str) and event_id and isinstance(calendar_id, str) and calendar_id:
+                            remaining = [c for c in candidates[1:] if isinstance(c, dict)]
+                            remaining_ids = [c.get("event_id") for c in remaining if isinstance(c.get("event_id"), str)]
+                            plan, route = _calendar_plan(
+                                "delete_calendar_event_proposal",
+                                {"event_id": event_id, "calendar_id": calendar_id},
+                            )
+                            out: dict[str, Any] = {
+                                "gmail_plan": plan,
+                                "assistant_route": route,
+                                "calendar_action_request": (
+                                    f"Delete the selected calendar event (event_id={event_id}, calendar_id={calendar_id}) "
+                                    f"as part of explicitly confirmed bulk deletion ({expected_count} events total)."
+                                ),
+                            }
+                            if remaining:
+                                out["pending_calendar_delete_selection"] = {
+                                    **pending_delete_selection,
+                                    "candidates": remaining,
+                                    "bulk_candidate_event_ids": remaining_ids,
+                                    "bulk_candidate_count": len(remaining),
+                                    "awaiting_bulk_confirmation": True,
+                                    "bulk_confirmation_phrase": f"confirm delete all {len(remaining)} events",
+                                }
+                            else:
+                                out["pending_calendar_delete_selection"] = None
+                            return out
+                if not _is_explicit_new_intent(msg):
+                    plan, route = _calendar_plan("clarify")
+                    return {"gmail_plan": plan, "assistant_route": route}
+
+            ordinal = None
+            # Prefer specific ordinals/numbers first to avoid "delete the second one" matching "one".
+            if re.search(r"\b(?:5|fifth|5th)\b", lowered_msg) or re.search(r"\bfive\b", lowered_msg):
+                ordinal = 5
+            elif re.search(r"\b(?:4|fourth|4th)\b", lowered_msg) or re.search(r"\bfour\b", lowered_msg):
+                ordinal = 4
+            elif re.search(r"\b(?:3|third|3rd)\b", lowered_msg) or re.search(r"\bthree\b", lowered_msg):
+                ordinal = 3
+            elif re.search(r"\b(?:2|second|2nd)\b", lowered_msg) or re.search(r"\btwo\b", lowered_msg):
+                ordinal = 2
+            elif re.search(r"\b(?:1|first|1st)\b", lowered_msg) or re.search(r"\bfirst\s+one\b", lowered_msg) or re.fullmatch(r"(?:delete|remove|cancel|select|choose|pick)?\s*(?:the\s+)?one\b[.!?]*", lowered_msg):
+                ordinal = 1
+            mnum = re.search(r"\b(?:#|number\s*)([1-9])\b", lowered_msg)
+            if ordinal is None and mnum and re.search(r"\b(?:delete|remove|cancel|select|choose|pick)\b", lowered_msg):
+                ordinal = int(mnum.group(1))
+            mnum_plain = re.search(r"\b([1-5])\b", lowered_msg)
+            if ordinal is None and mnum_plain and re.search(r"\b(?:delete|remove|cancel|select|choose|pick)\b", lowered_msg):
+                ordinal = int(mnum_plain.group(1))
+            if ordinal is not None and 1 <= ordinal <= len(candidates):
+                chosen = candidates[ordinal - 1]
+                if isinstance(chosen, dict):
+                    event_id = chosen.get("event_id")
+                    calendar_id = chosen.get("calendar_id") or pending_delete_selection.get("calendar_id") or "primary"
+                    if isinstance(event_id, str) and event_id and isinstance(calendar_id, str) and calendar_id:
+                        plan, route = _calendar_plan(
+                            "delete_calendar_event_proposal",
+                            {"event_id": event_id, "calendar_id": calendar_id},
+                        )
+                        return {
+                            "gmail_plan": plan,
+                            "assistant_route": route,
+                            "calendar_action_request": f"Delete the selected calendar event (event_id={event_id}, calendar_id={calendar_id}).",
+                            "pending_calendar_delete_selection": None,
+                        }
+
+            defer_to_pending_calendar_continuation = False
+
+            # Title-based follow-up: resolve against trusted pending candidates only.
+            # Require reasonable specificity to avoid accidental matches.
+            title_msg = re.sub(r"^(?:please\s+)?(?:delete|remove|cancel|select|choose|pick)\s+", "", msg, flags=re.I).strip().strip("\"' .!?")
+            normalized_title_msg = " ".join(title_msg.casefold().split())
+            if normalized_title_msg:
+                title_matches = []
+                for c in candidates:
+                    if not isinstance(c, dict):
+                        continue
+                    summary = c.get("summary")
+                    if not isinstance(summary, str) or not summary.strip():
+                        continue
+                    norm_summary = " ".join(summary.casefold().split())
+                    if not norm_summary:
+                        continue
+                    if (
+                        normalized_title_msg == norm_summary
+                        or (len(normalized_title_msg) >= 4 and normalized_title_msg in norm_summary)
+                        or (len(norm_summary) >= 4 and norm_summary in normalized_title_msg)
+                    ):
+                        title_matches.append(c)
+                # Dedupe by event_id
+                seen_ids = set()
+                unique_matches = []
+                for c in title_matches:
+                    eid = c.get("event_id")
+                    if isinstance(eid, str) and eid not in seen_ids:
+                        seen_ids.add(eid)
+                        unique_matches.append(c)
+                if len(unique_matches) == 1:
+                    chosen = unique_matches[0]
+                    event_id = chosen.get("event_id")
+                    calendar_id = chosen.get("calendar_id") or pending_delete_selection.get("calendar_id") or "primary"
+                    if isinstance(event_id, str) and event_id and isinstance(calendar_id, str) and calendar_id:
+                        plan, route = _calendar_plan(
+                            "delete_calendar_event_proposal",
+                            {"event_id": event_id, "calendar_id": calendar_id},
+                        )
+                        return {
+                            "gmail_plan": plan,
+                            "assistant_route": route,
+                            "calendar_action_request": f"Delete the selected calendar event (event_id={event_id}, calendar_id={calendar_id}).",
+                            "pending_calendar_delete_selection": None,
+                        }
+                if len(unique_matches) > 1 and not _is_explicit_new_intent(msg):
+                    # If the reply is just the shared title and a legacy pending
+                    # calendar action continuation exists, defer to that flow for
+                    # compatibility with older clarification-resume behavior.
+                    shared_titles = {
+                        " ".join(str(c.get("summary") or "").casefold().split())
+                        for c in unique_matches
+                        if isinstance(c, dict)
+                    }
+                    if (
+                        len(shared_titles) == 1
+                        and normalized_title_msg in shared_titles
+                        and isinstance(state.get("pending_calendar_action"), dict)
+                    ):
+                        defer_to_pending_calendar_continuation = True
+                    else:
+                        plan, route = _calendar_plan("clarify")
+                        return {"gmail_plan": plan, "assistant_route": route}
+
+            # If user explicitly asks to delete/select but we couldn't resolve, keep in calendar context.
+            if not defer_to_pending_calendar_continuation and re.search(r"\b(?:delete|remove|cancel|select|choose|pick)\b", lowered_msg) and not _is_explicit_new_intent(msg):
+                plan, route = _calendar_plan("clarify")
+                return {
+                    "gmail_plan": plan,
+                    "assistant_route": route,
+                }
+
+            # For any other non-independent follow-up while a trusted delete selection is pending,
+            # stay in Calendar context (clarify) rather than routing to Gmail/other services.
+            if not defer_to_pending_calendar_continuation and not _is_explicit_new_intent(msg):
+                plan, route = _calendar_plan("clarify")
+                return {
+                    "gmail_plan": plan,
+                    "assistant_route": route,
+                }
+
+            # If we deferred for legacy pending-calendar-action continuation, do not
+            # return here; allow the router to evaluate _pending_calendar_continuation.
+            if defer_to_pending_calendar_continuation:
+                pending_delete_selection = None  # prevent later delete-intent guard from forcing clarify
+
+    cleared_gmail_clarification = False
+    pending_gmail_clarification = _pending_gmail_clarification_resolution(state)
+    if pending_gmail_clarification is not None:
+        if pending_gmail_clarification.get("_gmail_clarification_clear_only"):
+            # Apply deterministic clear in state but continue normal routing for this request.
+            state = {**state, "pending_gmail_clarification": None}
+            cleared_gmail_clarification = True
+        else:
+            return pending_gmail_clarification
+
     pending_continuation = _pending_calendar_continuation(state)
     if pending_continuation is not None:
         return pending_continuation
 
     current_calendar_intent = _calendar_intent(state["user_message"])
     if current_calendar_intent == "DELETE_EVENT":
+        # "delete the second one" may be a follow-up to a pending selection; if selection was resolved above we won't reach here.
+        # Avoid re-planning generic delete when a selection exists but wasn't parsed.
+        if isinstance(state.get("pending_calendar_delete_selection"), dict):
+            plan, _route = _calendar_plan("clarify")
+            return {"gmail_plan": plan, "assistant_route": "google_calendar"}
         plan, _route = _calendar_plan("delete_calendar_event_proposal")
         return {
             "gmail_plan": plan,
@@ -3306,10 +4731,39 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
     if _is_calendar_request(state["user_message"]) and (
         plan.intent != "google_calendar"
     ):
-        normalized_plan = IntegrationPlan(
-            intent="google_calendar",
-            calendar_tool="clarify",
-        ).model_dump(mode="json")
+        generic_calendar_request = bool(re.fullmatch(
+            r"\s*(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+            state["user_message"],
+            re.IGNORECASE,
+        ) or re.fullmatch(
+            r"\s*(?:please\s+)?(?:check|show|open|view)\s+"
+            r"(?:my\s+)?(?:google\s+)?calendar\s*[.!?]*\s*",
+            state["user_message"],
+            re.IGNORECASE,
+        ) or re.fullmatch(
+            r"\s*(?:what(?:'s| is)\s+on\s+)?(?:my\s+)?"
+            r"(?:google\s+)?calendar\s*[.!?]*\s*",
+            state["user_message"],
+            re.IGNORECASE,
+        ) or re.fullmatch(
+            r"\s*show\s+my\s+calendar\s*[.!?]*\s*",
+            state["user_message"],
+            re.IGNORECASE,
+        ))
+        if generic_calendar_request:
+            normalized_plan = IntegrationPlan(
+                intent="google_calendar",
+                calendar_tool="get_today_schedule",
+                calendar_arguments={
+                    "time_zone": _validated_timezone(state),
+                    "calendar_id": "primary",
+                },
+            ).model_dump(mode="json")
+        else:
+            normalized_plan = IntegrationPlan(
+                intent="google_calendar",
+                calendar_tool="clarify",
+            ).model_dump(mode="json")
         if _is_calendar_update_request(state["user_message"]):
             planner_arguments = normalized_plan.get("calendar_arguments")
             log_calendar_update_diagnostic(
@@ -3369,12 +4823,15 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             selected_route=selected_route,
             module_path=__file__,
         )
-    return {
+    result = {
         "gmail_plan": normalized_plan,
         "assistant_route": selected_route,
         "provider": response.provider,
         "model": response.model,
     }
+    if cleared_gmail_clarification:
+        result["pending_gmail_clarification"] = None
+    return result
 
 
 def route_after_assistant_intent(state: ChatState) -> str:
@@ -3522,7 +4979,23 @@ def gmail_agent_node(
         )
 
     if intent == "clarify":
-        if plan_data.get("clarification_reason") == "mixed_google_services":
+        clarification_reason = plan_data.get("clarification_reason")
+        if clarification_reason in {
+            "gmail_search_fallback_declined",
+            "gmail_search_fallback_ambiguous",
+        } and state.get("assistant_response"):
+            response_state = gmail_response_node(
+                state,
+                direct_response=str(state.get("assistant_response")),
+            )
+            if clarification_reason == "gmail_search_fallback_ambiguous":
+                pending = state.get("pending_gmail_clarification")
+                if isinstance(pending, dict):
+                    response_state["pending_gmail_clarification"] = pending
+                return response_state
+            response_state["pending_gmail_clarification"] = None
+            return response_state
+        if clarification_reason == "mixed_google_services":
             return gmail_response_node(
                 state,
                 direct_response=(
@@ -3531,7 +5004,7 @@ def gmail_agent_node(
                     "should I handle first?"
                 ),
             )
-        if plan_data.get("clarification_reason") == "mixed_gmail_calendar":
+        if clarification_reason == "mixed_gmail_calendar":
             return gmail_response_node(
                 state,
                 direct_response=(
@@ -3552,10 +5025,27 @@ def gmail_agent_node(
                     "not enabled, and I won't change anything."
                 ),
             )
-        return gmail_response_node(
-            state,
-            direct_response=SAFE_CLARIFICATION,
-        )
+        # Gmail-only date-range clarification lifecycle: emit and persist typed scoped pending state.
+        date_range = _gmail_date_range_clarification_from_request(state)
+        if date_range is not None:
+            payload, clarification_text = date_range
+            return {
+                **gmail_response_node(
+                    state,
+                    direct_response=clarification_text,
+                ),
+                "pending_gmail_clarification": payload,
+            }
+        return {
+            **gmail_response_node(
+                state,
+                direct_response=SAFE_CLARIFICATION,
+            ),
+            # Generic Gmail clarification is not a date-range clarification; ensure we don't
+            # preserve a stale date-range pending state for this turn.
+            "pending_gmail_clarification": None,
+        }
+
 
     if intent == "unsupported":
         return gmail_response_node(state)
@@ -4491,8 +5981,10 @@ def gmail_response_node(
     plan_data = state.get("gmail_plan") or {}
     intent = plan_data.get("intent")
     response_metadata = state.get("response_metadata")
+    pending_gmail_fallback: dict[str, Any] | None = None
 
     if direct_response:
+
         answer = direct_response
         sources = state.get("available_gmail_sources") or {}
         matches = sources.get("messages")
@@ -4533,6 +6025,7 @@ def gmail_response_node(
         model = state.get("model", "")
     elif (
         intent == "summarize_important"
+        and isinstance(result, dict)
         and not result.get("messages")
     ):
         answer = (
@@ -4542,6 +6035,14 @@ def gmail_response_node(
         )
         provider = state.get("provider", "")
         model = state.get("model", "")
+        # Preserve scoped pending clarification so the next user turn can resolve it.
+        pending_gmail_fallback = _gmail_search_fallback_clarification_payload(
+            state,
+            from_intent="summarize_important",
+            fallback_intent="summarize_unread",
+            fallback_query="is:unread in:inbox",
+        )
+
     elif intent == "summarize_urgent" and not result.get("messages"):
         answer = (
             "I found no recent emails matching Gmail's IMPORTANT or UNREAD "
@@ -4569,6 +6070,14 @@ def gmail_response_node(
             provider = state.get("provider", "")
             model = state.get("model", "")
         else:
+            summary_intents = {
+                "summarize_important",
+                "summarize_unread",
+                "summarize_urgent",
+                "summarize_attention",
+                "summarize_today",
+            }
+            is_email_summary = intent in summary_intents
             try:
                 response = llm_router.generate(
                     LLMRequest(
@@ -4585,49 +6094,52 @@ def gmail_response_node(
                                     "operation. Do not reveal internal IDs, "
                                     "OAuth details, or raw tool data unless "
                                     "specifically needed to identify a matching "
-                                    "message. Summarize findings concisely in "
-                                    "Markdown with short paragraphs and "
-                                    "structured bullets. Use headings for "
-                                    "long summaries and compact tables only "
-                                    "when useful. Never output raw HTML or "
-                                    "<br> tags or repeat raw API "
-                                    "data. For important-email summaries, state "
-                                    "the reported time period and exact Gmail "
-                                    "search criteria, prioritize Inbox results, "
-                                    "summarize key points, identify action items "
-                                    "and deadlines, and say whether a reply seems "
-                                    "needed only when the message supports it. "
-                                    "For important-email summaries, the backend "
-                                    "has already applied sensible search defaults. "
-                                    "When matching messages are supplied, summarize "
-                                    "them directly and never ask for sender, subject, "
-                                    "or date clarification. Start by stating the "
-                                    "actual result count, period, and Gmail criteria. "
-                                    "For latest-thread summaries, include the "
-                                    "conversation subject and participants, give "
-                                    "the latest message date in Asia/Kolkata, "
-                                    "summarize messages chronologically, label "
-                                    "each as incoming or outgoing, distinguish "
-                                    "the latest outgoing message from the latest "
-                                    "incoming one, and identify supported "
-                                    "decisions and action items. Call a response "
-                                    "pending only when the email content supports "
-                                    "that conclusion and no later outgoing reply "
-                                    "is shown; do not infer it from direction alone. "
-                                    "For urgent-email requests, distinguish "
-                                    "Gmail's IMPORTANT/UNREAD labels from AI "
-                                    "inferred urgency; cite concrete message "
-                                    "evidence and do not call a message urgent "
-                                    "without explaining that evidence. Never "
-                                    "invent message content, deadlines, or "
-                                    "priorities. For today's mail, use the "
-                                    "provided timezone and period. When there "
-                                    "are multiple plausible matching emails and "
-                                    "the user wants to reply or act on one, "
-                                    "show a short sender/subject/date list and "
-                                    "ask which message they mean. For email "
-                                    "summaries show sender, subject, key points, "
-                                    "and supported action items."
+                                    "message. Never output raw HTML or <br> tags "
+                                    "or repeat raw API data. Never invent senders, "
+                                    "subjects, dates, summaries, priorities, "
+                                    "actions, deadlines, or next steps; state "
+                                    "explicitly when a detail is not available in "
+                                    "the supplied data.\n\n"
+                                    + (
+                                        "For this email-summary request, produce a "
+                                        "professional, readable, responsive Markdown "
+                                        "report (not a raw dump). Do not use large "
+                                        "or multi-column tables that can overflow; "
+                                        "prefer headings and clearly separated "
+                                        "card-like blocks.\n"
+                                        "Use this structure when supported by the data:\n"
+                                        "## Important Email Summary\n"
+                                        "**Period:** <reported period or 'Not specified'>  \n"
+                                        "**Emails analyzed:** <actual count>  \n"
+                                        "**Search criteria:** <exact criteria from data>\n\n"
+                                        "### Executive Summary\n"
+                                        "- 2-4 concise bullets summarizing key activity grounded in the emails.\n\n"
+                                        "### Priority Emails\n"
+                                        "For each email, render a clearly separated block/card with labeled fields on separate lines:\n"
+                                        "**<Priority/importance only if supported> · <Subject or (no subject)>**\n"
+                                        "- **From:** <sender name and/or email if available>\n"
+                                        "- **Date:** <received date/time if available>\n"
+                                        "- **Summary:** <grounded key points>\n"
+                                        "- **Action required:** <only if supported; otherwise 'None stated'>\n"
+                                        "- **Deadline:** <only if explicitly available; otherwise 'Not specified'>\n"
+                                        "- **Suggested next step:** <only if reasonably supported; otherwise 'Not specified'>\n\n"
+                                        "### Action Required\n"
+                                        "- List emails/items needing attention (or state 'None identified from the available data.').\n\n"
+                                        "### Pending / Waiting\n"
+                                        "- Include only when supported by content; otherwise state 'None clearly indicated from the available data.'\n\n"
+                                        "### Informational Emails\n"
+                                        "- List important/informational emails not requiring immediate action (or state 'None identified.').\n"
+                                        "Preserve sender details, dates, and relevant links/citations when present in supplied data. "
+                                        "State the actual result count, period, and Gmail criteria. Prioritize Inbox results when indicated."
+                                        if is_email_summary
+                                        else
+                                        "Summarize findings concisely in Markdown with short paragraphs and structured bullets. "
+                                        "Use headings for long summaries and compact tables only when useful. "
+                                        "For latest-thread summaries, include the conversation subject and participants, give the latest message date in Asia/Kolkata, summarize messages chronologically, label each as incoming or outgoing, distinguish the latest outgoing message from the latest incoming one, and identify supported decisions and action items. Call a response pending only when the email content supports that conclusion and no later outgoing reply is shown; do not infer it from direction alone. "
+                                        "For urgent-email requests, distinguish Gmail's IMPORTANT/UNREAD labels from AI inferred urgency; cite concrete message evidence and do not call a message urgent without explaining that evidence. "
+                                        "For today's mail, use the provided timezone and period. When there are multiple plausible matching emails and the user wants to reply or act on one, show a short sender/subject/date list and ask which message they mean. "
+                                        "For email summaries show sender, subject, key points, and supported action items."
+                                    )
                                 ),
                             ),
                             LLMMessage(
@@ -4647,10 +6159,10 @@ def gmail_response_node(
                         ],
                         temperature=(
                             0
-                            if intent == "summarize_important"
+                            if is_email_summary
                             else 0.2
                         ),
-                        max_tokens=1600,
+                        max_tokens=1800,
                     )
                 )
                 answer = response.content
@@ -4685,4 +6197,6 @@ def gmail_response_node(
         response_state["gmail_sources"] = result["gmail_sources"]
     if response_metadata:
         response_state["response_metadata"] = response_metadata
+    if pending_gmail_fallback is not None:
+        response_state["pending_gmail_clarification"] = pending_gmail_fallback
     return response_state

@@ -4,8 +4,8 @@ const configuredTimeout = Number(
 
 export const API_REQUEST_TIMEOUT_MS =
   Number.isFinite(configuredTimeout) && configuredTimeout >= 1000
-    ? Math.min(configuredTimeout, 120_000)
-    : 30_000
+    ? Math.min(configuredTimeout, 180_000)
+    : 65_000
 
 export function createRequestTimeoutError(
   message = 'The request timed out. Please try again.',

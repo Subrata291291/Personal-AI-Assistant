@@ -39,3 +39,11 @@ class ChatResponse(BaseModel):
     assistant_message: ChatMessageResponse
     provider: str
     model: str
+
+
+class ChatRequestStatusResponse(BaseModel):
+    conversation_id: UUID
+    idempotency_key: UUID
+    status: str
+    response: ChatResponse | None = None
+    error_message: str | None = None

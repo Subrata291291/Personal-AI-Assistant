@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Link } from 'react-router-dom'
+import MyOrbitLogo from '../components/MyOrbitLogo.jsx'
 import { useAuth } from '../context/AuthContext'
 import { getOAuthRedirectTo } from '../lib/authRedirect'
 import { supabase } from '../lib/supabase'
@@ -134,13 +135,13 @@ function Login() {
       {/* Header */}
       <header className="relative z-10 flex items-center justify-between px-5 py-5 sm:px-8 lg:px-12">
         <Link to="/login" className="flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 text-2xl font-bold shadow-lg shadow-violet-500/20">
-            ✧
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-500/15 to-indigo-600/15 ring-1 ring-violet-400/20 shadow-lg shadow-violet-500/10">
+            <MyOrbitLogo className="h-7 w-7" />
           </div>
 
           <div>
-            <h1 className="text-lg font-bold tracking-tight">
-              Personal AI
+            <h1 className="text-lg font-bold tracking-tight bg-gradient-to-r from-violet-300 to-indigo-300 bg-clip-text text-transparent">
+              MyOrbit AI
             </h1>
             <p
               className={`text-xs ${
@@ -196,9 +197,9 @@ function Login() {
               isDark ? 'text-slate-400' : 'text-slate-600'
             }`}
           >
-            Meet your personal AI assistant — a smarter way to
-            manage information, remember what matters, and connect
-            the tools you use every day.
+            Meet MyOrbit AI — a smarter way to manage information,
+            remember what matters, and connect the tools you use
+            every day.
           </p>
 
           {/* Features */}

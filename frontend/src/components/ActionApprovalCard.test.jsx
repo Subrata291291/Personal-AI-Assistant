@@ -815,4 +815,105 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
     expect(screen.getByText('Checking Calendar execution...'))
       .toBeInTheDocument()
   })
+
+  it('displays approved distinctly from completed', async () => {
+    const { unmount } = renderProposalCard(createCalendarProposal('approved'))
+    expect(screen.getByText('Approval: Approved')).toBeInTheDocument()
+    expect(screen.queryByText('Execution: Completed')).not.toBeInTheDocument()
+    unmount()
+
+    renderProposalCard({
+      ...createCalendarProposal('completed'),
+      result: { outcome: 'created', google_event_id: 'event-1' },
+    })
+    expect(screen.getByText('Approval: Approved')).toBeInTheDocument()
+    expect(screen.getByText('Execution: Completed')).toBeInTheDocument()
+    expect(screen.getByText(/Google Calendar confirmed the event was created/)).toBeInTheDocument()
+  })
+
+  it('displays executing distinctly from completed', () => {
+    const { unmount } = renderProposalCard(createCalendarProposal('executing'))
+    expect(screen.getByText('Execution: In Progress')).toBeInTheDocument()
+    expect(screen.queryByText('Execution: Completed')).not.toBeInTheDocument()
+    expect(screen.queryByText(/confirmed the event was/)).not.toBeInTheDocument()
+    unmount()
+
+    renderProposalCard({
+      ...createCalendarProposal('completed'),
+      result: { outcome: 'created', google_event_id: 'event-1' },
+    })
+    expect(screen.getByText('Execution: Completed')).toBeInTheDocument()
+  })
+
+  it('never presents execution_uncertain as confirmed success', async () => {
+    renderProposalCard(createCalendarProposal('execution_uncertain'))
+    expect(screen.getByText('Execution: Unconfirmed')).toBeInTheDocument()
+    expect(screen.queryByText('Execution: Completed')).not.toBeInTheDocument()
+    expect(screen.queryByText(/confirmed the event was/)).not.toBeInTheDocument()
+    expect(screen.getByText(/outcome is unconfirmed/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Create Calendar event' })).not.toBeInTheDocument()
+  })
+
+  it('treats network execution errors as unconfirmed, not provider success or failure', async () => {
+    actionApprovalService.execute.mockRejectedValue(
+      Object.assign(new Error('Network request failed'), { networkFailure: true }),
+    )
+    actionApprovalService.getProposal.mockResolvedValue(
+      createCalendarProposal('approved'),
+    )
+    renderProposalCard(createCalendarProposal('approved'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create Calendar event' }))
+
+    await waitFor(() => {
+      expect(actionApprovalService.getProposal).toHaveBeenCalled()
+    })
+    expect(screen.getByText('Execution: Available')).toBeInTheDocument()
+    expect(screen.queryByText('Execution: Failed')).not.toBeInTheDocument()
+    expect(screen.queryByText('Execution: Completed')).not.toBeInTheDocument()
+    expect(screen.queryByText(/confirmed the event was/)).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(/unconfirmed/i)
+  })
+
+  it('refreshes to newer authoritative backend status', async () => {
+    const uncertain = createCalendarProposal('execution_uncertain')
+    actionApprovalService.getProposal.mockResolvedValue({
+      ...createCalendarProposal('completed'),
+      result: { outcome: 'created', google_event_id: 'event-99' },
+    })
+    renderProposalCard(uncertain)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check Calendar change status' }))
+
+    expect(await screen.findByText('Execution: Completed')).toBeInTheDocument()
+    expect(screen.getByText(/confirmed the event was created/)).toBeInTheDocument()
+    expect(screen.queryByText('Execution: Unconfirmed')).not.toBeInTheDocument()
+  })
+
+  it('applies authoritative status refresh results (guarded against stale overwrite by fetch sequencing)', async () => {
+    // UI disables concurrent status-check clicks while pending; sequencing guard in component ensures only the latest
+    // in-flight proposal fetch can update state when overlapping refreshes occur (e.g. execute-error refresh vs status check).
+    const uncertain = createCalendarProposal('execution_uncertain')
+    actionApprovalService.getProposal.mockResolvedValueOnce({
+      ...createCalendarProposal('completed'),
+      result: { outcome: 'created', google_event_id: 'event-new' },
+    })
+    renderProposalCard(uncertain)
+    fireEvent.click(screen.getByRole('button', { name: 'Check Calendar change status' }))
+    expect(await screen.findByText('Execution: Completed')).toBeInTheDocument()
+    expect(screen.getByText(/confirmed the event was created/)).toBeInTheDocument()
+  })
+
+  it('does not offer destructive retry controls for uncertain or executing states', () => {
+    const { unmount } = renderProposalCard(createCalendarProposal('execution_uncertain'))
+    expect(screen.queryByRole('button', { name: 'Create Calendar event' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Execute Gmail send' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check Calendar change status' })).toBeInTheDocument()
+    unmount()
+
+    renderProposalCard(createCalendarProposal('executing'))
+    expect(screen.queryByRole('button', { name: 'Create Calendar event' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Execute Gmail send' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Check Calendar change status' })).toBeInTheDocument()
+  })
 })

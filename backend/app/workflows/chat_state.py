@@ -26,6 +26,25 @@ class ChatContext(TypedDict):
     calendar_write_selection_required: NotRequired[bool]
     calendar_selected_write_scope_missing: NotRequired[bool]
     calendar_selected_freebusy_scope_missing: NotRequired[bool]
+    contacts_connection_id: NotRequired[str | None]
+    contacts_write_connection_id: NotRequired[str | None]
+    contacts_enabled: NotRequired[bool]
+    contacts_selection_required: NotRequired[bool]
+    contacts_selected_account_email: NotRequired[str | None]
+    contacts_candidate_emails: NotRequired[list[str]]
+    contacts_default_connection_invalid: NotRequired[bool]
+    contacts_default_connection_selected: NotRequired[bool]
+    contacts_read_scope_missing: NotRequired[bool]
+    contacts_write_scope_missing: NotRequired[bool]
+    contacts_google_connection_available: NotRequired[bool]
+    drive_connection_id: NotRequired[str | None]
+    drive_enabled: NotRequired[bool]
+    drive_selection_required: NotRequired[bool]
+    drive_selected_account_email: NotRequired[str | None]
+    drive_candidate_emails: NotRequired[list[str]]
+    drive_read_scope_missing: NotRequired[bool]
+    drive_default_connection_invalid: NotRequired[bool]
+    drive_default_connection_selected: NotRequired[bool]
 
 
 class ChatState(TypedDict):
@@ -61,6 +80,7 @@ class ChatState(TypedDict):
     gmail_plan: NotRequired[dict[str, Any]]
     calendar_action_proposal: NotRequired[dict[str, Any]]
     calendar_create_event_proposal: NotRequired[dict[str, Any]]
+    contacts_action_proposal: NotRequired[dict[str, Any]]
 
     assistant_response: str
 
@@ -86,3 +106,13 @@ class ChatState(TypedDict):
     gmail_sources: NotRequired[dict[str, Any]]
 
     email_draft: NotRequired[dict[str, Any]]
+
+    pending_contacts_clarification: NotRequired[dict[str, Any] | None]
+
+    pending_calendar_delete_selection: NotRequired[dict[str, Any] | None]
+
+    pending_calendar_read: NotRequired[dict[str, Any] | None]
+
+    pending_gmail_clarification: NotRequired[dict[str, Any] | None]
+
+    calendar_passthrough_response: NotRequired[bool]

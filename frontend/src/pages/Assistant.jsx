@@ -20,6 +20,7 @@ import {
   useQueryClient,
 } from '@tanstack/react-query'
 
+import MyOrbitLogo from '../components/MyOrbitLogo.jsx'
 import { useAuth } from '../context/AuthContext'
 import EmailDraftCard from '../components/EmailDraftCard.jsx'
 import ActionApprovalCard from '../components/ActionApprovalCard.jsx'
@@ -539,7 +540,106 @@ function AssistantContent({ user }) {
         })
       }
 
-      if (err.status >= 500) {
+      const isRequestTimeout =
+        err?.timeout === true ||
+        err?.code === 'REQUEST_TIMEOUT' ||
+        err?.name === 'TimeoutError'
+      const isConflict =
+        err?.status === 409 || err?.status === '409'
+
+      // If the client timed out, attempt bounded read-only recovery polling using
+      // the same idempotency key/request context (no duplicate logical request).
+      if (isRequestTimeout && conversationId) {
+        const pollIntervalMs = 2000
+        const maxPollMs = 30000
+        const startedAt = Date.now()
+        let recovered = null
+        let terminalFailure = null
+        let stopPolling = false
+
+        while (!stopPolling && Date.now() - startedAt < maxPollMs) {
+          if (!isCurrentUserScope(userId)) return
+          try {
+            const statusResult = await conversationService.getChatRequestStatus(
+              conversationId,
+              idempotencyKey,
+            )
+            const status = statusResult?.status
+            if (
+              isCurrentUserScope(userId) &&
+              status === 'completed' &&
+              statusResult?.response
+            ) {
+              recovered = statusResult.response
+              stopPolling = true
+              break
+            }
+            if (status === 'failed') {
+              terminalFailure = statusResult?.error_message || 'The request failed.'
+              stopPolling = true
+              break
+            }
+            if (status !== 'processing') {
+              // Unknown/non-recoverable status for this flow; stop and let user retry safely.
+              stopPolling = true
+              break
+            }
+          } catch (statusErr) {
+            const statusCode = statusErr?.status
+            // Auth/permission/request-not-found should not be polled indefinitely.
+            if (statusCode === 401 || statusCode === 403 || statusCode === 404) {
+              terminalFailure = statusErr?.message || 'Unable to recover the request status.'
+              stopPolling = true
+              break
+            }
+            // Network/transient status-check failure: retry within the bounded window.
+          }
+
+          if (!stopPolling && Date.now() - startedAt < maxPollMs) {
+            await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+          }
+        }
+
+        if (recovered && isCurrentUserScope(userId)) {
+          setConversationId(recovered.conversation_id || conversationId)
+          newChatModeRef.current = false
+          queryClient.setQueryData(
+            ['conversation-messages', userId, recovered.conversation_id || conversationId],
+            (current = []) => [
+              ...current.filter((item) => item.id !== temporaryId),
+              recovered.user_message,
+              recovered.assistant_message,
+            ]
+          )
+          setOptimisticMessages([])
+          setProviderInfo({
+            provider: recovered.provider,
+            model: recovered.model,
+          })
+          pendingRequestRef.current = null
+          setError('')
+          queryClient.invalidateQueries({
+            queryKey: ['conversations', userId],
+          })
+          scrollToBottom()
+          return
+        }
+
+        if (terminalFailure && isCurrentUserScope(userId)) {
+          pendingRequestRef.current = null
+          setOptimisticMessages((current) =>
+            current.filter((item) => item.id !== temporaryId)
+          )
+          setMessage(content)
+          setError(terminalFailure)
+          return
+        }
+      }
+
+      // Keep the same idempotency key for safe retry/recovery when the backend
+      // request may still be processing or already completed (e.g. frontend
+      // timeout before response). Clear it for definitive server-side failures.
+      if (!isRequestTimeout && !isConflict && err?.status >= 500) {
         pendingRequestRef.current = null
       }
 
@@ -550,10 +650,17 @@ function AssistantContent({ user }) {
       // Keep the draft available for retry.
       setMessage(content)
 
-      setError(
-        err.message ||
-        'Unable to process your message. Please try again.'
-      )
+      if (isRequestTimeout) {
+        setError(
+          'The request is taking longer than expected. It may still be processing. ' +
+          'Please retry to safely check for the result; your message will not be sent twice.'
+        )
+      } else {
+        setError(
+          err.message ||
+          'Unable to process your message. Please try again.'
+        )
+      }
     } finally {
       if (isCurrentUserScope(userId)) {
         sendingRef.current = false
@@ -600,7 +707,7 @@ function AssistantContent({ user }) {
         <div>
           <div className="mb-2 flex items-center gap-2 text-xs font-bold tracking-[1.5px] text-violet-400">
             <span>✧</span>
-            PERSONAL AI ASSISTANT
+            MYORBIT AI
           </div>
 
           <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">
@@ -634,13 +741,13 @@ function AssistantContent({ user }) {
         <div className={`flex items-center gap-3 border-b px-4 py-4 sm:px-6 ${
           isDark ? 'border-[#252838]' : 'border-slate-200'
         }`}>
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500 to-indigo-600 text-xl text-white">
-            ✧
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500/15 to-indigo-600/15 ring-1 ring-violet-400/20 text-violet-300">
+            <MyOrbitLogo className="h-6 w-6" />
           </div>
 
           <div className="min-w-0 flex-1">
             <h2 className="text-sm font-semibold">
-              Personal AI
+              MyOrbit AI
             </h2>
 
             <p className={`mt-1 text-xs ${muted}`}>
@@ -685,7 +792,7 @@ function AssistantContent({ user }) {
 
               <p className={`mt-3 max-w-md text-sm leading-6 ${muted}`}>
                 Ask questions, organize your thoughts, or explore
-                what your personal AI assistant can do.
+                what MyOrbit AI can do.
               </p>
 
               <div className="mt-8 grid w-full grid-cols-1 gap-3 sm:grid-cols-2">

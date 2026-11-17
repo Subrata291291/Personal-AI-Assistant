@@ -7,6 +7,8 @@ from app.db.models.oauth_credential import OAuthCredential
 from app.db.models.oauth_state import OAuthState
 from app.db.models.memory_review import MemoryReview
 from app.db.models.calendar_action_operation import CalendarActionOperation
+from app.db.models.contacts_action_idempotency import ContactsActionIdempotency
+from app.db.models.drive_selected_file import DriveSelectedFile
 
 __all__ = [
     "Conversation",
@@ -18,4 +20,6 @@ __all__ = [
     "OAuthState",
     "MemoryReview",
     "CalendarActionOperation",
+    "ContactsActionIdempotency",
+    "DriveSelectedFile",
 ]

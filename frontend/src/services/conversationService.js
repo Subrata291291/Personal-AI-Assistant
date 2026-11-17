@@ -123,4 +123,13 @@ export const conversationService = {
       }
     )
   },
+
+  async getChatRequestStatus(conversationId, idempotencyKey) {
+    const params = new URLSearchParams({
+      conversation_id: conversationId,
+    })
+    return api.get(
+      `${CHAT_PATH}/requests/${encodeURIComponent(idempotencyKey)}?${params.toString()}`
+    )
+  },
 }

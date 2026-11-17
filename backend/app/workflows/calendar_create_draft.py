@@ -55,6 +55,16 @@ _MONTH_DATE = re.compile(
     r"(\d{1,2})(?:st|nd|rd|th)?(?:,\s*|\s+)(20\d{2})\b",
     re.IGNORECASE,
 )
+_MONTH_DAY = re.compile(
+    r"\b(?:(\d{1,2})(?:st|nd|rd|th)?\s+"
+    r"(january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)"
+    r"|"
+    r"(january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)\s+"
+    r"(\d{1,2})(?:st|nd|rd|th)?)\b",
+    re.IGNORECASE,
+)
 _ISO_DATE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 _CLOCK = re.compile(
     r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b",
@@ -64,6 +74,50 @@ _MONTH_NAMES = (
     "january", "february", "march", "april", "may", "june",
     "july", "august", "september", "october", "november", "december",
 )
+
+_MONTH_TYPO_MAP = {
+    "jan": "january", "janu": "january", "januray": "january", "janruary": "january",
+    "feb": "february", "febuary": "february", "feburary": "february",
+    "mar": "march", "aprl": "april", "apr": "april",
+    "jun": "june", "jul": "july", "aug": "august", "agust": "august",
+    "sep": "september", "sept": "september", "septmber": "september", "setember": "september",
+    "oct": "october", "octuber": "october", "oktober": "october",
+    "nov": "november", "novem": "november", "novmber": "november", "ovember": "november",
+    "ovembar": "november", "novembar": "november", "novenber": "november",
+    "dec": "december", "decem": "december", "decembar": "december", "desember": "december",
+}
+_MONTH_TOKEN_RE = re.compile(r"\b([A-Za-z]{3,12})\b")
+
+
+def _normalize_month_typos(text: str) -> str:
+    if not text:
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(1)
+        lower = token.casefold()
+        if lower in _MONTH_NAMES:
+            return token
+        fixed = _MONTH_TYPO_MAP.get(lower)
+        if not fixed:
+            # Conservative prefix correction for minor misspellings (e.g. ovembar-like handled above,
+            # plus close variants) without replacing arbitrary words.
+            for name in _MONTH_NAMES:
+                if len(lower) >= 5 and (name.startswith(lower[:4]) or lower.startswith(name[:4])):
+                    # Require small edit distance-like similarity by shared prefix/length.
+                    if abs(len(lower) - len(name)) <= 2:
+                        fixed = name
+                        break
+        if not fixed:
+            return token
+        # Preserve capitalization style loosely.
+        if token.isupper():
+            return fixed.upper()
+        if token[:1].isupper():
+            return fixed.capitalize()
+        return fixed
+
+    return _MONTH_TOKEN_RE.sub(repl, text)
 _FIELD_NAMES = (
     "title", "date", "start time", "end time", "time zone", "timezone",
     "calendar", "description", "location", "attendees", "all day",
@@ -94,7 +148,7 @@ def _normalize_labeled_text(text: str) -> str:
     )
 
 
-def extract_explicit_calendar_date(text: str) -> date | None:
+def extract_explicit_calendar_date(text: str, *, reference_date: date | None = None) -> date | None:
     iso_match = _ISO_DATE.search(text)
     if iso_match:
         try:
@@ -102,17 +156,35 @@ def extract_explicit_calendar_date(text: str) -> date | None:
         except ValueError:
             pass
 
-    natural_match = _MONTH_DATE.search(text)
-    if not natural_match:
-        return None
-    try:
-        return date(
-            int(natural_match.group(3)),
-            _MONTH_NAMES.index(natural_match.group(1).casefold()) + 1,
-            int(natural_match.group(2)),
-        )
-    except ValueError:
-        return None
+    normalized_text = _normalize_month_typos(text)
+
+    natural_match = _MONTH_DATE.search(normalized_text)
+    if natural_match:
+        try:
+            return date(
+                int(natural_match.group(3)),
+                _MONTH_NAMES.index(natural_match.group(1).casefold()) + 1,
+                int(natural_match.group(2)),
+            )
+        except ValueError:
+            pass
+
+    # Allow "21st November" / "November 21st" / "21th november" without year by
+    # inferring year from reference_date when provided (caller supplies user-timezone context).
+    day_month = _MONTH_DAY.search(normalized_text)
+    if day_month and reference_date is not None:
+        if day_month.group(1) and day_month.group(2):
+            day_num = int(day_month.group(1))
+            month_name = day_month.group(2)
+        else:
+            month_name = day_month.group(3)
+            day_num = int(day_month.group(4))
+        try:
+            month_num = _MONTH_NAMES.index(month_name.casefold()) + 1
+            return date(reference_date.year, month_num, day_num)
+        except (ValueError, IndexError):
+            return None
+    return None
 
 
 def _label_value(text: str, label: str) -> str | None:

@@ -506,3 +506,14 @@ def test_combined_day_check_treats_an_all_day_event_as_a_conflict(
     assert "calendar_create_event_proposal" not in result
     assert "Company holiday" in result["assistant_response"]
 
+
+def test_extract_explicit_calendar_date_handles_common_month_typo_with_reference_year():
+    from datetime import date
+
+    from app.workflows.calendar_create_draft import extract_explicit_calendar_date
+
+    assert extract_explicit_calendar_date(
+        "check calendar for 18th ovembar",
+        reference_date=date(2026, 11, 17),
+    ) == date(2026, 11, 18)
+

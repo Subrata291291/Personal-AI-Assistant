@@ -4,10 +4,12 @@ from typing import Any
 from urllib.parse import quote
 from uuid import UUID
 from zoneinfo import ZoneInfo
+import hashlib
 
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.request_metrics import request_id as _request_id
 from app.db.session import SessionLocal
 from app.integrations.google.api_client import GoogleAPIClient
 from app.integrations.google.exceptions import (
@@ -37,6 +39,18 @@ from app.services.calendar_service import CalendarService
 
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_ref(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        text = str(value)
+        if not text:
+            return None
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    except Exception:
+        return None
 
 
 class CalendarExecutionStatePersistenceError(Exception):
@@ -262,6 +276,17 @@ class CalendarActionExecutor:
         )
         api_db = SessionLocal()
         try:
+            logger.info(
+                "calendar_delete_tool_invocation | request_id=%s | action=%s | calendar_ref=%s | event_ref=%s | user_ref=%s | connection_ref=%s | method=%s | if_match_present=%s",
+                getattr(proposal, "proposal_id", None),
+                proposal.action_type,
+                _safe_ref(parameters.calendar_id),
+                _safe_ref(parameters.event_id),
+                _safe_ref(str(user_id)),
+                _safe_ref(str(proposal.connection_id)),
+                method,
+                bool(parameters.expected_etag),
+            )
             await self.api_client.request_mutation(
                 db=api_db,
                 user_id=str(user_id),

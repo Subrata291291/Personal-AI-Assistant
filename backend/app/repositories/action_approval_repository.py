@@ -328,6 +328,72 @@ _INSERT_GMAIL_DRAFT_PROPOSAL = text("""
     RETURNING id AS message_id, metadata, created_at
 """)
 
+_INSERT_STANDALONE_CONTACTS_PROPOSAL = text("""
+    WITH proposal_clock AS (
+        SELECT clock_timestamp() AS created_at
+    ),
+    approval_conversation AS (
+        INSERT INTO public.pa_conversations (
+            id, user_id, title, is_archived
+        )
+        VALUES (
+            CAST(:conversation_id AS uuid),
+            CAST(:user_id AS uuid),
+            'Contacts approval',
+            true
+        )
+        RETURNING id
+    ),
+    source_message AS (
+        INSERT INTO public.pa_conversation_messages (
+            id, conversation_id, role, content, metadata
+        )
+        SELECT
+            CAST(:source_message_id AS uuid),
+            approval_conversation.id,
+            'assistant',
+            'Contacts approval context',
+            jsonb_build_object('internal_action_approval_source', true)
+        FROM approval_conversation
+        RETURNING id, conversation_id
+    )
+    INSERT INTO public.pa_conversation_messages (
+        id, conversation_id, role, content, metadata
+    )
+    SELECT
+        CAST(:proposal_id AS uuid),
+        source_message.conversation_id,
+        'assistant',
+        CAST(:content AS text),
+        jsonb_build_object(
+            'action_approval',
+            jsonb_build_object(
+                'proposal_id', CAST(:proposal_id AS uuid)::text,
+                'source_message_id', source_message.id::text,
+                'user_id', CAST(:user_id AS uuid)::text,
+                'conversation_id', source_message.conversation_id::text,
+                'action_type', CAST(:action_type AS text),
+                'parameters', CAST(:parameters AS jsonb),
+                'connection_id', CAST(:connection_id AS uuid)::text,
+                'account_email', CAST(:account_email AS text),
+                'created_at', proposal_clock.created_at::text,
+                'expires_at',
+                    (
+                        proposal_clock.created_at
+                        + make_interval(mins => :expiration_minutes)
+                    )::text,
+                'status', 'pending',
+                'approved_at', NULL,
+                'execution_started_at', NULL,
+                'completed_at', NULL,
+                'result', NULL
+            ) || COALESCE(CAST(:calendar_integrity AS jsonb), '{}'::jsonb)
+        )
+    FROM source_message
+    CROSS JOIN proposal_clock
+    RETURNING id AS message_id, metadata, created_at
+""")
+
 _LIST_PENDING = text("""
     SELECT
         approval_message.id AS message_id,
@@ -721,7 +787,10 @@ class ActionApprovalRepository:
             ),
         }
         with self.engine.begin() as connection:
-            if calendar_operation is not None:
+            if (
+                calendar_operation is not None
+                and str(action_type).startswith("calendar.")
+            ):
                 connection.execute(
                     _LOCK_PROPOSAL_IDEMPOTENCY,
                     {
@@ -839,7 +908,10 @@ class ActionApprovalRepository:
                         "Replacement Calendar approval could not be stored."
                     )
                 return None
-            if calendar_operation is not None:
+            if (
+                calendar_operation is not None
+                and str(action_type).startswith("calendar.")
+            ):
                 connection.execute(
                     _INSERT_CALENDAR_OPERATION,
                     calendar_operation,
@@ -931,6 +1003,75 @@ class ActionApprovalRepository:
         )
         if row is None:
             raise RuntimeError("Gmail draft approval could not be stored.")
+        return self._proposal_row(row, account_email)
+
+    def create_standalone_contacts_proposal(
+        self,
+        *,
+        proposal_id: UUID,
+        source_message_id: UUID,
+        conversation_id: UUID,
+        user_id: UUID,
+        action_type: str,
+        parameters: dict[str, Any],
+        connection_id: UUID,
+        account_email: str | None,
+        expiration_minutes: int,
+        contacts_integrity: dict[str, Any] | None = None,
+        connection: Any | None = None,
+    ) -> dict[str, Any]:
+        params = {
+            "proposal_id": str(proposal_id),
+            "source_message_id": str(source_message_id),
+            "conversation_id": str(conversation_id),
+            "user_id": str(user_id),
+            "action_type": action_type,
+            "parameters": json.dumps(
+                parameters,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "connection_id": str(connection_id),
+            "account_email": account_email,
+            "expiration_minutes": expiration_minutes,
+            "content": f"Approval proposal: {action_type}",
+            "calendar_integrity": (
+                json.dumps(
+                    {
+                        "integrity_schema_version": contacts_integrity[
+                            "integrity_schema_version"
+                        ],
+                        "payload_fingerprint": contacts_integrity[
+                            "payload_fingerprint"
+                        ],
+                        "operation_id": contacts_integrity["operation_id"],
+                        "calendar_event_id": contacts_integrity.get("event_id"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if contacts_integrity is not None
+                else None
+            ),
+        }
+
+        def _execute(conn):
+            return (
+                conn.execute(
+                    _INSERT_STANDALONE_CONTACTS_PROPOSAL,
+                    params,
+                )
+                .mappings()
+                .first()
+            )
+
+        if connection is not None:
+            row = _execute(connection)
+        else:
+            with self.engine.begin() as managed_connection:
+                row = _execute(managed_connection)
+        if row is None:
+            raise RuntimeError("Contacts approval could not be stored.")
         return self._proposal_row(row, account_email)
 
     def get_gmail_draft_proposal(

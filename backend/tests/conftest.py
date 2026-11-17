@@ -10,6 +10,24 @@ restores the original values afterwards. Production configuration and the
 defaults in ``app.core.config`` are unchanged.
 """
 
+import logging
+import os
+
+# Disable external tracing during tests to avoid background LangSmith/LangChain
+# client threads and network/export side effects. This must be set before app
+# modules that load environment/tracing configuration are imported.
+os.environ.setdefault("LANGCHAIN_TRACING_V2", "false")
+os.environ.setdefault("LANGCHAIN_TRACING", "false")
+os.environ.setdefault("LANGSMITH_TRACING", "false")
+os.environ.setdefault("LANGSMITH_TRACING_V2", "false")
+
+# LangSmith background threads may emit debug logs during interpreter shutdown
+# after pytest closes captured streams, causing noisy "I/O operation on closed
+# file" logging errors and non-zero process exits without test failures.
+for _logger_name in ("langsmith", "langsmith.client", "langsmith.utils"):
+    logging.getLogger(_logger_name).setLevel(logging.CRITICAL)
+    logging.getLogger(_logger_name).propagate = False
+
 import pytest
 
 from app.core.config import settings

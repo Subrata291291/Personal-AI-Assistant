@@ -1,10 +1,11 @@
 
 import logging
+from collections.abc import Iterator
 from time import perf_counter
 
-from app.llm.fallback import FallbackManager
-from app.llm.schemas import LLMRequest, LLMResponse
 from app.core.request_metrics import record_timing, request_id
+from app.llm.fallback import FallbackManager
+from app.llm.schemas import LLMRequest, LLMResponse, LLMStreamChunk
 
 
 logger = logging.getLogger(__name__)
@@ -40,13 +41,30 @@ class LLMRouter:
             response.provider,
             response.model,
             response.finish_reason,
-            response.usage.completion_tokens if response.usage else None,
-            response.usage.prompt_tokens if response.usage else None,
-            response.completion_metadata()["status"],
+            getattr(getattr(response, "usage", None), "completion_tokens", None),
+            getattr(getattr(response, "usage", None), "prompt_tokens", None),
+            "output_limited" if response.output_limited else "success",
         )
 
         return response
 
+    def stream(self, request: LLMRequest) -> Iterator[LLMStreamChunk]:
+        started_at = perf_counter()
+        logger.info(
+            "llm_stream_started | request_id=%s | messages=%s",
+            request_id(),
+            len(request.messages),
+        )
+        try:
+            yield from self.fallback_manager.stream(request)
+        finally:
+            duration_ms = (perf_counter() - started_at) * 1000
+            record_timing("llm", duration_ms)
+            logger.info(
+                "llm_stream_ended | request_id=%s | duration_ms=%.2f",
+                request_id(),
+                duration_ms,
+            )
 
-# Shared router instance for application components
+
 llm_router = LLMRouter()

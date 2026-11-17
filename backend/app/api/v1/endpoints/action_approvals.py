@@ -29,6 +29,13 @@ from app.services.calendar_action_executor import (
     CalendarActionExecutor,
     CalendarExecutionStatePersistenceError,
 )
+from app.services.contacts_action_executor import ContactsActionExecutor
+from app.services.contacts_service import ContactsService
+from app.services.contacts_update_verification import (
+    ContactsUpdateTargetConflictError,
+    verify_and_bind_contacts_update_target,
+)
+from app.services.user_connection_service import UserConnectionService
 
 
 router = APIRouter()
@@ -354,26 +361,136 @@ def get_gmail_draft_send_approval_status(
     response_model=ActionApprovalResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_action_approval(
+async def create_action_approval(
     payload: ApprovalProposalCreate,
     user: CurrentUser,
     service: ActionApprovalServiceDependency,
+    db: Session = Depends(get_db),
 ):
+    user_id = UUID(str(user["id"]))
     integration = (
         "gmail"
         if payload.action_type.startswith("gmail.")
         else "calendar"
         if payload.action_type.startswith("calendar.")
+        else "contacts"
+        if payload.action_type.startswith("contacts.")
         else None
     )
     if integration and not is_integration_enabled(user, integration):
+        label = (
+            "Google Contacts"
+            if integration == "contacts"
+            else integration.title()
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"{integration.title()} is turned off in Connected Apps.",
+            detail=f"{label} is turned off in Connected Apps.",
         )
+
+    if payload.action_type.startswith("contacts."):
+        metadata = (
+            user.get("user_metadata")
+            if isinstance(user, dict)
+            and isinstance(user.get("user_metadata"), dict)
+            else {}
+        )
+        access = UserConnectionService(service.db).get_user_contacts_access(
+            user_id=user_id,
+            default_connection_id=metadata.get(
+                "default_contacts_connection_id"
+            ),
+        )
+        if access.get("selection_required"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Select a Google account to use Contacts before creating an approval proposal.",
+            )
+        if access.get("default_connection_invalid"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The selected Contacts account is unavailable. Choose a different account.",
+            )
+        write_connection_id = access.get("write_connection_id")
+        if not write_connection_id:
+            if access.get("write_scope_missing"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Google Contacts write permission is not granted for the selected account.",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No eligible Google Contacts connection was found for this action.",
+            )
+        # Never trust frontend/LLM-supplied connection IDs for Contacts proposals.
+        payload = payload.model_copy(
+            update={"connection_id": UUID(str(write_connection_id))}
+        )
+
+        if payload.action_type == "contacts.update_contact":
+            try:
+                verified = await verify_and_bind_contacts_update_target(
+                    db=db,
+                    user_id=user_id,
+                    connection_id=UUID(str(write_connection_id)),
+                    parameters=dict(payload.parameters),
+                )
+                payload = payload.model_copy(update={"parameters": verified.parameters})
+            except ContactsUpdateTargetConflictError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "message": str(exc),
+                        "code": "contacts_update_target_conflict",
+                    },
+                ) from exc
+            except GoogleAPIError as exc:
+                if exc.status_code == 401:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Google authorization is no longer valid. Reconnect Google Contacts in Connected Apps.",
+                    ) from exc
+                if exc.status_code == 403:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Google Contacts permission was denied for the selected account.",
+                    ) from exc
+                if exc.status_code == 404:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="The requested contact was not found.",
+                    ) from exc
+                if exc.status_code == 409:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="The contact changed since it was loaded. Refresh and try again.",
+                    ) from exc
+                if exc.status_code == 429 or exc.status_code >= 500:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Google Contacts is temporarily unavailable. Please try again.",
+                    ) from exc
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Google Contacts could not process the request.",
+                ) from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+            except LookupError as exc:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Unable to verify the selected contact before creating an update approval.",
+                )
+
     try:
         proposal = service.create_proposal(
-            user_id=UUID(str(user["id"])),
+            user_id=user_id,
             payload=payload,
         )
     except LookupError as exc:
@@ -384,6 +501,11 @@ def create_action_approval(
     except PermissionError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
     return ActionApprovalResponse(proposal=proposal)
@@ -518,14 +640,19 @@ async def execute_action(
             if current.action_type.startswith("gmail.")
             else "calendar"
             if current.action_type.startswith("calendar.")
+            else "contacts"
+            if current.action_type.startswith("contacts.")
             else None
         )
         if integration and not is_integration_enabled(user, integration):
+            label = (
+                "Google Contacts"
+                if integration == "contacts"
+                else integration.title()
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=(
-                    f"{integration.title()} is turned off in Connected Apps."
-                ),
+                detail=f"{label} is turned off in Connected Apps.",
             )
         if current.action_type in GmailActionExecutor.SUPPORTED_ACTION_TYPES:
             proposal = await GmailActionExecutor(
@@ -537,6 +664,14 @@ async def execute_action(
             )
         elif current.action_type in CalendarActionExecutor.SUPPORTED_ACTION_TYPES:
             proposal = await CalendarActionExecutor(
+                db=service.db,
+                approval_service=service,
+            ).execute(
+                user_id=user_id,
+                proposal_id=proposal_id,
+            )
+        elif current.action_type in ContactsActionExecutor.SUPPORTED_ACTION_TYPES:
+            proposal = await ContactsActionExecutor(
                 db=service.db,
                 approval_service=service,
             ).execute(
@@ -578,24 +713,39 @@ async def execute_action(
             detail=str(exc),
         ) from exc
     except GoogleAPIError as exc:
+        action_type = locals().get("current").action_type if "current" in locals() else ""
+        is_contacts = str(action_type).startswith("contacts.")
         if exc.status_code in {401, 403}:
             response_status = status.HTTP_403_FORBIDDEN
             detail = (
-                "The selected Google account is no longer authorized for "
-                "this Calendar."
+                "Google authorization is no longer valid for the selected Contacts account."
+                if is_contacts
+                else "The selected Google account is no longer authorized for this Calendar."
             )
         elif exc.status_code == 404:
             response_status = status.HTTP_404_NOT_FOUND
-            detail = "The selected Google Calendar is unavailable."
+            detail = (
+                "The selected contact was not found."
+                if is_contacts
+                else "The selected Google Calendar is unavailable."
+            )
+        elif exc.status_code == 409 and is_contacts:
+            response_status = status.HTTP_409_CONFLICT
+            detail = "The contact changed since it was loaded. Refresh and try again."
         elif exc.status_code == 429 or exc.status_code >= 500:
             response_status = status.HTTP_503_SERVICE_UNAVAILABLE
             detail = (
-                "Google Calendar is temporarily unavailable. The event "
-                "request was not automatically retried."
+                "Google Contacts is temporarily unavailable. The change was not automatically retried."
+                if is_contacts
+                else "Google Calendar is temporarily unavailable. The event request was not automatically retried."
             )
         else:
             response_status = status.HTTP_502_BAD_GATEWAY
-            detail = "Google Calendar could not process the request."
+            detail = (
+                "Google Contacts could not process the request."
+                if is_contacts
+                else "Google Calendar could not process the request."
+            )
         raise HTTPException(
             status_code=response_status,
             detail=detail,

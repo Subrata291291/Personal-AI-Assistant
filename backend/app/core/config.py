@@ -46,31 +46,47 @@ class Settings(BaseSettings):
     # Groq
     GROQ_API_KEY: Optional[SecretStr] = None
     GROQ_MODEL: Optional[str] = None
-    GROQ_TIMEOUT_SECONDS: int = Field(default=20, gt=0)
+    GROQ_TIMEOUT_SECONDS: int = Field(default=12, gt=0)
     GROQ_MAX_OUTPUT_TOKENS: int = Field(default=2048, gt=0)
 
     # OpenRouter
     OPENROUTER_API_KEY: Optional[SecretStr] = None
     OPENROUTER_MODEL: Optional[str] = None
-    OPENROUTER_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    OPENROUTER_TIMEOUT_SECONDS: int = Field(default=15, gt=0)
     OPENROUTER_MAX_OUTPUT_TOKENS: int = Field(default=2048, gt=0)
 
     # Gemini
     GEMINI_API_KEY: Optional[SecretStr] = None
     GEMINI_MODEL: Optional[str] = None
-    GEMINI_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    GEMINI_TIMEOUT_SECONDS: int = Field(default=15, gt=0)
     GEMINI_MAX_OUTPUT_TOKENS: int = Field(default=2048, gt=0)
 
     # OpenAI
     OPENAI_API_KEY: Optional[SecretStr] = None
     OPENAI_MODEL: Optional[str] = None
-    OPENAI_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    OPENAI_TIMEOUT_SECONDS: int = Field(default=20, gt=0)
     OPENAI_MAX_OUTPUT_TOKENS: int = Field(default=2048, gt=0)
+
+    # Overall LLM request budget across fallback attempts (seconds).
+    # Frontend/client timeout should be >= this plus small overhead.
+    LLM_REQUEST_DEADLINE_SECONDS: int = Field(default=50, gt=0)
 
     # Google OAuth
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[SecretStr] = None
     GOOGLE_REDIRECT_URI: Optional[str] = None
+
+    # Google Picker (Drive contracts MVP). The API key is a browser key
+    # restricted to the configured frontend origins and the Picker API.
+    GOOGLE_API_KEY: Optional[str] = None
+
+    # Google Drive contracts (read-only, selected files only)
+    # Temporarily disabled for production readiness; keep unavailable until re-enabled.
+    DRIVE_CONTRACTS_ENABLED: bool = False
+    DRIVE_CONTRACTS_MAX_FILES_PER_ANSWER: int = 3
+    DRIVE_CONTRACTS_MAX_CHARS_PER_DOCUMENT: int = 30000
+    DRIVE_CONTRACTS_MAX_TOTAL_CHARS: int = 90000
+    DRIVE_CONTRACTS_MAX_DOWNLOAD_BYTES: int = 20 * 1024 * 1024
 
     # OAuth scopes (comma-separated)
     GOOGLE_OAUTH_SCOPES: str = (
@@ -87,6 +103,12 @@ class Settings(BaseSettings):
     CALENDAR_CREATE_EVENT_ENABLED: bool = False
     CALENDAR_UPDATE_EVENT_ENABLED: bool = False
     CALENDAR_DELETE_EVENT_ENABLED: bool = False
+
+    # Google Contacts
+    CONTACTS_READ_ENABLED: bool = True
+    CONTACTS_CREATE_ENABLED: bool = False
+    CONTACTS_UPDATE_ENABLED: bool = False
+    CONTACTS_DELETE_ENABLED: bool = False
 
     # Frontend and Backend
     FRONTEND_URL: str = "http://localhost:5173"

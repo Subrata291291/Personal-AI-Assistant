@@ -249,7 +249,15 @@ def _extract_event_query(text: str) -> str | None:
             direct_title.group("title"),
             flags=re.IGNORECASE,
         )
-        return _clean_title(title)
+        cleaned = _clean_title(title)
+        if cleaned:
+            normalized = " ".join(cleaned.casefold().split())
+            # Keep generic nouns as searchable queries for legacy/generic requests
+            # (e.g. "Delete my event."); day-scoped generic discovery is handled
+            # separately in parse_calendar_delete_request.
+            if normalized in {"calendar event", "calendar meeting"}:
+                return None
+        return cleaned
     return None
 
 
@@ -409,9 +417,6 @@ def _parse_calendar_request_details(
     """Extract shared event identity and timing details."""
     event_query = _extract_event_query(text)
     date_text = _label_value(text, "Date", "Event date", "Start date")
-    event_date = extract_explicit_calendar_date(
-        date_text if date_text is not None else text
-    )
     time_zone = _label_value(text, "Timezone", "Time zone")
     if time_zone is None:
         zone_match = _TIME_ZONE.search(text)
@@ -423,8 +428,6 @@ def _parse_calendar_request_details(
             time_zone = planner_time_zone
         else:
             errors.append("The timezone is invalid.")
-    if date_text is not None and event_date is None:
-        errors.append("The event date is invalid or unsupported.")
     if time_zone is not None:
         try:
             zone = ZoneInfo(time_zone)
@@ -432,6 +435,37 @@ def _parse_calendar_request_details(
         except (OSError, ValueError, ZoneInfoNotFoundError):
             errors.append("The timezone is invalid.")
             zone = None
+
+    parsed_reference_time = reference_time
+    if isinstance(parsed_reference_time, str):
+        try:
+            parsed_reference_time = datetime.fromisoformat(
+                parsed_reference_time.replace("Z", "+00:00")
+            )
+        except Exception:
+            parsed_reference_time = None
+    reference_date = None
+    if isinstance(parsed_reference_time, datetime):
+        try:
+            reference_date = (
+                parsed_reference_time.astimezone(zone).date()
+                if zone is not None
+                else parsed_reference_time.date()
+            )
+        except Exception:
+            reference_date = None
+    elif zone is not None:
+        try:
+            reference_date = datetime.now(zone).date()
+        except Exception:
+            reference_date = None
+
+    event_date = extract_explicit_calendar_date(
+        date_text if date_text is not None else text,
+        reference_date=reference_date,
+    )
+    if date_text is not None and event_date is None:
+        errors.append("The event date is invalid or unsupported.")
 
     original_start, original_end, original_error = _labeled_time_pair(
         text,
@@ -737,9 +771,14 @@ def _parse_calendar_request_details(
 def parse_calendar_delete_request(
     text: str,
     planner_time_zone: object | None = None,
+    reference_time: datetime | None = None,
 ) -> dict[str, Any]:
-    """Extract event identity and exact occurrence details for a Delete."""
-    details = _parse_calendar_request_details(text, planner_time_zone)
+    """Extract event identity and details for a Calendar delete request."""
+    details = _parse_calendar_request_details(
+        text,
+        planner_time_zone,
+        reference_time=reference_time,
+    )
     lowered = text.casefold()
     details["delete_entire_series"] = bool(re.search(
         r"\b(?:entire|whole|complete|full|all)\b.{0,50}"
@@ -762,21 +801,86 @@ def parse_calendar_delete_request(
         lowered,
     ))
 
+    # Resolve common relative day references for simple (non-series) deletes using user's timezone.
+    if not details.get("delete_entire_series") and details.get("event_date") is None:
+        zone = None
+        if isinstance(details.get("time_zone"), str):
+            try:
+                zone = ZoneInfo(details["time_zone"])
+            except Exception:
+                zone = None
+        ref = reference_time
+        if isinstance(ref, str):
+            try:
+                ref = datetime.fromisoformat(ref.replace("Z", "+00:00"))
+            except Exception:
+                ref = None
+        if zone is not None:
+            base = ref.astimezone(zone).date() if isinstance(ref, datetime) else datetime.now(zone).date()
+            if re.search(r"\btoday(?:'s|s)?\b", lowered):
+                details["event_date"] = base
+            elif re.search(r"\btomorrow(?:'s|s)?\b", lowered):
+                details["event_date"] = base + timedelta(days=1)
+            elif re.search(r"\byesterday(?:'s|s)?\b", lowered):
+                details["event_date"] = base - timedelta(days=1)
+            if details.get("event_date") is not None and details.get("lookup_time_min") is None:
+                try:
+                    details["lookup_time_min"] = _aware_local_datetime(details["event_date"], time.min, zone)
+                    details["lookup_time_max"] = _aware_local_datetime(details["event_date"] + timedelta(days=1), time.min, zone)
+                except Exception as exc:
+                    details.setdefault("errors", []).append(str(exc))
+
     missing_fields: list[str] = []
-    if not details.get("event_query"):
+    # Generic deletion (e.g. "delete the event from today's calendar") without a specific title/time
+    # should discover/list that day's actual events instead of failing on missing title.
+    # Do not convert broad undated requests like "Delete my event." into day discovery.
+    generic_event_discovery = False
+    if not details.get("delete_entire_series"):
+        has_specific_time = bool(details.get("original_start_time") or details.get("original_end_time") or details.get("event_title_is_prefix"))
+        eq = details.get("event_query")
+        nq = " ".join(str(eq).casefold().split()) if isinstance(eq, str) else ""
+        generic_title_like = nq in {"event", "meeting", "appointment", "my event", "the event", "my meeting", "the meeting", "my appointment", "the appointment"}
+        if not generic_title_like:
+            generic_title_like = bool(re.search(
+                r"\b(?:delete|remove|cancel)\b.{0,60}\b(?:the|an?)\s*(?:event|meeting|appointment)\b.{0,30}\b(?:from|on|for)\b.{0,30}\b(?:today|todays|tomorrow|yesterday|calendar)\b",
+                lowered,
+            ))
+        bulk_all_scope = bool(re.search(
+            r"\b(?:delete|remove|cancel)\b.{0,20}\b(?:all|every)\b.{0,20}\b(?:events?|meetings?|appointments?)\b|"
+            r"\b(?:all|every)\b\s+(?:events?|meetings?|appointments?)\b.{0,20}\b(?:delete|remove|cancel)\b",
+            lowered,
+        ))
+        has_day_scope = details.get("event_date") is not None and bool(re.search(
+            r"\b(?:today(?:'s|s)?|tomorrow(?:'s|s)?|yesterday(?:'s|s)?|calendar)\b|"
+            r"\b(?:on|from|for)\b.{0,40}\b(?:\d{1,2}(?:st|nd|rd|th)?\s+"
+            r"(?:january|february|march|april|may|june|july|august|september|"
+            r"october|november|december)|(?:january|february|march|april|may|"
+            r"june|july|august|september|october|november|december)\s+"
+            r"\d{1,2}(?:st|nd|rd|th)?|20\d{2}-\d{2}-\d{2})\b",
+            lowered,
+        ))
+        if not has_specific_time and has_day_scope and (generic_title_like or bulk_all_scope):
+            generic_event_discovery = True
+            details["event_query"] = None
+
+    if not details.get("event_query") and not generic_event_discovery:
         missing_fields.append("event title")
     if details.get("event_date") is None:
         missing_fields.append("event date")
-    if details.get("original_start_time") is None:
-        missing_fields.append("start time")
-    if details.get("original_end_time") is None:
-        missing_fields.append("end time")
-    if details.get("time_zone") is None:
+    if details.get("delete_entire_series"):
+        if details.get("original_start_time") is None:
+            missing_fields.append("start time")
+        if details.get("original_end_time") is None:
+            missing_fields.append("end time")
+        if details.get("time_zone") is None:
+            missing_fields.append("timezone")
+        if details["expected_recurrence"] is None:
+            missing_fields.append("recurrence")
+        if not details["expected_recurring_unbounded"]:
+            missing_fields.append("no end date")
+    elif details.get("time_zone") is None and (re.search(r"\btoday(?:'s|s)?\b|\btomorrow(?:'s|s)?\b|\byesterday(?:'s|s)?\b", lowered)):
         missing_fields.append("timezone")
-    if details["expected_recurrence"] is None:
-        missing_fields.append("recurrence")
-    if not details["expected_recurring_unbounded"]:
-        missing_fields.append("no end date")
+    details["generic_event_discovery"] = generic_event_discovery
     details["missing_fields"] = missing_fields
     return details
 

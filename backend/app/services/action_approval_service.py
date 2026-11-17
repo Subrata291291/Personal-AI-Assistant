@@ -75,6 +75,11 @@ class ActionApprovalService:
         "calendar.update_event": "CALENDAR_UPDATE_EVENT_ENABLED",
         "calendar.delete_event": "CALENDAR_DELETE_EVENT_ENABLED",
     }
+    CONTACTS_EXECUTION_FLAGS = {
+        "contacts.create_contact": "CONTACTS_CREATE_ENABLED",
+        "contacts.update_contact": "CONTACTS_UPDATE_ENABLED",
+        "contacts.delete_contact": "CONTACTS_DELETE_ENABLED",
+    }
 
     @classmethod
     def _with_execution_availability(
@@ -82,6 +87,8 @@ class ActionApprovalService:
         proposal: ActionApprovalProposal,
     ) -> ActionApprovalProposal:
         flag_name = cls.CALENDAR_EXECUTION_FLAGS.get(proposal.action_type)
+        if flag_name is None:
+            flag_name = cls.CONTACTS_EXECUTION_FLAGS.get(proposal.action_type)
         if flag_name is None:
             return proposal
         return proposal.model_copy(update={
@@ -182,6 +189,40 @@ class ActionApprovalService:
                     identity.integrity_schema_version
                 ),
             }
+        contacts_operation = None
+        if payload.action_type.startswith("contacts."):
+            from app.services.contacts_action_identity import (
+                build_contacts_operation_identity,
+            )
+
+            resource_name = None
+            params = payload.parameters if isinstance(payload.parameters, dict) else {}
+            if payload.action_type in {"contacts.update_contact", "contacts.delete_contact"}:
+                candidate = params.get("contact_id")
+                if isinstance(candidate, str):
+                    resource_name = candidate
+            identity = build_contacts_operation_identity(
+                proposal_id=proposal_id,
+                user_id=user_id,
+                connection_id=payload.connection_id,
+                action_type=payload.action_type,
+                resource_name=resource_name,
+                parameters=payload.parameters,
+            )
+            contacts_operation = {
+                "proposal_id": str(identity.proposal_id),
+                "operation_id": str(identity.operation_id),
+                "user_id": str(identity.user_id),
+                "connection_id": str(identity.connection_id),
+                "idempotency_key": None,
+                "payload_fingerprint": identity.payload_fingerprint,
+                "action_type": identity.action_type,
+                "calendar_id": "contacts",
+                "event_id": identity.resource_name,
+                "integrity_schema_version": (
+                    identity.integrity_schema_version
+                ),
+            }
         repository_arguments = {
             "proposal_id": proposal_id,
             "user_id": user_id,
@@ -192,7 +233,7 @@ class ActionApprovalService:
             "connection_id": payload.connection_id,
             "account_email": connection.email,
             "expiration_minutes": self.PROPOSAL_TTL_MINUTES,
-            "calendar_operation": calendar_operation,
+            "calendar_operation": calendar_operation or contacts_operation,
         }
         if supersedes_proposal_id is not None:
             repository_arguments["supersedes_proposal_id"] = (
@@ -205,6 +246,79 @@ class ActionApprovalService:
             raise LookupError(
                 "The conversation or source assistant message was not found."
             )
+        return self._with_execution_availability(
+            ActionApprovalProposal.model_validate(row)
+        )
+
+    def create_standalone_contacts_proposal(
+        self,
+        user_id: UUID,
+        connection_id: UUID,
+        action_type: str,
+        parameters: dict[str, Any],
+        *,
+        proposal_id: UUID | None = None,
+        source_message_id: UUID | None = None,
+        conversation_id: UUID | None = None,
+        db_connection: Any | None = None,
+    ) -> ActionApprovalProposal:
+        if not action_type.startswith("contacts."):
+            raise ValueError("Unsupported Contacts action type.")
+        payload = ApprovalProposalCreate.model_validate({
+            "conversation_id": conversation_id or uuid4(),
+            "source_message_id": source_message_id or uuid4(),
+            "connection_id": connection_id,
+            "action_type": action_type,
+            "parameters": parameters,
+        })
+        connection = self._validate_connection(
+            user_id=user_id,
+            connection_id=payload.connection_id,
+            action_type=payload.action_type,
+        )
+        proposal_id = proposal_id or uuid4()
+        from app.services.contacts_action_identity import (
+            build_contacts_operation_identity,
+        )
+
+        resource_name = None
+        params = payload.parameters if isinstance(payload.parameters, dict) else {}
+        if payload.action_type in {"contacts.update_contact", "contacts.delete_contact"}:
+            candidate = params.get("contact_id")
+            if isinstance(candidate, str):
+                resource_name = candidate
+        identity = build_contacts_operation_identity(
+            proposal_id=proposal_id,
+            user_id=user_id,
+            connection_id=payload.connection_id,
+            action_type=payload.action_type,
+            resource_name=resource_name,
+            parameters=payload.parameters,
+        )
+        contacts_integrity = {
+            "proposal_id": str(identity.proposal_id),
+            "operation_id": str(identity.operation_id),
+            "user_id": str(identity.user_id),
+            "connection_id": str(identity.connection_id),
+            "payload_fingerprint": identity.payload_fingerprint,
+            "action_type": identity.action_type,
+            "calendar_id": "contacts",
+            "event_id": identity.resource_name,
+            "integrity_schema_version": identity.integrity_schema_version,
+        }
+        row = self.repository.create_standalone_contacts_proposal(
+            proposal_id=proposal_id,
+            source_message_id=payload.source_message_id,
+            conversation_id=payload.conversation_id,
+            user_id=user_id,
+            action_type=payload.action_type,
+            parameters=payload.parameters,
+            connection_id=payload.connection_id,
+            account_email=connection.email,
+            expiration_minutes=self.PROPOSAL_TTL_MINUTES,
+            contacts_integrity=contacts_integrity,
+            connection=db_connection,
+        )
         return self._with_execution_availability(
             ActionApprovalProposal.model_validate(row)
         )
@@ -510,11 +624,17 @@ class ActionApprovalService:
         user_id: UUID,
         proposal_id: UUID,
     ) -> ActionApprovalProposal:
-        """Atomically claim an approved Gmail-send proposal."""
+        """Atomically claim an approved Gmail-send or Contacts proposal."""
         proposal = self.get_proposal(user_id, proposal_id)
-        if proposal.action_type not in {"gmail.send", "gmail.send_draft"}:
+        if proposal.action_type not in {
+            "gmail.send",
+            "gmail.send_draft",
+            "contacts.create_contact",
+            "contacts.update_contact",
+            "contacts.delete_contact",
+        }:
             raise PermissionError(
-                "Only Gmail send actions can be executed in this phase."
+                "Only Gmail send or Contacts actions can be executed in this phase."
             )
         if proposal.status != "approved":
             if proposal.status == "pending":

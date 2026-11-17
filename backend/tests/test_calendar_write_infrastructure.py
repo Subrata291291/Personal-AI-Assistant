@@ -72,7 +72,10 @@ PARAMETERS = {
         ),
         (
             "calendar_write",
-            {GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE},
+            {
+                GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE,
+                *GoogleOAuthClient.IDENTITY_SCOPES,
+            },
         ),
     ],
 )
@@ -90,7 +93,12 @@ def test_calendar_write_oauth_is_separate_incremental_consent():
 
     assert GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE not in read_scopes
     assert GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE in write_scopes
-    assert write_scopes == [GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE]
+    assert set(write_scopes) == {
+        GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE,
+        *GoogleOAuthClient.IDENTITY_SCOPES,
+    }
+    assert GoogleOAuthClient.CALENDAR_EVENTS_READ_SCOPE not in write_scopes
+    assert GoogleOAuthClient.CALENDAR_FREEBUSY_SCOPE not in write_scopes
 
 
 def test_calendar_list_oauth_is_separate_incremental_read_consent():
@@ -100,7 +108,12 @@ def test_calendar_list_oauth_is_separate_incremental_read_consent():
     assert GoogleOAuthClient.CALENDAR_LIST_READ_SCOPE in read_scopes
     assert GoogleOAuthClient.CALENDAR_EVENTS_READ_SCOPE in read_scopes
     assert GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE not in read_scopes
-    assert list_scopes == [GoogleOAuthClient.CALENDAR_LIST_READ_SCOPE]
+    assert set(list_scopes) == {
+        GoogleOAuthClient.CALENDAR_LIST_READ_SCOPE,
+        *GoogleOAuthClient.IDENTITY_SCOPES,
+    }
+    assert GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE not in list_scopes
+    assert GoogleOAuthClient.CALENDAR_EVENTS_READ_SCOPE not in list_scopes
 
 
 def test_write_grant_is_reported_but_execution_remains_unavailable(

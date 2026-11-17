@@ -2722,3 +2722,48 @@ def test_chat_graph_routes_upcoming_events_to_calendar_tool(monkeypatch):
         result["assistant_response"]
     )
     factory.assert_called_once()
+
+
+def test_next_saturday_schedule_plan_invokes_calendar_read_tool(monkeypatch):
+    calls = []
+
+    class RecordingTool(FakeTool):
+        async def ainvoke(self, arguments):
+            calls.append(arguments)
+            return await super().ainvoke(arguments)
+
+    tool = RecordingTool(
+        "get_calendar_schedule",
+        {"ok": True, "data": {"events": [], "date": "2026-11-21", "period": "day"}},
+    )
+    factory = Mock(return_value=[tool])
+    monkeypatch.setattr(calendar_agent_node, "create_calendar_tools", factory)
+
+    state = _state(
+        "get_calendar_schedule",
+        {
+            "date": "2026-11-21",
+            "period": "day",
+            "time_zone": "America/Los_Angeles",
+            "calendar_id": "primary",
+        },
+    )
+    state["user_message"] = "What is on my calendar next Saturday?"
+
+    result = run_node(
+        state,
+        _runtime(
+            user_id=USER_ID,
+            request_time="2026-11-16T12:00:00Z",
+            calendar_event_connection_id=EVENT_CONNECTION_ID,
+            calendar_freebusy_connection_id=None,
+            google_connection_available=True,
+        ),
+    )
+
+    assert calls, "Expected get_calendar_schedule tool to be invoked"
+    assert calls[0]["date"] == "2026-11-21"
+    assert calls[0]["period"] == "day"
+    assert calls[0]["time_zone"] == "America/Los_Angeles"
+    factory.assert_called_once()
+    assert isinstance(result.get("assistant_response"), str)

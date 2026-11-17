@@ -58,17 +58,34 @@ def _frontend_connector_url(status_value: str) -> str:
 def connect_google(
     current_user: CurrentUser,
     db: Session = Depends(get_db),
-    service: Literal[
-        "gmail",
-        "calendar",
-        "calendar_write",
-        "calendar_list_read",
-    ] = "gmail",
+    service: str = "gmail",
     connection_id: UUID | None = None,
 ):
     """
     Start Google OAuth authorization for an authenticated user.
     """
+
+    if service in {"drive_read", "drive_file", "drive_write"}:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Google Drive integration is temporarily unavailable and "
+                "will be available in a future update."
+            ),
+        )
+
+    if service not in {
+        "gmail",
+        "calendar",
+        "calendar_write",
+        "calendar_list_read",
+        "contacts_read",
+        "contacts_write",
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported Google service.",
+        )
 
     if not settings.GOOGLE_CLIENT_ID:
         raise HTTPException(
@@ -85,7 +102,11 @@ def connect_google(
     try:
         user_id = UUID(str(current_user["id"]))
 
-        if service in {"calendar_write", "calendar_list_read"}:
+        if service in {
+            "calendar_write",
+            "calendar_list_read",
+            "contacts_write",
+        }:
             if connection_id is None:
                 raise ValueError(
                     "Choose the connected Google account to authorize."
@@ -104,7 +125,8 @@ def connect_google(
                 )
         elif connection_id is not None:
             raise ValueError(
-                "A target account is supported only for incremental Calendar consent."
+                "A target account is supported only for incremental "
+                "service consent."
             )
 
         state_service = OAuthStateService(db)
@@ -144,17 +166,77 @@ def connect_google(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
+    except RuntimeError as exc:
+        db.rollback()
+        # OAuth client/state helpers raise RuntimeError for configuration or
+        # upstream preparation failures. Return a safe, actionable message
+        # without exposing credentials/tokens.
+        raw_message = str(exc).strip()
+        message = raw_message or "Unable to prepare Google authorization."
+        lower_raw = raw_message.casefold()
+        safe_prefixes = (
+            "GOOGLE_CLIENT_ID",
+            "GOOGLE_REDIRECT_URI",
+            "Google OAuth",
+            "Invalid Google redirect URI",
+            "Production Google redirect URI",
+            "Unsupported redirect URI",
+            "Google redirect URI",
+            "Invalid OAuth state",
+            "Invalid PKCE",
+        )
+        if "encryption_key" in lower_raw or "encrypt" in lower_raw or "decrypt" in lower_raw or "fernet" in lower_raw:
+            logger.exception(
+                "Unable to initiate Google OAuth due to secure configuration/encryption error."
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Google OAuth could not be prepared because secure server "
+                    "configuration is unavailable. Please verify server "
+                    "configuration and try again later."
+                ),
+            ) from exc
+        if not any(
+            message.startswith(prefix) or prefix in message
+            for prefix in safe_prefixes
+        ):
+            logger.exception("Unable to initiate Google OAuth (runtime error).")
+            message = "Unable to prepare Google authorization. Please try again."
+        else:
+            logger.warning(
+                "Unable to initiate Google OAuth: %s",
+                message,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+            if "not configured" in message.casefold() or "missing" in message.casefold()
+            else status.HTTP_400_BAD_REQUEST,
+            detail=message,
+        ) from exc
 
     except Exception as exc:
         db.rollback()
 
-        logger.error(
-            "Unable to initiate Google OAuth."
-        )
+        logger.exception("Unable to initiate Google OAuth.")
 
+        detail = "Unable to initiate Google OAuth. Please try again."
+        # Surface a safe hint for common setup failures without leaking secrets.
+        text = str(exc).casefold()
+        if "encrypt" in text or "decrypt" in text or "fernet" in text or "encryption_key" in text:
+            detail = (
+                "Google OAuth could not be prepared because secure server "
+                "configuration is unavailable. Please verify server "
+                "configuration and try again later."
+            )
+        elif "oauth_state" in text or "pa_oauth_states" in text or "database" in text or "connection" in text:
+            detail = "Google OAuth could not be prepared right now. Please try again later."
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unable to initiate Google OAuth.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+            if "secure server configuration is unavailable" in detail.casefold()
+            or "could not be prepared right now" in detail.casefold()
+            else status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=detail,
         ) from exc
 
 
@@ -243,6 +325,13 @@ def list_google_connections(
 
     try:
         user_id = UUID(str(current_user["id"]))
+        user_metadata = (
+            current_user.get("user_metadata")
+            if isinstance(current_user, dict)
+            else None
+        )
+        if not isinstance(user_metadata, dict):
+            user_metadata = {}
 
         service = UserConnectionService(db)
 
@@ -252,11 +341,43 @@ def list_google_connections(
         calendar_capabilities = service.aggregate_calendar_capabilities(
             connections,
         )
+        contacts_capabilities = service.aggregate_contacts_capabilities(
+            connections,
+        )
+        contacts_access = service.get_user_contacts_access(
+            user_id=user_id,
+            default_connection_id=user_metadata.get(
+                "default_contacts_connection_id"
+            ),
+        )
+        contacts_capabilities.update({
+            "read_available": bool(contacts_access.get("read_connection_id")),
+            "chat_available": bool(contacts_access.get("read_connection_id")),
+            "selection_required": bool(contacts_access.get("selection_required")),
+            "default_connection_invalid": bool(
+                contacts_access.get("default_connection_invalid")
+            ),
+            "default_connection_selected": bool(
+                contacts_access.get("default_connection_selected")
+            ),
+            "read_scope_missing": bool(
+                contacts_access.get("read_scope_missing")
+            ),
+            "selected_connection_email": contacts_access.get(
+                "selected_connection_email"
+            ),
+            "candidate_emails": contacts_access.get("candidate_emails", []),
+        })
+        drive_capabilities = service.aggregate_drive_capabilities(
+            connections,
+        )
 
         return {
             "connections": connections,
             "total": len(connections),
             "calendar_capabilities": calendar_capabilities,
+            "contacts_capabilities": contacts_capabilities,
+            "drive_capabilities": drive_capabilities,
         }
 
     except (KeyError, ValueError) as exc:

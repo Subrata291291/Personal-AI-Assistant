@@ -18,8 +18,8 @@ import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
 const CONNECTOR_DETAILS = {
   gmail: 'Email integration',
   calendar: 'Events and schedule',
-  drive: 'File integration is coming soon',
-  contacts: 'Contacts integration is coming soon',
+  drive: 'Files and documents',
+  contacts: 'People and contact details',
 }
 
 const connectors = GOOGLE_WORKSPACE_SERVICES.map((service) => ({
@@ -419,14 +419,36 @@ function Dashboard() {
               )
               const isComingSoon = connector.comingSoon
 
+              const statusLabel = connectionsLoading
+                ? 'Checking…'
+                : connectionsError
+                  ? 'Unavailable'
+                  : isComingSoon
+                    ? 'Coming soon'
+                    : status
+
+              const badgeClass = connectionsLoading
+                ? SEMANTIC_STATUS_STYLES.neutral.badge
+                : connectionsError
+                  ? SEMANTIC_STATUS_STYLES.error.badge
+                  : status === 'Connected · Enabled'
+                    ? SEMANTIC_STATUS_STYLES.positive.badge
+                    : status === 'Connected · Disabled'
+                      ? SEMANTIC_STATUS_STYLES.neutral.badge
+                      : SEMANTIC_STATUS_STYLES.neutral.badge
+
+              const rowClass = isDark
+                ? 'border-[#252838] bg-[#151826] hover:bg-[#1b1f2e] hover:border-[#32374b]'
+                : 'border-slate-200 bg-white hover:bg-slate-50 hover:border-slate-300'
+
               return (
                 <div
                   key={connector.id}
-                  className={`flex min-w-0 items-center gap-3 rounded-xl p-3 transition sm:p-3.5 ${hoverSurface}`}
+                  className={`group flex min-w-0 items-center gap-3 rounded-xl border p-3 transition-colors duration-150 sm:p-3.5 ${rowClass}`}
                 >
 
-                  <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl sm:h-11 sm:w-11 ${
-                    isDark ? 'bg-[#1b1e2b]' : 'bg-slate-50'
+                  <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border sm:h-11 sm:w-11 ${
+                    isDark ? 'border-[#2a2f40] bg-[#1b1e2b]' : 'border-slate-200 bg-slate-50'
                   }`}>
                     <GoogleServiceIcon service={connector.id} />
                   </div>
@@ -444,25 +466,9 @@ function Dashboard() {
                   </div>
 
                   <span
-                    className={`shrink-0 rounded-full border px-2 py-1 text-[10px] sm:px-3 sm:text-xs ${
-                      connectionsLoading
-                        ? SEMANTIC_STATUS_STYLES.neutral.badge
-                        : connectionsError
-                          ? SEMANTIC_STATUS_STYLES.error.badge
-                          : status === 'Connected · Enabled'
-                            ? SEMANTIC_STATUS_STYLES.positive.badge
-                            : status === 'Connected · Disabled'
-                              ? SEMANTIC_STATUS_STYLES.neutral.badge
-                            : SEMANTIC_STATUS_STYLES.neutral.badge
-                    }`}
+                    className={`shrink-0 rounded-full border px-2.5 py-1 text-[10px] font-semibold leading-none sm:px-3 sm:text-xs ${badgeClass}`}
                   >
-                    {connectionsLoading
-                      ? 'Checking…'
-                      : connectionsError
-                        ? 'Unavailable'
-                        : isComingSoon
-                          ? 'Coming soon'
-                          : status}
+                    {statusLabel}
                   </span>
 
                 </div>

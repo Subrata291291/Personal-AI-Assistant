@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import AppIcon from '../AppIcon'
+import MyOrbitLogo from '../MyOrbitLogo.jsx'
 import GoogleServiceIcon from '../GoogleServiceIcon'
 import { api } from '../../lib/api.js'
 import {
@@ -215,13 +216,13 @@ function DashboardLayout() {
         {/* Brand */}
         <div className="flex h-[76px] shrink-0 items-center justify-between gap-3 border-b border-inherit px-5">
           <div className="flex min-w-0 items-center gap-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500 to-indigo-600 text-xl text-white shadow-lg shadow-indigo-500/20">
-              <AppIcon name="assistant" className="h-5 w-5" />
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500/15 to-indigo-600/15 ring-1 ring-violet-400/20 shadow-lg shadow-indigo-500/10">
+              <MyOrbitLogo className="h-7 w-7" />
             </div>
 
             <div className="min-w-0">
-              <div className="text-base font-bold tracking-wide">
-                Personal AI
+              <div className="text-base font-bold tracking-wide bg-gradient-to-r from-violet-300 to-indigo-300 bg-clip-text text-transparent">
+                MyOrbit AI
               </div>
               <div className={`mt-1 text-xs font-semibold tracking-[1.5px] ${muted}`}>
                 INTELLIGENCE HUB

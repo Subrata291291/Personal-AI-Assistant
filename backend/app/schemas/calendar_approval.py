@@ -387,6 +387,8 @@ def _validate_snapshot(
         "attendees",
         "etag",
         "recurrence",
+        "recurring_event_id",
+        "original_start_time",
     }
     if (
         set(snapshot) - allowed
@@ -395,7 +397,7 @@ def _validate_snapshot(
     ):
         raise ValueError("Current event snapshot is invalid.")
     _validate_event_time_pair(snapshot["start"], snapshot["end"])
-    for key in ("summary", "description", "location"):
+    for key in ("summary", "description", "location", "recurring_event_id"):
         value = snapshot.get(key)
         if value is not None and not isinstance(value, str):
             raise ValueError("Current event snapshot contains invalid text.")
@@ -413,5 +415,23 @@ def _validate_snapshot(
         or any(not isinstance(rule, str) or len(rule) > 1024 for rule in recurrence)
     ):
         raise ValueError("Current event snapshot has invalid recurrence.")
+    original_start_time = snapshot.get("original_start_time")
+    if original_start_time is not None:
+        if not isinstance(original_start_time, dict):
+            raise ValueError("Current event snapshot has invalid original start time.")
+        # Accept date-only or dateTime forms (same shape as start/end components)
+        if "date" in original_start_time:
+            if set(original_start_time) != {"date"} or not isinstance(original_start_time["date"], str):
+                raise ValueError("Current event snapshot has invalid original start time.")
+        elif "dateTime" in original_start_time:
+            if not isinstance(original_start_time["dateTime"], str):
+                raise ValueError("Current event snapshot has invalid original start time.")
+            tz = original_start_time.get("timeZone")
+            if tz is not None and not isinstance(tz, str):
+                raise ValueError("Current event snapshot has invalid original start time.")
+            if set(original_start_time) - {"dateTime", "timeZone"}:
+                raise ValueError("Current event snapshot has invalid original start time.")
+        else:
+            raise ValueError("Current event snapshot has invalid original start time.")
     if len(repr(snapshot).encode("utf-8")) > 16_000:
         raise ValueError("Current event snapshot is too large.")

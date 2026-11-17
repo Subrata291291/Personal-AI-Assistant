@@ -21,6 +21,45 @@ from app.services.oauth_credential_service import OAuthCredentialService
 from app.services.user_connection_service import UserConnectionService
 
 
+def test_contacts_read_scope_requests_only_contacts_readonly():
+    scopes = GoogleOAuthClient.scopes_for_service("contacts_read")
+
+    assert "https://www.googleapis.com/auth/contacts.readonly" in scopes
+    assert "https://www.googleapis.com/auth/contacts" not in scopes
+
+
+def test_contacts_write_service_requests_read_only_scope():
+    """Contacts mutations are unavailable; do not request Contacts write scope."""
+    scopes = GoogleOAuthClient.scopes_for_service("contacts_write")
+
+    assert "https://www.googleapis.com/auth/contacts.readonly" in scopes
+    assert "https://www.googleapis.com/auth/contacts" not in scopes
+
+
+def test_drive_read_scope_requests_only_drive_readonly():
+    scopes = GoogleOAuthClient.scopes_for_service("drive_read")
+
+    assert "https://www.googleapis.com/auth/drive.readonly" in scopes
+    assert "https://www.googleapis.com/auth/drive" not in scopes
+    assert "https://www.googleapis.com/auth/drive.file" not in scopes
+
+
+def test_drive_write_scope_requests_only_drive_file():
+    scopes = GoogleOAuthClient.scopes_for_service("drive_write")
+
+    assert "https://www.googleapis.com/auth/drive.file" in scopes
+    assert "https://www.googleapis.com/auth/drive" not in scopes
+    assert "https://www.googleapis.com/auth/drive.readonly" not in scopes
+
+
+def test_drive_contracts_scope_requests_only_drive_file():
+    scopes = GoogleOAuthClient.scopes_for_service("drive_file")
+
+    assert "https://www.googleapis.com/auth/drive.file" in scopes
+    assert "https://www.googleapis.com/auth/drive" not in scopes
+    assert "https://www.googleapis.com/auth/drive.readonly" not in scopes
+
+
 @pytest.mark.parametrize(
     ("status_code", "body", "error_type"),
     [
@@ -153,6 +192,38 @@ def test_expired_oauth_token_can_enter_refresh_path(monkeypatch):
                 "https://www.googleapis.com/auth/gmail.readonly",
             ],
         ),
+        (
+            "contacts_read",
+            ["https://www.googleapis.com/auth/contacts.readonly"],
+            [
+                "https://www.googleapis.com/auth/contacts",
+                GoogleOAuthClient.CALENDAR_EVENTS_READ_SCOPE,
+            ],
+        ),
+        (
+            "contacts_write",
+            ["https://www.googleapis.com/auth/contacts.readonly"],
+            [
+                "https://www.googleapis.com/auth/contacts",
+                GoogleOAuthClient.CALENDAR_EVENTS_WRITE_SCOPE,
+            ],
+        ),
+        (
+            "drive_read",
+            ["https://www.googleapis.com/auth/drive.readonly"],
+            [
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/drive.file",
+            ],
+        ),
+        (
+            "drive_write",
+            ["https://www.googleapis.com/auth/drive.file"],
+            [
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/drive.readonly",
+            ],
+        ),
     ],
 )
 def test_google_authorization_requests_scopes_for_only_selected_service(
@@ -194,10 +265,10 @@ def test_google_authorization_requests_scopes_for_only_selected_service(
 
 def test_google_authorization_rejects_unknown_service():
     with pytest.raises(ValueError, match="Unsupported Google service"):
-        GoogleOAuthClient.scopes_for_service("drive")
+        GoogleOAuthClient.scopes_for_service("tasks")
 
 
-def test_oauth_state_binds_incremental_calendar_consent_to_connection(
+def test_oauth_state_binds_incremental_consent_to_connection(
     monkeypatch,
 ):
     from app.services.oauth_state_service import OAuthStateService
@@ -235,6 +306,14 @@ def test_oauth_state_binds_incremental_calendar_consent_to_connection(
             redirect_uri="https://example.test/callback",
             service="calendar_write",
         )
+    for incremental_service in ("contacts_write", "drive_write"):
+        with pytest.raises(ValueError, match="must target an existing connection"):
+            service.create_state(
+                user_id=user_id,
+                provider="google",
+                redirect_uri="https://example.test/callback",
+                service=incremental_service,
+            )
 
 
 def test_oauth_state_is_consumed_once_and_replay_is_rejected(monkeypatch):
@@ -513,9 +592,17 @@ def test_disconnect_cancels_an_in_flight_oauth_callback():
             "calendar_list_read",
             GoogleOAuthClient.CALENDAR_LIST_READ_SCOPE,
         ),
+        (
+            "contacts_write",
+            GoogleOAuthClient.CONTACTS_WRITE_SCOPE,
+        ),
+        (
+            "drive_write",
+            GoogleOAuthClient.DRIVE_WRITE_SCOPE,
+        ),
     ],
 )
-def test_incremental_calendar_callback_is_bound_to_the_selected_google_account(
+def test_incremental_callback_is_bound_to_the_selected_google_account(
     service_name,
     scope,
     monkeypatch,

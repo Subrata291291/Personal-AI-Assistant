@@ -63,6 +63,21 @@ def test_list_connections_reports_service_capabilities_from_granted_scopes(
         "calendar_delete_execution_available": False,
         "calendar_write_execution_available": False,
         "calendar_write_available": False,
+        "contacts": False,
+        "contacts_read": False,
+        "contacts_write_permission_granted": False,
+        "contacts_create_feature_enabled": False,
+        "contacts_update_feature_enabled": False,
+        "contacts_delete_feature_enabled": False,
+        "contacts_create_execution_available": False,
+        "contacts_update_execution_available": False,
+        "contacts_delete_execution_available": False,
+        "contacts_write_execution_available": False,
+        "drive": False,
+        "drive_read": False,
+        "drive_file": False,
+        "drive_contracts_read": False,
+        "drive_write_permission_granted": False,
     }
     assert connections[1]["capabilities"] == {
         "gmail": False,
@@ -84,6 +99,21 @@ def test_list_connections_reports_service_capabilities_from_granted_scopes(
         "calendar_delete_execution_available": False,
         "calendar_write_execution_available": False,
         "calendar_write_available": False,
+        "contacts": False,
+        "contacts_read": False,
+        "contacts_write_permission_granted": False,
+        "contacts_create_feature_enabled": False,
+        "contacts_update_feature_enabled": False,
+        "contacts_delete_feature_enabled": False,
+        "contacts_create_execution_available": False,
+        "contacts_update_execution_available": False,
+        "contacts_delete_execution_available": False,
+        "contacts_write_execution_available": False,
+        "drive": False,
+        "drive_read": False,
+        "drive_file": False,
+        "drive_contracts_read": False,
+        "drive_write_permission_granted": False,
     }
     assert credentials.get_by_connection.call_args_list[0].kwargs == {
         "user_id": user_id,
@@ -133,6 +163,21 @@ def test_list_connections_does_not_report_non_google_as_gmail(
         "calendar_delete_execution_available": False,
         "calendar_write_execution_available": False,
         "calendar_write_available": False,
+        "contacts": False,
+        "contacts_read": False,
+        "contacts_write_permission_granted": False,
+        "contacts_create_feature_enabled": False,
+        "contacts_update_feature_enabled": False,
+        "contacts_delete_feature_enabled": False,
+        "contacts_create_execution_available": False,
+        "contacts_update_execution_available": False,
+        "contacts_delete_execution_available": False,
+        "contacts_write_execution_available": False,
+        "drive": False,
+        "drive_read": False,
+        "drive_file": False,
+        "drive_contracts_read": False,
+        "drive_write_permission_granted": False,
     }
     credentials.get_by_connection.assert_not_called()
 
@@ -189,6 +234,21 @@ def test_list_connections_reports_both_services_only_when_both_scopes_are_grante
         "calendar_delete_execution_available": False,
         "calendar_write_execution_available": False,
         "calendar_write_available": False,
+        "contacts": False,
+        "contacts_read": False,
+        "contacts_write_permission_granted": False,
+        "contacts_create_feature_enabled": False,
+        "contacts_update_feature_enabled": False,
+        "contacts_delete_feature_enabled": False,
+        "contacts_create_execution_available": False,
+        "contacts_update_execution_available": False,
+        "contacts_delete_execution_available": False,
+        "contacts_write_execution_available": False,
+        "drive": False,
+        "drive_read": False,
+        "drive_file": False,
+        "drive_contracts_read": False,
+        "drive_write_permission_granted": False,
     }
     credentials.get_by_connection.assert_called_once_with(
         user_id=user_id,
@@ -557,6 +617,224 @@ def test_runtime_scopes_are_only_retrieved_for_active_connection_owned_by_user()
         connection_id=connection_id,
     )
     credentials.get_by_connection.assert_not_called()
+
+
+def _contacts_connection(connection_id, email):
+    return SimpleNamespace(
+        id=connection_id,
+        provider="google",
+        email=email,
+        status="connected",
+        connected_at=None,
+        created_at=None,
+    )
+
+
+def test_contacts_access_resolves_one_connection_for_read_and_write():
+    user_id = uuid4()
+    connection_id = uuid4()
+    repository = Mock()
+    repository.list_by_user.return_value = [
+        _contacts_connection(connection_id, "contacts@example.com"),
+    ]
+    credentials = Mock()
+    credentials.get_by_connection.return_value = SimpleNamespace(
+        scopes=[UserConnectionService.CONTACTS_WRITE_SCOPE],
+    )
+    service = UserConnectionService(db=None)
+    service.repository = repository
+    service.credential_repository = credentials
+
+    access = service.get_user_contacts_access(user_id)
+
+    assert access["read_connection_id"] == str(connection_id)
+    assert access["write_connection_id"] == str(connection_id)
+    assert access["selected_connection_email"] == "contacts@example.com"
+    assert access["selection_required"] is False
+    assert access["read_scope_missing"] is False
+    assert access["write_scope_missing"] is False
+    assert access["capabilities"]["read"] is True
+    assert access["capabilities"]["write_permission_granted"] is True
+
+
+def test_contacts_access_requires_explicit_choice_for_multiple_accounts():
+    user_id = uuid4()
+    repository = Mock()
+    repository.list_by_user.return_value = [
+        _contacts_connection(uuid4(), "one@example.com"),
+        _contacts_connection(uuid4(), "two@example.com"),
+    ]
+    credentials = Mock()
+    credentials.get_by_connection.return_value = SimpleNamespace(
+        scopes=[UserConnectionService.CONTACTS_READ_SCOPE],
+    )
+    service = UserConnectionService(db=None)
+    service.repository = repository
+    service.credential_repository = credentials
+
+    access = service.get_user_contacts_access(user_id)
+
+    assert access["read_connection_id"] is None
+    assert access["write_connection_id"] is None
+    assert access["selection_required"] is True
+    assert access["candidate_emails"] == [
+        "one@example.com",
+        "two@example.com",
+    ]
+
+
+def test_contacts_access_uses_selected_account_without_scope_fallback():
+    user_id = uuid4()
+    read_connection_id = uuid4()
+    write_connection_id = uuid4()
+    repository = Mock()
+    repository.list_by_user.return_value = [
+        _contacts_connection(read_connection_id, "read@example.com"),
+        _contacts_connection(write_connection_id, "write@example.com"),
+    ]
+    credentials = Mock()
+    credentials.get_by_connection.side_effect = [
+        SimpleNamespace(scopes=[UserConnectionService.CONTACTS_READ_SCOPE]),
+        SimpleNamespace(scopes=[UserConnectionService.CONTACTS_WRITE_SCOPE]),
+    ]
+    service = UserConnectionService(db=None)
+    service.repository = repository
+    service.credential_repository = credentials
+
+    access = service.get_user_contacts_access(
+        user_id,
+        default_connection_id=str(read_connection_id),
+    )
+
+    assert access["read_connection_id"] == str(read_connection_id)
+    assert access["write_connection_id"] is None
+    assert access["selected_connection_email"] == "read@example.com"
+    assert access["selection_required"] is False
+    assert access["write_scope_missing"] is True
+    assert access["default_connection_invalid"] is False
+
+
+def test_contacts_access_never_falls_back_to_calendar_grants():
+    user_id = uuid4()
+    connection_id = uuid4()
+    repository = Mock()
+    repository.list_by_user.return_value = [
+        _contacts_connection(connection_id, "calendar@example.com"),
+    ]
+    credentials = Mock()
+    credentials.get_by_connection.return_value = SimpleNamespace(
+        scopes=[UserConnectionService.CALENDAR_EVENTS_READ_SCOPE],
+    )
+    service = UserConnectionService(db=None)
+    service.repository = repository
+    service.credential_repository = credentials
+
+    access = service.get_user_contacts_access(user_id)
+
+    assert access["read_connection_id"] is None
+    assert access["write_connection_id"] is None
+    assert access["selection_required"] is False
+    assert access["google_connection_available"] is True
+    assert access["capabilities"]["connected"] is False
+
+
+def test_contacts_access_rejects_unowned_default_without_selecting_another():
+    user_id = uuid4()
+    repository = Mock()
+    repository.list_by_user.return_value = [
+        _contacts_connection(uuid4(), "owned@example.com"),
+    ]
+    credentials = Mock()
+    credentials.get_by_connection.return_value = SimpleNamespace(
+        scopes=[UserConnectionService.CONTACTS_READ_SCOPE],
+    )
+    service = UserConnectionService(db=None)
+    service.repository = repository
+    service.credential_repository = credentials
+
+    access = service.get_user_contacts_access(
+        user_id,
+        default_connection_id=str(uuid4()),
+    )
+
+    assert access["read_connection_id"] is None
+    assert access["write_connection_id"] is None
+    assert access["default_connection_invalid"] is True
+    assert access["default_connection_selected"] is True
+
+
+def test_aggregate_contacts_and_drive_capabilities_ignore_non_google():
+    contacts = UserConnectionService.aggregate_contacts_capabilities([
+        {
+            "provider": "google",
+            "status": "connected",
+            "capabilities": {
+                "contacts": True,
+                "contacts_read": True,
+                "contacts_write_permission_granted": False,
+                "contacts_create_execution_available": False,
+                "contacts_update_execution_available": False,
+                "contacts_delete_execution_available": False,
+                "contacts_write_execution_available": False,
+            },
+        },
+        {
+            "provider": "other",
+            "status": "connected",
+            "capabilities": {
+                "contacts": True,
+                "contacts_read": True,
+                "contacts_write_permission_granted": True,
+            },
+        },
+    ])
+    drive = UserConnectionService.aggregate_drive_capabilities([
+        {
+            "provider": "google",
+            "status": "connected",
+            "capabilities": {
+                "drive": True,
+                "drive_read": True,
+                "drive_write_permission_granted": False,
+            },
+        },
+        {
+            "provider": "other",
+            "status": "connected",
+            "capabilities": {
+                "drive": True,
+                "drive_read": True,
+                "drive_write_permission_granted": True,
+            },
+        },
+    ])
+
+    assert contacts["connected"] is True
+    assert contacts["read"] is True
+    assert contacts["write_permission_granted"] is False
+    assert contacts["google_connection_available"] is True
+    assert contacts["permissions_need_consent"] is False
+    assert contacts["create_feature_enabled"] is settings.CONTACTS_CREATE_ENABLED
+    assert contacts["update_feature_enabled"] is settings.CONTACTS_UPDATE_ENABLED
+    assert contacts["delete_feature_enabled"] is settings.CONTACTS_DELETE_ENABLED
+    assert contacts["create_execution_available"] is False
+    assert contacts["update_execution_available"] is False
+    assert contacts["delete_execution_available"] is False
+    assert contacts["write_execution_available"] is False
+
+    # Google Drive is temporarily disabled for production readiness; existing
+    # stored grants must not activate Drive functionality.
+    assert drive == {
+        "connected": False,
+        "read": False,
+        "contracts_read": False,
+        "file_scope_granted": False,
+        "write_permission_granted": False,
+        "google_connection_available": False,
+        "permissions_need_consent": False,
+        "integration_enabled": False,
+        "temporarily_unavailable": True,
+    }
 
 
 def test_runtime_scopes_return_only_grants_for_requested_users_connection():

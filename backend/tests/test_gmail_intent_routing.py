@@ -412,9 +412,13 @@ def test_calendar_create_request_is_never_sent_to_gmail_or_claimed_successful():
 
     assert routed["assistant_route"] == "google_calendar"
     assert routed["gmail_plan"]["calendar_tool"] == "create_calendar_event_proposal"
-    assert "authorized google calendar account" in response.casefold()
     assert "nothing was created" in response.casefold()
     assert "created successfully" not in response.casefold()
+    assert (
+        "no eligible connected google calendar account" in response.casefold()
+        or "calendar access is unavailable" in response.casefold()
+        or "authorized google calendar account" in response.casefold()
+    )
     assert "gmail_search" not in str(routed["gmail_plan"])
 
 
@@ -452,11 +456,13 @@ def test_calendar_create_intents_short_circuit_without_requesting_more_details()
         assert routed["gmail_plan"]["calendar_tool"] == (
             "create_calendar_event_proposal"
         )
-        assert (
-            "authorized google calendar account"
-            in result["assistant_response"].casefold()
-        )
         assert "nothing was created" in result["assistant_response"].casefold()
+        assert (
+            "no eligible connected google calendar account"
+            in result["assistant_response"].casefold()
+            or "calendar access is unavailable" in result["assistant_response"].casefold()
+            or "authorized google calendar account" in result["assistant_response"].casefold()
+        )
         assert "calendar_create_event_proposal" not in result
 
 
@@ -774,26 +780,28 @@ def test_mixed_gmail_and_calendar_request_asks_which_task_to_do_first():
     )
 
 
-def test_drive_and_contact_requests_route_to_explicit_unavailable_results():
-    cases = (
-        ("Find a PDF in my Drive.", "google_drive"),
-        ("Find Subrata's phone number.", "google_contacts"),
-    )
-    for message, expected_route in cases:
-        state = _state(message)
-        routed = gmail_agent_nodes.gmail_intent_router_node(state)
-        assert routed["assistant_route"] == expected_route
+def test_drive_requests_route_to_the_read_only_drive_agent():
+    state = _state("Find a PDF in my Drive.")
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
 
-        result = integration_unavailable_node({
-            **state,
-            **routed,
-        })
-        assert "not implemented in the Assistant yet" in (
-            result["assistant_response"]
-        )
-        assert "cannot retrieve or change that data" in (
-            result["assistant_response"]
-        )
+    assert routed["assistant_route"] == "google_drive"
+
+
+def test_contact_requests_route_to_explicit_unavailable_results():
+    state = _state("Find Subrata's phone number.")
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+    assert routed["assistant_route"] == "google_contacts"
+
+    result = integration_unavailable_node({
+        **state,
+        **routed,
+    })
+    assert "not implemented in the Assistant yet" in (
+        result["assistant_response"]
+    )
+    assert "cannot retrieve or change that data" in (
+        result["assistant_response"]
+    )
 
 
 def test_mixed_drive_and_contacts_request_clarifies_without_provider_calls():
@@ -3569,3 +3577,178 @@ def test_add_gym_natural_language_routes_to_create_and_requests_missing_end():
     assert routed["calendar_create_draft"]["summary"] == "Gym"
     assert routed["calendar_create_draft"]["start_time"] == "10:00"
     assert routed["calendar_create_draft"].get("end_time") is None
+
+
+def test_calendar_next_saturday_requests_route_and_use_user_timezone():
+    # 2026-11-16T12:00:00Z is a Monday; next Saturday is 2026-11-21
+    for message in (
+        "check next saturdays google calder",
+        "What is on my calendar next Saturday?",
+        "Show my events for next Saturday",
+        "Do I have any meetings next Saturday?",
+    ):
+        routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+            message,
+            user_timezone="America/Los_Angeles",
+            request_time="2026-11-16T12:00:00Z",
+            assistant_capabilities={
+                "google_calendar": {
+                    "api_available": True,
+                    "events_read": True,
+                    "connected": True,
+                },
+            },
+        ))
+        assert routed["assistant_route"] == "google_calendar", message
+        plan = routed["gmail_plan"]
+        assert plan["intent"] == "google_calendar"
+        assert plan["calendar_tool"] == "get_calendar_schedule"
+        assert plan["calendar_arguments"]["date"] == "2026-11-21"
+        assert plan["calendar_arguments"]["period"] == "day"
+        assert plan["calendar_arguments"]["time_zone"] == "America/Los_Angeles"
+        assert plan["calendar_arguments"].get("calendar_id") == "primary"
+
+
+def test_cross_service_routing_does_not_use_wrong_service():
+    cases = (
+        ("Check next Saturday's calendar", "google_calendar"),
+        ("Show my latest emails", "gmail"),
+        ("Find Mam's phone number", "google_contacts"),
+        ("Search my selected contract", "google_drive"),
+    )
+    for message, expected_route in cases:
+        routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+            message,
+            user_timezone="America/Los_Angeles",
+            request_time="2026-11-16T12:00:00Z",
+            assistant_capabilities={
+                "google_calendar": {
+                    "api_available": True,
+                    "events_read": True,
+                    "connected": True,
+                },
+            },
+        ))
+        assert routed["assistant_route"] == expected_route, message
+
+
+def test_new_request_route_not_overridden_by_previous_contacts_clarification_for_calendar():
+    pending = {
+        "version": 1,
+        "type": "contacts_read_clarification",
+        "clarification_id": "clarify-1",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+        "user_id": "user-1",
+        "conversation_id": "conv-1",
+        "target_query": "Mam",
+        "requested_attribute": "phone",
+        "candidates": [{"resource_name": "people/1", "display_name": "Mam"}],
+    }
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "Check next Saturday's calendar",
+        messages=[
+            {"role": "user", "content": "Can you check mams number?"},
+            {"role": "assistant", "content": "Which contact do you mean?"},
+        ],
+        pending_contacts_clarification=pending,
+        user_timezone="America/Los_Angeles",
+        request_time="2026-11-16T12:00:00Z",
+        assistant_capabilities={
+            "google_calendar": {
+                "api_available": True,
+                "events_read": True,
+                "connected": True,
+            },
+        },
+    ))
+    assert routed["assistant_route"] == "google_calendar"
+    assert routed["gmail_plan"]["calendar_tool"] == "get_calendar_schedule"
+
+
+
+def test_contacts_request_not_hijacked_by_stale_pending_calendar_action():
+    state = _state(
+        "find the number of Rintu da somnath da ref",
+        pending_calendar_action={
+            "version": 1,
+            "operation": "delete",
+            "original_request": "delete the event from todays calender",
+            "known_event_details": {"calendar_id": "primary"},
+            "unresolved_fields": ["event_identity"],
+            "connection_id": "conn-cal",
+            "calendar_id": "primary",
+            "user_id": "user-1",
+            "conversation_id": "conversation-1",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+        },
+        assistant_capabilities={
+            "google_contacts": {"connected": True, "read_available": True, "chat_available": True},
+            "google_calendar": {"connected": True, "read_available": True, "chat_available": True},
+        },
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+
+    assert routed.get("assistant_route") == "google_contacts"
+    assert (routed.get("gmail_plan") or {}).get("intent") == "google_contacts"
+    assert routed.get("calendar_action_request") is None
+
+
+def test_routing_contacts_show_number_not_calendar_or_gmail():
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state("show me Rintu's number")
+    )
+    assert routed.get("assistant_route") == "google_contacts"
+    assert (routed.get("gmail_plan") or {}).get("intent") == "google_contacts"
+
+
+def test_routing_calendar_check_today_not_contacts_or_gmail(monkeypatch):
+    state = _state(
+        "check my calendar for today",
+        assistant_capabilities={
+            "google_calendar": {"connected": True, "read_available": True, "chat_available": True}
+        },
+        user_timezone="Asia/Kolkata",
+        request_time="2026-11-16T04:30:00+00:00",
+    )
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+    assert routed.get("assistant_route") == "google_calendar"
+    assert (routed.get("gmail_plan") or {}).get("intent") == "google_calendar"
+
+
+def test_routing_gmail_show_important_emails_not_calendar_or_contacts():
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state("show my important emails")
+    )
+    assert routed.get("assistant_route") == "gmail"
+    assert (routed.get("gmail_plan") or {}).get("intent") in {
+        "summarize_important", "search_emails", "clarify"
+    }
+
+def test_unambiguous_gmail_today_request_routes_to_summarize_today_without_clarification():
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "check what emails ihave for today",
+        user_timezone="Asia/Kolkata",
+        request_time="2026-11-17T10:00:00+05:30",
+    ))
+    assert routed["assistant_route"] == "gmail"
+    assert routed.get("gmail_plan", {}).get("intent") == "summarize_today"
+    # Must not ask for start/end times or emit pending gmail clarification for unambiguous today
+    assert routed.get("pending_gmail_clarification") in (None, {})
+    response_text = str(routed.get("assistant_response") or "").lower()
+    assert "start and end time" not in response_text
+    assert "what date" not in response_text
+
+
+def test_whole_day_without_pending_gmail_clarification_does_not_invent_gmail_continuation():
+    routed = gmail_agent_nodes.gmail_intent_router_node(_state(
+        "whole day",
+        user_timezone="Asia/Kolkata",
+        request_time="2026-11-17T10:05:00+05:30",
+        pending_gmail_clarification=None,
+    ))
+    # No valid pending Gmail clarification exists, so router must not invent one.
+    assert routed.get("pending_gmail_clarification") in (None, {})
+    # Must not be forced into calendar by stale calendar state (none provided).
+    assert routed.get("assistant_route") != "google_calendar"

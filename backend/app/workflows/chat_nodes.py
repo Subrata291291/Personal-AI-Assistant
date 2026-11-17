@@ -332,7 +332,58 @@ def capabilities_node(state: ChatState) -> dict:
             "grants Calendar write access."
         )
 
-    unavailable = capabilities.get("unavailable_integrations") or []
+    drive = capabilities.get("google_drive") or {}
+    sections.append(
+        "Google Drive integration is temporarily unavailable and will be "
+        "available in a future update."
+    )
+
+    contacts = capabilities.get("google_contacts") or {}
+    if contacts.get("integration_enabled") is False:
+        sections.append("Google Contacts is turned off in Connected Apps.")
+    elif contacts.get("default_connection_invalid"):
+        sections.append(
+            "Your saved default Google Contacts account is no longer available. "
+            "Choose a connected account in Connected Apps before using Contacts."
+        )
+    elif contacts.get("selection_required"):
+        sections.append(
+            "More than one Google account has Contacts access. Choose which "
+            "account Contacts should use in Connected Apps."
+        )
+    elif contacts.get("chat_available") and contacts.get("read_available"):
+        sections.append(
+            "Google Contacts is available in read-only mode in chat. I can "
+            "search, list, and look up contact details such as phone numbers "
+            "and email addresses for the selected Google account."
+        )
+    elif contacts.get("read_scope_missing"):
+        sections.append(
+            "Google Contacts read permission has not been granted for the "
+            "selected account. Grant Contacts read access in Connected Apps."
+        )
+    elif contacts.get("google_connection_available"):
+        sections.append(
+            "A Google account is connected, but Contacts read access is not "
+            "available for chat yet. Check the selected account and Contacts "
+            "permissions in Connected Apps."
+        )
+    else:
+        sections.append(
+            "Google Contacts is not connected. Connect a Google account with "
+            "Contacts read access in Connected Apps to look up contacts in chat."
+        )
+
+    unavailable = [
+        name for name in (capabilities.get("unavailable_integrations") or [])
+        if name != "Google Contacts"
+        or not (capabilities.get("google_contacts") or {}).get("chat_available")
+    ]
+    # Avoid contradictory "not implemented" claim when Contacts chat is available.
+    if (capabilities.get("google_contacts") or {}).get("chat_available"):
+        unavailable = [
+            name for name in unavailable if name != "Google Contacts"
+        ]
     if unavailable:
         sections.append(
             f"{', '.join(unavailable)} operations are not implemented yet."
@@ -354,17 +405,24 @@ def integration_unavailable_node(state: ChatState) -> dict:
     """Keep future integration routes explicit without issuing provider calls."""
     route = state.get("assistant_route", "integration")
     labels = {
-        "google_drive": "Google Drive access",
+        "google_drive": "Google Drive integration",
         "google_calendar": "Google Calendar access",
         "google_contacts": "Google Contacts access",
         "tasks": "task and reminder management",
     }
     integration = labels.get(route, "that integration")
-    answer = (
-        f"{integration} is not implemented in the Assistant yet, so I "
-        "cannot retrieve or change that data. I can still help with general "
-        "planning or questions."
-    )
+    if route == "google_drive":
+        answer = (
+            "Google Drive integration is temporarily unavailable and will be "
+            "available in a future update. I can still help with Gmail, "
+            "Google Calendar, Google Contacts, or general questions."
+        )
+    else:
+        answer = (
+            f"{integration} is not implemented in the Assistant yet, so I "
+            "cannot retrieve or change that data. I can still help with general "
+            "planning or questions."
+        )
     return {
         "assistant_response": answer,
         "provider": state.get("provider", ""),

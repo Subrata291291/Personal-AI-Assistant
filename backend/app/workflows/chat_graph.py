@@ -17,12 +17,17 @@ from app.workflows.gmail_agent_nodes import (
     route_after_assistant_intent,
 )
 from app.workflows.calendar_agent_node import calendar_agent_node
+from app.workflows.contacts_agent_node import contacts_agent_node
+from app.workflows.drive_contracts_agent_node import (
+    drive_contracts_agent_node,
+)
 from app.workflows.memory_retrieval_node import (
     memory_retrieval_node,
 )
 from app.workflows.memory_update_node import memory_update_node
 from app.workflows.autonomous_memory_node import autonomous_memory_node
 from app.core.request_metrics import record_timing, request_id
+from app.core.diagnostics import lifecycle_event
 
 
 logger = logging.getLogger(__name__)
@@ -33,9 +38,10 @@ ASSISTANT_ROUTE_NODES = {
     "memory_update": "memory_update",
     "capabilities": "capabilities",
     "gmail": "gmail_agent",
+    # Google Drive is temporarily disabled for production readiness.
     "google_drive": "integration_unavailable",
     "google_calendar": "calendar_agent",
-    "google_contacts": "integration_unavailable",
+    "google_contacts": "contacts_agent",
     "tasks": "integration_unavailable",
 }
 
@@ -55,6 +61,12 @@ def _timed_node(name, node):
                 request_id(),
                 name,
                 duration_ms,
+            )
+            lifecycle_event(
+                "graph.node.completed",
+                request_id=request_id(),
+                graph_node=name,
+                duration_ms=round(duration_ms, 2),
             )
 
     return wrapped
@@ -112,6 +124,16 @@ def build_chat_graph():
     )
 
     builder.add_node(
+        "contacts_agent",
+        _timed_node("contacts_agent", contacts_agent_node),
+    )
+
+    builder.add_node(
+        "drive_agent",
+        _timed_node("drive_agent", drive_contracts_agent_node),
+    )
+
+    builder.add_node(
         "integration_unavailable",
         _timed_node(
             "integration_unavailable",
@@ -163,6 +185,16 @@ def build_chat_graph():
 
     builder.add_edge(
         "calendar_agent",
+        END,
+    )
+
+    builder.add_edge(
+        "contacts_agent",
+        END,
+    )
+
+    builder.add_edge(
+        "drive_agent",
         END,
     )
 
