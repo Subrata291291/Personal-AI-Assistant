@@ -6,6 +6,7 @@ from langgraph.runtime import Runtime
 
 from app.workflows.chat_state import ChatContext, ChatState
 from app.workflows.contacts_read import generate_contacts_read_response
+from app.llm.streaming import emit_status
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ def contacts_agent_node(
 ) -> dict[str, Any]:
     """Handle Google Contacts read requests. Contacts mutations are unavailable."""
 
+    emit_status("Retrieving contact details...")
     context = runtime.context
     user_id = context.get("user_id")
     message = state["user_message"]

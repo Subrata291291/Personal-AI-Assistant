@@ -40,9 +40,30 @@ class LLMFallbackError(RuntimeError):
         attempted_providers: list[str] | None = None,
         failures: list[dict[str, Any]] | None = None,
     ):
-        super().__init__(message)
         self.attempted_providers = attempted_providers or []
         self.failures = failures or []
+        summary = self.failure_summary()
+        full_message = f"{message} Failure summary: {summary}" if summary else message
+        super().__init__(full_message)
+        self.base_message = message
+
+    def failure_summary(self) -> str:
+        """Sanitized per-provider failure summary (no secrets, no stack traces)."""
+        parts: list[str] = []
+        for failure in self.failures:
+            provider = failure.get("provider") or "unknown"
+            model = failure.get("model") or "unknown"
+            category = failure.get("category") or "unknown"
+            status = failure.get("status_code")
+            code = failure.get("error_code")
+            retry_attempted = failure.get("retry_attempted", False)
+            fallback_continued = failure.get("fallback_continued", False)
+            parts.append(
+                f"{provider}[model={model}, category={category}, status={status}, "
+                f"error_code={code}, retry_attempted={retry_attempted}, "
+                f"fallback_continued={fallback_continued}]"
+            )
+        return "; ".join(parts)
 
 
 class FallbackManager:
@@ -121,6 +142,73 @@ class FallbackManager:
             return True
         return False
 
+    @staticmethod
+    def _safe_text_fragments(error: Exception) -> str:
+        """Collect sanitized, non-secret text hints for local classification only."""
+        parts: list[str] = []
+        for attr in ("code", "type", "param"):
+            value = getattr(error, attr, None)
+            if isinstance(value, str) and value:
+                parts.append(value)
+        body = getattr(error, "body", None)
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                for key in ("code", "type", "message"):
+                    value = err.get(key)
+                    if isinstance(value, str) and value:
+                        parts.append(value)
+            for key in ("code", "type", "message"):
+                value = body.get(key)
+                if isinstance(value, str) and value:
+                    parts.append(value)
+        try:
+            parts.append(str(error))
+        except Exception:
+            pass
+        # Keep local matching bounded; never log this aggregate.
+        return " ".join(parts)[:2000].casefold()
+
+    @classmethod
+    def _is_billing_or_quota_exhaustion(
+        cls, error: Exception, status_code: int | None, safe_error_code: str | None
+    ) -> bool:
+        """Detect exhausted credits/quota/billing failures (non-retryable for provider)."""
+        code = (safe_error_code or "").casefold()
+        text = cls._safe_text_fragments(error)
+        explicit_codes = {
+            "insufficient_quota",
+            "insufficient_credit",
+            "insufficient_credits",
+            "billing_hard_limit_reached",
+            "billing_not_active",
+            "quota_exceeded",
+            "account_deactivated",
+        }
+        if code in explicit_codes:
+            return True
+        markers = (
+            "insufficient_quota",
+            "insufficient quota",
+            "insufficient credit",
+            "insufficient credits",
+            "no credits remaining",
+            "no credit remaining",
+            "credit balance is too low",
+            "out of credits",
+            "exceeded your current quota",
+            "quota exceeded",
+            "billing hard limit",
+            "billing limit",
+            "account deactivated",
+            "plan and billing",
+        )
+        if any(marker in text for marker in markers):
+            # Avoid misclassifying generic transient throttling without billing/quota signals.
+            if status_code in {402, 429, 403, 400} or "quota" in text or "credit" in text or "billing" in text:
+                return True
+        return False
+
     @classmethod
     def classify_provider_failure(cls, error: Exception) -> ProviderFailureClassification:
         """
@@ -137,6 +225,21 @@ class FallbackManager:
         status_code = cls._extract_status_code(error)
         safe_error_code = cls._safe_error_code(error)
 
+        # Billing/quota/credit exhaustion: permanent for this provider/account, not retried
+        # on the same provider, but safe to try a different configured provider.
+        # Keep 402 in its dedicated category for compatibility; classify explicit
+        # insufficient-credits/quota exhaustion separately from transient 429 rate limits.
+        if status_code != 402 and cls._is_billing_or_quota_exhaustion(
+            error, status_code, safe_error_code
+        ):
+            return ProviderFailureClassification(
+                fallback_to_next_provider=True,
+                category="provider_billing_or_quota_exhausted",
+                status_code=status_code,
+                safe_error_code=safe_error_code or "billing_or_quota_exhausted",
+                retry_same_provider=False,
+            )
+
         # Provider/server/network failures: safe to try another configured provider.
         if status_code == 429:
             return ProviderFailureClassification(
@@ -144,6 +247,7 @@ class FallbackManager:
                 category="rate_limit",
                 status_code=status_code,
                 safe_error_code=safe_error_code,
+                retry_same_provider=False,
             )
 
         if status_code == 408 or (status_code is not None and 500 <= status_code <= 599):
@@ -152,6 +256,7 @@ class FallbackManager:
                 category="provider_server_error" if status_code and status_code >= 500 else "timeout",
                 status_code=status_code,
                 safe_error_code=safe_error_code,
+                retry_same_provider=False,
             )
 
         # Explicit provider/account/model/access failures: non-retryable for this provider,
@@ -162,6 +267,7 @@ class FallbackManager:
                 category="provider_auth_error",
                 status_code=status_code,
                 safe_error_code=safe_error_code,
+                retry_same_provider=False,
             )
         if status_code == 402:
             return ProviderFailureClassification(
@@ -169,6 +275,7 @@ class FallbackManager:
                 category="provider_payment_or_quota_error",
                 status_code=status_code,
                 safe_error_code=safe_error_code,
+                retry_same_provider=False,
             )
         if status_code == 403:
             return ProviderFailureClassification(
@@ -176,6 +283,7 @@ class FallbackManager:
                 category="provider_access_or_policy_error",
                 status_code=status_code,
                 safe_error_code=safe_error_code,
+                retry_same_provider=False,
             )
         if status_code == 404:
             return ProviderFailureClassification(
@@ -183,6 +291,7 @@ class FallbackManager:
                 category="provider_model_or_resource_unavailable",
                 status_code=status_code,
                 safe_error_code=safe_error_code,
+                retry_same_provider=False,
             )
 
         # Likely request/input issues (possibly shared across providers) or unknown 4xx:
@@ -193,6 +302,7 @@ class FallbackManager:
                 category="request_error_non_fallback",
                 status_code=status_code,
                 safe_error_code=safe_error_code,
+                retry_same_provider=False,
             )
 
         if cls._is_network_or_timeout(error):
@@ -201,6 +311,7 @@ class FallbackManager:
                 category="network_or_timeout",
                 status_code=status_code,
                 safe_error_code=safe_error_code,
+                retry_same_provider=False,
             )
 
         # Inspect nested cause/context for network/timeout signals from SDK wrappers.
@@ -213,12 +324,14 @@ class FallbackManager:
                     "timeout",
                     "provider_server_error",
                     "rate_limit",
+                    "provider_billing_or_quota_exhausted",
                 }:
                     return ProviderFailureClassification(
                         fallback_to_next_provider=True,
                         category=nested.category,
                         status_code=nested.status_code or status_code,
                         safe_error_code=nested.safe_error_code or safe_error_code,
+                        retry_same_provider=nested.retry_same_provider,
                     )
             except Exception:
                 pass
@@ -232,6 +345,7 @@ class FallbackManager:
                     category="provider_empty_response",
                     status_code=status_code,
                     safe_error_code=safe_error_code,
+                    retry_same_provider=False,
                 )
 
         # Default: application/programming/unexpected errors must not be silently retried
@@ -241,6 +355,7 @@ class FallbackManager:
             category="application_or_unexpected_error",
             status_code=status_code,
             safe_error_code=safe_error_code,
+            retry_same_provider=False,
         )
 
     @staticmethod
@@ -296,12 +411,14 @@ class FallbackManager:
         stream: bool,
         content_emitted: bool = False,
         duration_ms: float | None = None,
+        retry_attempted: bool = False,
     ) -> None:
         logger.warning(
             "llm_provider_attempt_failed | request_id=%s | provider=%s | model=%s "
             "| attempt=%s | stream=%s | duration_ms=%s | exception_class=%s.%s | status=%s "
             "| error_code=%s | category=%s | fallback_to_next_provider=%s "
-            "| fallback_will_continue=%s | fallback_initiated=%s | content_emitted=%s",
+            "| retry_attempted=%s | fallback_continued=%s | fallback_will_continue=%s "
+            "| fallback_initiated=%s | content_emitted=%s",
             request_id(),
             provider_name,
             model or "unknown",
@@ -314,6 +431,8 @@ class FallbackManager:
             classification.safe_error_code,
             classification.category,
             classification.fallback_to_next_provider,
+            retry_attempted,
+            fallback_will_continue,
             fallback_will_continue,
             fallback_will_continue,
             content_emitted,
@@ -327,6 +446,8 @@ class FallbackManager:
         attempt_number: int,
         error: Exception,
         classification: ProviderFailureClassification,
+        retry_attempted: bool = False,
+        fallback_continued: bool = False,
     ) -> dict[str, Any]:
         return {
             "provider": provider_name,
@@ -337,6 +458,8 @@ class FallbackManager:
             "error_code": classification.safe_error_code,
             "category": classification.category,
             "fallback_to_next_provider": classification.fallback_to_next_provider,
+            "retry_attempted": retry_attempted,
+            "fallback_continued": fallback_continued,
         }
 
     @staticmethod
@@ -365,7 +488,7 @@ class FallbackManager:
         overall_deadline_s = self._overall_deadline_seconds(request)
         overall_started_at = perf_counter()
 
-        for provider_name in self.provider_priority:
+        for idx, provider_name in enumerate(self.provider_priority):
 
             if provider_name not in _SUPPORTED_PROVIDERS:
                 raise RuntimeError(
@@ -379,6 +502,11 @@ class FallbackManager:
                     provider_name,
                 )
                 continue
+
+            has_next_configured_provider = any(
+                candidate in _SUPPORTED_PROVIDERS and self.registry.is_configured(candidate)
+                for candidate in self.provider_priority[idx + 1 :]
+            )
 
             remaining_s = None
             if overall_deadline_s is not None:
@@ -465,16 +593,26 @@ class FallbackManager:
                     setattr(error, "_llm_fallback_provider", provider_name)
                 except Exception:
                     pass
+
+                fallback_will_continue = (
+                    classification.fallback_to_next_provider and has_next_configured_provider
+                )
+                if fallback_will_continue and overall_deadline_s is not None:
+                    remaining_after_s = overall_deadline_s - (perf_counter() - overall_started_at)
+                    if remaining_after_s <= 0.5:
+                        fallback_will_continue = False
+
                 failure = self._failure_record(
                     provider_name=provider_name,
                     model=provider_model or (self._provider_model(provider_name, provider) if provider else ""),
                     attempt_number=attempt_number,
                     error=error,
                     classification=classification,
+                    retry_attempted=bool(classification.retry_same_provider),
+                    fallback_continued=fallback_will_continue,
                 )
                 failures.append(failure)
 
-                fallback_will_continue = classification.fallback_to_next_provider
                 self._log_provider_failure(
                     provider_name=provider_name,
                     model=failure.get("model") or "",
@@ -484,6 +622,7 @@ class FallbackManager:
                     fallback_will_continue=fallback_will_continue,
                     stream=False,
                     duration_ms=provider_duration_ms,
+                    retry_attempted=bool(classification.retry_same_provider),
                 )
 
                 if not classification.fallback_to_next_provider:
@@ -508,11 +647,12 @@ class FallbackManager:
 
                 logger.info(
                     "llm_provider_fallback_continue | request_id=%s | from_provider=%s "
-                    "| attempt=%s | category=%s",
+                    "| attempt=%s | category=%s | retry_attempted=%s | fallback_continued=true",
                     request_id(),
                     provider_name,
                     attempt_number,
                     classification.category,
+                    bool(classification.retry_same_provider),
                 )
 
         if not attempted_providers:
@@ -548,7 +688,7 @@ class FallbackManager:
         overall_deadline_s = self._overall_deadline_seconds(request)
         overall_started_at = perf_counter()
 
-        for provider_name in self.provider_priority:
+        for idx, provider_name in enumerate(self.provider_priority):
 
             if provider_name not in _SUPPORTED_PROVIDERS:
                 raise RuntimeError(
@@ -562,6 +702,11 @@ class FallbackManager:
                     provider_name,
                 )
                 continue
+
+            has_next_configured_provider = any(
+                candidate in _SUPPORTED_PROVIDERS and self.registry.is_configured(candidate)
+                for candidate in self.provider_priority[idx + 1 :]
+            )
 
             remaining_s = None
             if overall_deadline_s is not None:
@@ -643,18 +788,28 @@ class FallbackManager:
                     setattr(error, "_llm_fallback_provider", provider_name)
                 except Exception:
                     pass
+
+                fallback_will_continue = (
+                    classification.fallback_to_next_provider
+                    and not content_emitted
+                    and has_next_configured_provider
+                )
+                if fallback_will_continue and overall_deadline_s is not None:
+                    remaining_after_s = overall_deadline_s - (perf_counter() - overall_started_at)
+                    if remaining_after_s <= 0.5:
+                        fallback_will_continue = False
+
                 failure = self._failure_record(
                     provider_name=provider_name,
                     model=provider_model or (self._provider_model(provider_name, provider) if provider else ""),
                     attempt_number=attempt_number,
                     error=error,
                     classification=classification,
+                    retry_attempted=bool(classification.retry_same_provider),
+                    fallback_continued=fallback_will_continue,
                 )
                 failures.append(failure)
 
-                fallback_will_continue = (
-                    classification.fallback_to_next_provider and not content_emitted
-                )
                 self._log_provider_failure(
                     provider_name=provider_name,
                     model=failure.get("model") or "",
@@ -665,6 +820,7 @@ class FallbackManager:
                     stream=True,
                     content_emitted=content_emitted,
                     duration_ms=provider_duration_ms,
+                    retry_attempted=bool(classification.retry_same_provider),
                 )
 
                 # Critical safety rule: never restart/append a different provider after partial output.
@@ -692,11 +848,13 @@ class FallbackManager:
 
                 logger.info(
                     "llm_provider_fallback_continue | request_id=%s | from_provider=%s "
-                    "| attempt=%s | category=%s | stream=true | pre_first_token=true",
+                    "| attempt=%s | category=%s | stream=true | pre_first_token=true "
+                    "| retry_attempted=%s | fallback_continued=true",
                     request_id(),
                     provider_name,
                     attempt_number,
                     classification.category,
+                    bool(classification.retry_same_provider),
                 )
 
         if not attempted_providers:

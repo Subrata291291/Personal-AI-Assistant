@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.llm.router import llm_router
 from app.llm.schemas import LLMMessage, LLMRequest
+from app.llm.streaming import emit_replace, generate_or_stream
 
 from app.workflows.chat_state import ChatState
 
@@ -163,13 +164,16 @@ def llm_node(state: ChatState) -> dict:
         max_tokens=1800,
     )
 
-    response = llm_router.generate(request)
+    response = generate_or_stream(request)
     assistant_response = response.content
     if (
         state.get("assistant_route") == "general"
         and _contains_personal_calendar_claim(assistant_response)
     ):
         assistant_response = UNVERIFIED_CALENDAR_RESPONSE
+        # The streamed tokens already reached the client; replace them so the
+        # rendered text matches what is persisted.
+        emit_replace(assistant_response)
 
     assistant_message = {
         "role": "assistant",

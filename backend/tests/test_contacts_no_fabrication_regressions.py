@@ -94,10 +94,14 @@ def test_exact_contact_name_returns_actual_google_phone_number(monkeypatch):
         assert args["query"].strip().casefold() == "mam"
         return _env_ok({"contacts": [MOCK_MAM_CONTACT]})
 
+    def get_contact(args):
+        assert args["resource_name"] == MOCK_MAM_CONTACT["resource_name"]
+        return _env_ok(MOCK_MAM_CONTACT)
+
     _mock_tools(monkeypatch, {
         "search_contacts": search_contacts,
         "list_contacts": lambda a: _env_ok({}),
-        "get_contact": lambda a: _env_ok({}),
+        "get_contact": get_contact,
     })
     _force_llm_fabrication(monkeypatch, "Mam's number is +1 (555) 123-4567")
 
@@ -192,10 +196,13 @@ def test_contact_without_phone_number_never_invented(monkeypatch):
     def search_contacts(args):
         return _env_ok({"contacts": [MOCK_NO_PHONE_CONTACT]})
 
+    def get_contact(args):
+        return _env_ok(MOCK_NO_PHONE_CONTACT)
+
     _mock_tools(monkeypatch, {
         "search_contacts": search_contacts,
         "list_contacts": lambda a: _env_ok({}),
-        "get_contact": lambda a: _env_ok({}),
+        "get_contact": get_contact,
     })
     _force_llm_fabrication(monkeypatch, "No Phone Contact's number is +1 (555) 123-4567")
 
@@ -255,10 +262,13 @@ def test_fabricated_llm_phone_number_rejected(monkeypatch):
     def search_contacts(args):
         return _env_ok({"contacts": [MOCK_MAM_CONTACT]})
 
+    def get_contact(args):
+        return _env_ok(MOCK_MAM_CONTACT)
+
     _mock_tools(monkeypatch, {
         "search_contacts": search_contacts,
         "list_contacts": lambda a: _env_ok({}),
-        "get_contact": lambda a: _env_ok({}),
+        "get_contact": get_contact,
     })
     calls = {"llm": 0}
 
@@ -291,10 +301,13 @@ def test_llm_output_cannot_override_trusted_contact_data(monkeypatch):
     def search_contacts(args):
         return _env_ok({"contacts": [trusted]})
 
+    def get_contact(args):
+        return _env_ok(trusted)
+
     _mock_tools(monkeypatch, {
         "search_contacts": search_contacts,
         "list_contacts": lambda a: _env_ok({}),
-        "get_contact": lambda a: _env_ok({}),
+        "get_contact": get_contact,
     })
     _force_llm_fabrication(monkeypatch, "Trusted Person's phone number is +1 (555) 111-2222")
 
@@ -470,10 +483,13 @@ def test_contacts_search_invoked_on_first_message_and_target_extracted(monkeypat
         # Mock Google People API fixture (verified backend result)
         return _env_ok({"contacts": [MOCK_HOME_BABA_CONTACT]})
 
+    def get_contact(args):
+        return _env_ok(MOCK_HOME_BABA_CONTACT)
+
     _mock_tools(monkeypatch, {
         "search_contacts": search_contacts,
         "list_contacts": lambda a: _env_ok({}),
-        "get_contact": lambda a: _env_ok({}),
+        "get_contact": get_contact,
     })
     _force_llm_fabrication(monkeypatch, "Home Baba's number is +1 (555) 987-6543")
 
@@ -1318,3 +1334,27 @@ def test_no_matching_contact_after_normalized_fallback_returns_safe_no_match(mon
     assert prov.get("selected_contact_resource_ref") is None
     _assert_no_fabricated_numbers(result["assistant_response"])
 
+
+
+def test_single_match_get_contact_fails_returns_safe_error(monkeypatch):
+    def search_contacts(args):
+        return _env_ok({"contacts": [MOCK_MAM_CONTACT]})
+
+    def get_contact(args):
+        return _env_err("boom")
+
+    _mock_tools(monkeypatch, {
+        "search_contacts": search_contacts,
+        "list_contacts": lambda a: _env_ok({}),
+        "get_contact": get_contact,
+    })
+    _force_llm_fabrication(monkeypatch, "Mams number is fake")
+
+    result = contacts_read.generate_contacts_read_response(
+        user_id="user-1",
+        connection_id="conn-1",
+        message="Show me Mam's number",
+    )
+    text = result.get("assistant_response") or ""
+    assert "couldn" in text.lower()
+    assert MOCK_MAM_CONTACT["primary_phone"] not in text

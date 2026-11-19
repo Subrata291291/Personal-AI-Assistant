@@ -1,8 +1,10 @@
 
 import { api } from '../lib/api.js'
+import { supabase } from '../lib/supabase.js'
 
 const BASE_PATH = '/api/v1/conversations'
 const CHAT_PATH = '/api/v1/chat'
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL
 
 export const conversationService = {
   // Get all conversations belonging to the authenticated user.
@@ -102,7 +104,7 @@ export const conversationService = {
     )
   },
 
-  // Send a message through the LangGraph chat workflow.
+  // Send a message through the LangGraph chat workflow (non-streaming).
   async sendChatMessage(
     conversationId,
     content,
@@ -122,6 +124,111 @@ export const conversationService = {
         'Idempotency-Key': idempotencyKey,
       }
     )
+  },
+
+  // Stream a chat message via SSE (POST). Calls onEvent({type, ...}) for each SSE event.
+  async streamChatMessage(
+    conversationId,
+    content,
+    idempotencyKey,
+    gmailConnectionId = null,
+    userTimezone = 'UTC',
+    onEvent = () => {},
+    signal,
+  ) {
+    const {
+      data: { session },
+      error,
+    } = await supabase.auth.getSession()
+    if (error || !session?.access_token) {
+      throw new Error('Authentication required. Please sign in again.')
+    }
+    const url = `${API_BASE_URL}${CHAT_PATH}/stream`
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${session.access_token}`,
+        'Idempotency-Key': idempotencyKey,
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        conversation_id: conversationId,
+        content,
+        gmail_connection_id: gmailConnectionId,
+        user_timezone: userTimezone,
+      }),
+      signal,
+    })
+    if (!resp.ok) {
+      let detail = 'Request failed'
+      try {
+        const errBody = await resp.json()
+        detail = errBody?.detail || detail
+      } catch (_) {
+        // ignore
+      }
+      const err = new Error(typeof detail === 'string' ? detail : 'Request failed')
+      err.status = resp.status
+      throw err
+    }
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+    let sawDone = false
+
+    const dispatch = (evt) => {
+      if (!evt || typeof evt !== 'object' || !evt.type) return
+      if (evt.type === 'error') {
+        const err = new Error(evt.message || 'Streaming failed')
+        err.partial = Boolean(evt.partial)
+        err.streamError = true
+        throw err
+      }
+      if (evt.type === 'done') sawDone = true
+      onEvent(evt)
+    }
+
+    const handleLine = (line) => {
+      if (!line.startsWith('data:')) return
+      const jsonStr = line.slice(5).trimStart()
+      if (!jsonStr) return
+      let evt
+      try {
+        evt = JSON.parse(jsonStr)
+      } catch {
+        // Ignore malformed events; never let a parse failure look like success.
+        return
+      }
+      dispatch(evt)
+    }
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      // Parse SSE events separated by \n\n
+      let idx
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, idx)
+        buffer = buffer.slice(idx + 2)
+        for (const line of rawEvent.split('\n')) {
+          handleLine(line)
+        }
+      }
+    }
+    // Flush any remaining buffer
+    if (buffer.trim()) {
+      for (const line of buffer.split('\n')) {
+        handleLine(line)
+      }
+    }
+
+    if (!sawDone) {
+      const err = new Error('The response stream ended before completion.')
+      err.partial = true
+      throw err
+    }
   },
 
   async getChatRequestStatus(conversationId, idempotencyKey) {

@@ -20,6 +20,7 @@ from app.schemas.calendar_approval import (
 )
 from app.services.calendar_service import CalendarService
 from app.services.action_approval_service import ActionApprovalService
+from app.llm.streaming import emit_status
 from app.workflows.calendar_tools import create_calendar_tools
 from app.workflows.chat_state import ChatContext, ChatState
 from app.workflows.calendar_create_draft import (
@@ -1281,14 +1282,26 @@ def _is_calendar_delete_request(text: str) -> bool:
         "cancel",
     }:
         return False
-    return bool(re.search(
-        r"\b(?:delete|remove|cancel)\b.{0,120}"
-        r"\b(?:calendar\s+)?(?:event|series|meeting|appointment|calendar)\b|"
-        r"\b(?:calendar\s+)?(?:event|series|meeting|appointment)\b"
-        r".{0,120}\b(?:delete|remove|cancel)\b",
-        text,
-        re.IGNORECASE,
-    ))
+    return bool(
+        re.search(
+            r"\b(?:delete|remove|cancel)\b.{0,120}"
+            r"\b(?:calendar\s+)?(?:event|series|meeting|appointment|calendar)\b|"
+            r"\b(?:calendar\s+)?(?:event|series|meeting|appointment)\b"
+            r".{0,120}\b(?:delete|remove|cancel)\b",
+            text,
+            re.IGNORECASE,
+        )
+        or (
+            re.search(r"\b(?:delete|remove|cancel)\b", text, re.IGNORECASE)
+            and re.search(
+                r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+                r"\s*(?:to|[-–—])\s*"
+                r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+    )
 
 
 def _update_event_matches_request(
@@ -2421,6 +2434,7 @@ def calendar_agent_node(
     state: ChatState,
     runtime: Runtime[ChatContext],
 ) -> dict[str, Any]:
+    emit_status("Checking your calendar...")
     plan = state.get("gmail_plan") or {}
     if state.get("calendar_passthrough_response") and isinstance(
         state.get("assistant_response"), str
@@ -2594,6 +2608,59 @@ def calendar_agent_node(
         contextual_proposal, contextual_event_id = (
             _recent_created_calendar_event(state)
         )
+        current_query = arguments.get("event_query")
+        query_text = (
+            " ".join(str(current_query).casefold().split())
+            if isinstance(current_query, str)
+            else ""
+        )
+        recent_summary = None
+        if isinstance(contextual_proposal, dict):
+            recent_params = contextual_proposal.get("parameters")
+            if isinstance(recent_params, dict):
+                candidate_summary = recent_params.get("summary")
+                if isinstance(candidate_summary, str):
+                    recent_summary = candidate_summary.strip()
+        recent_title = (
+            " ".join(recent_summary.casefold().split())
+            if recent_summary
+            else ""
+        )
+        generic_context_query = query_text in {
+            "this",
+            "that",
+            "it",
+            "one",
+            "the one",
+            "event",
+            "my event",
+            "the event",
+            "this event",
+            "that event",
+            "calendar event",
+            "meeting",
+            "my meeting",
+            "the meeting",
+            "appointment",
+            "my appointment",
+            "the appointment",
+        }
+        explicit_context_reference = bool(re.search(
+            r"\b(?:just created|you (?:just )?created|"
+            r"i just created|we just (?:created|made)|"
+            r"that event|this event)\b",
+            state["user_message"],
+            re.IGNORECASE,
+        ))
+        matches_recent_title = bool(
+            query_text
+            and recent_title
+            and (
+                query_text == recent_title
+                or query_text in recent_title
+                or recent_title in query_text
+            )
+        )
         if (
             contextual_event_id is not None
             and not (
@@ -2601,14 +2668,10 @@ def calendar_agent_node(
                 and str(arguments.get("event_id")).strip()
             )
             and (
-                not isinstance(arguments.get("event_query"), str)
-                or not str(arguments.get("event_query")).strip()
-                or re.search(
-                    r"\b(?:just created|you (?:just )?created|"
-                    r"i just created|that event|this event)\b",
-                    state["user_message"],
-                    re.IGNORECASE,
-                )
+                not query_text
+                or generic_context_query
+                or explicit_context_reference
+                or matches_recent_title
             )
         ):
             arguments["event_id"] = contextual_event_id

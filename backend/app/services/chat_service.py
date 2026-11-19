@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
 from typing import Any
@@ -11,6 +12,7 @@ from app.core.error_logging import log_exception_traceback
 from app.core.config import settings
 from app.core.diagnostics import lifecycle_event
 from app.core.request_metrics import current_request_metrics
+from app.llm.streaming import streaming_mode
 from app.memory.memory_pipeline import MemoryPipeline
 from app.services.user_settings_service import UserSettingsService
 from app.workflows.calendar_update_parser import (
@@ -50,6 +52,16 @@ class ChatService:
     HEARTBEAT_JOIN_TIMEOUT = 10
     CALENDAR_ACTION_CLARIFICATION_TTL_SECONDS = 30 * 60
     GMAIL_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
+    # Friendly labels for node starts observed through LangGraph debug events.
+    # Only these nodes emit status events this way; nodes that produce their own
+    # status text (Gmail, Calendar, Contacts, the LLM node) are omitted to avoid
+    # duplicate messages. Debug payloads themselves are never forwarded.
+    STREAM_NODE_STATUS = {
+        "gmail_intent_router_node": "Understanding your request...",
+        "memory_retrieval_node": "Checking saved memories...",
+        "autonomous_memory_node": "Checking saved memories...",
+    }
+    STREAM_MAX_CONTENT_CHARS = 50000
 
     def __init__(
         self,
@@ -1046,7 +1058,50 @@ class ChatService:
                 "Worker lease ownership could not be confirmed."
             )
 
-    def send_message(
+    @classmethod
+    def _sanitize_stream_event(
+        cls,
+        payload: Any,
+    ) -> dict[str, Any] | None:
+        """Allowlist custom graph events; never forward raw payloads."""
+        if not isinstance(payload, dict):
+            return None
+
+        event_type = payload.get("type")
+        if event_type in {"token", "replace"}:
+            content = payload.get("content")
+            if not isinstance(content, str) or not content:
+                return None
+            return {
+                "type": event_type,
+                "content": content[: cls.STREAM_MAX_CONTENT_CHARS],
+            }
+
+        if event_type == "status":
+            message = payload.get("message")
+            if not isinstance(message, str):
+                return None
+            message = message.replace("\n", " ").strip()[:200]
+            if not message:
+                return None
+            return {"type": "status", "message": message}
+
+        return None
+
+    @classmethod
+    def _status_for_debug_event(cls, payload: Any) -> str | None:
+        """Map a LangGraph task-start debug event to a safe status label."""
+        if not isinstance(payload, dict) or payload.get("type") != "task":
+            return None
+        task_payload = payload.get("payload")
+        if not isinstance(task_payload, dict):
+            return None
+        name = task_payload.get("name")
+        if not isinstance(name, str):
+            return None
+        return cls.STREAM_NODE_STATUS.get(name)
+
+    def _send_message_generator(
         self,
         user_id: UUID,
         conversation_id: UUID,
@@ -1061,8 +1116,15 @@ class ChatService:
         calendar_enabled: bool = True,
         contacts_enabled: bool = True,
         drive_enabled: bool = True,
-    ) -> dict[str, Any]:
-        """Process an idempotent chat request using LangGraph."""
+        streaming: bool = False,
+    ) -> Iterator[dict[str, Any]]:
+        """Process an idempotent chat request using LangGraph.
+
+        Yields sanitized stream events (``status``, ``token``, ``replace``) and
+        terminates with a single ``done`` event carrying the persisted
+        response. When ``streaming`` is false the graph is invoked normally and
+        no token events are produced.
+        """
 
         if not content or not content.strip():
             raise ValueError("Message content cannot be empty.")
@@ -1106,11 +1168,15 @@ class ChatService:
 
         # 4. Return the previous response if already completed.
         if request["status"] == "completed":
-            return self._get_completed_response(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                request=request,
-            )
+            yield {
+                "type": "done",
+                "response": self._get_completed_response(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    request=request,
+                ),
+            }
+            return
 
         # 5. Recover an assistant message saved before a crash.
         if (
@@ -1140,11 +1206,15 @@ class ChatService:
                 )
 
                 if reconciled is not None:
-                    return self._get_completed_response(
-                        user_id=user_id,
-                        conversation_id=conversation_id,
-                        request=reconciled,
-                    )
+                    yield {
+                        "type": "done",
+                        "response": self._get_completed_response(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            request=reconciled,
+                        ),
+                    }
+                    return
 
                 latest_request = self.request_repository.get_request(
                     user_id=user_id,
@@ -1156,11 +1226,15 @@ class ChatService:
                     latest_request
                     and latest_request["status"] == "completed"
                 ):
-                    return self._get_completed_response(
-                        user_id=user_id,
-                        conversation_id=conversation_id,
-                        request=latest_request,
-                    )
+                    yield {
+                        "type": "done",
+                        "response": self._get_completed_response(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            request=latest_request,
+                        ),
+                    }
+                    return
 
         # 6. Never automatically restart failed requests.
         if request["status"] == "failed":
@@ -1195,11 +1269,15 @@ class ChatService:
                 and current_request.get("user_message_id")
                 and current_request.get("assistant_message_id")
             ):
-                return self._get_completed_response(
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    request=current_request,
-                )
+                yield {
+                    "type": "done",
+                    "response": self._get_completed_response(
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        request=current_request,
+                    ),
+                }
+                return
 
             if (
                 current_request
@@ -1515,15 +1593,28 @@ class ChatService:
                 },
             )
 
-            previous_messages = [
-                {
+            # Preserve trusted approval metadata in LangGraph state. The
+            # Calendar contextual-delete resolver needs the completed create
+            # result (and its authoritative Google event ID) from this history.
+            previous_messages = []
+            for message in history:
+                if (
+                    message["id"] == user_message["id"]
+                    or message["role"] not in {"user", "assistant"}
+                ):
+                    continue
+                projected_message = {
                     "role": message["role"],
                     "content": message["content"],
                 }
-                for message in history
-                if message["id"] != user_message["id"]
-                and message["role"] in {"user", "assistant"}
-            ]
+                metadata = message.get("metadata")
+                if isinstance(metadata, dict) and isinstance(
+                    metadata.get("action_approval"), dict
+                ):
+                    projected_message["metadata"] = {
+                        "action_approval": metadata["action_approval"],
+                    }
+                previous_messages.append(projected_message)
 
             # 10. Mark execution started.
             started = self.request_repository.mark_execution_started(
@@ -1657,11 +1748,7 @@ class ChatService:
             )
 
             # 13. Execute LangGraph.
-            try:
-                result = chat_graph.invoke(
-                    initial_state,
-                    config=thread_config,
-                    context={
+            graph_context = {
                         "user_id": str(user_id),
                         "gmail_connection_id": (
                             str(effective_gmail_connection_id)
@@ -1770,8 +1857,64 @@ class ChatService:
                         "drive_default_connection_selected": (
                             False
                         ),
-                    },
-                )
+            }
+            streamed_text = ""
+            streamed_any = False
+            last_status = None
+            try:
+                if streaming:
+                    result = None
+                    graph_stream = chat_graph.stream(
+                        initial_state,
+                        config=thread_config,
+                        context=graph_context,
+                        stream_mode=["custom", "debug", "values"],
+                    )
+                    while True:
+                        # A ContextVar token may only be reset in the context
+                        # that created it. Starlette resumes this generator
+                        # from threadpool contexts, so streaming mode must be
+                        # scoped to a single advance instead of spanning the
+                        # yields below.
+                        with streaming_mode():
+                            try:
+                                mode, payload = next(graph_stream)
+                            except StopIteration:
+                                break
+
+                        if mode == "values":
+                            if isinstance(payload, dict):
+                                result = payload
+                            continue
+                        if mode == "debug":
+                            status = self._status_for_debug_event(payload)
+                            if status and status != last_status:
+                                last_status = status
+                                yield {
+                                    "type": "status",
+                                    "message": status,
+                                }
+                            continue
+                        event = self._sanitize_stream_event(payload)
+                        if event is None:
+                            continue
+                        if event["type"] == "token":
+                            streamed_text += event["content"]
+                            streamed_any = True
+                        elif event["type"] == "replace":
+                            streamed_text = event["content"]
+                            streamed_any = True
+                        yield event
+                    if result is None:
+                        raise RuntimeError(
+                            "The AI workflow returned no final state."
+                        )
+                else:
+                    result = chat_graph.invoke(
+                        initial_state,
+                        config=thread_config,
+                        context=graph_context,
+                    )
             finally:
                 # Always stop heartbeat when graph execution ends,
                 # whether it succeeds or raises an exception.
@@ -2328,13 +2471,26 @@ class ChatService:
             except Exception:
                 logger.debug("chat.response.completed diagnostics emission failed", exc_info=True)
 
-            return {
+            response = {
                 "conversation_id": conversation_id,
                 "user_message": user_message,
                 "assistant_message": assistant_message,
                 "provider": metadata.get("provider", ""),
                 "model": metadata.get("model", ""),
             }
+
+            if streaming:
+                # Guarantee that what the client rendered equals what was
+                # persisted, including deterministic non-LLM routes and
+                # post-generation rewrites that did not emit their own replace.
+                final_text = assistant_message.get("content") or assistant_content
+                if not streamed_any:
+                    yield {"type": "token", "content": final_text}
+                elif final_text != streamed_text:
+                    yield {"type": "replace", "content": final_text}
+
+            yield {"type": "done", "response": response}
+            return
 
         except ChatRequestUncertainError:
             raise
@@ -2357,3 +2513,81 @@ class ChatService:
                     exc,
                 )
             raise
+
+    def send_message(
+        self,
+        user_id: UUID,
+        conversation_id: UUID,
+        content: str,
+        idempotency_key: UUID,
+        gmail_connection_id: UUID | None = None,
+        user_timezone: str = "UTC",
+        default_calendar_connection_id: str | None = None,
+        default_contacts_connection_id: str | None = None,
+        default_drive_connection_id: str | None = None,
+        gmail_enabled: bool = True,
+        calendar_enabled: bool = True,
+        contacts_enabled: bool = True,
+        drive_enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Process an idempotent chat request and return the final response."""
+        for event in self._send_message_generator(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            content=content,
+            idempotency_key=idempotency_key,
+            gmail_connection_id=gmail_connection_id,
+            user_timezone=user_timezone,
+            default_calendar_connection_id=default_calendar_connection_id,
+            default_contacts_connection_id=default_contacts_connection_id,
+            default_drive_connection_id=default_drive_connection_id,
+            gmail_enabled=gmail_enabled,
+            calendar_enabled=calendar_enabled,
+            contacts_enabled=contacts_enabled,
+            drive_enabled=drive_enabled,
+            streaming=False,
+        ):
+            if event.get("type") == "done":
+                return event["response"]
+
+        raise RuntimeError("Chat execution ended without a result.")
+
+    def stream_message(
+        self,
+        user_id: UUID,
+        conversation_id: UUID,
+        content: str,
+        idempotency_key: UUID,
+        gmail_connection_id: UUID | None = None,
+        user_timezone: str = "UTC",
+        default_calendar_connection_id: str | None = None,
+        default_contacts_connection_id: str | None = None,
+        default_drive_connection_id: str | None = None,
+        gmail_enabled: bool = True,
+        calendar_enabled: bool = True,
+        contacts_enabled: bool = True,
+        drive_enabled: bool = True,
+    ) -> Iterator[dict[str, Any]]:
+        """Stream a chat request, yielding tokens as the graph produces them.
+
+        Pre-flight failures are raised before the first event so the HTTP layer
+        can still return a proper error status. Failures after streaming has
+        started propagate from the iterator; the request is marked failed and
+        the partial assistant message is never persisted as completed.
+        """
+        yield from self._send_message_generator(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            content=content,
+            idempotency_key=idempotency_key,
+            gmail_connection_id=gmail_connection_id,
+            user_timezone=user_timezone,
+            default_calendar_connection_id=default_calendar_connection_id,
+            default_contacts_connection_id=default_contacts_connection_id,
+            default_drive_connection_id=default_drive_connection_id,
+            gmail_enabled=gmail_enabled,
+            calendar_enabled=calendar_enabled,
+            contacts_enabled=contacts_enabled,
+            drive_enabled=drive_enabled,
+            streaming=True,
+        )

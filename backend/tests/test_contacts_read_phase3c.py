@@ -365,8 +365,12 @@ def test_search_match_on_second_page_receives_correct_page_token(monkeypatch):
         calls.append(dict(args))
         if len(calls) == 1:
             return _env_ok({"contacts": [{"resource_name": "people/1", "display_name": "Someone Else"}], "next_page_token": "tok-2"})
-        return _env_ok({"contacts": [{"resource_name": "people/2", "display_name": "Rintu", "primary_phone": "999"}], "next_page_token": None})
-    _mock_tools(monkeypatch, {"search_contacts": search, "list_contacts": lambda a: _env_ok({}), "get_contact": lambda a: _env_ok({})})
+        return _env_ok({"contacts": [{"resource_name": "people/2", "display_name": "Rintu", "primary_phone": "999", "phones": [{"value": "999"}]}], "next_page_token": None})
+    def get_contact(args):
+        if args.get("resource_name") == "people/2":
+            return _env_ok({"resource_name": "people/2", "display_name": "Rintu", "primary_phone": "999", "phones": [{"value": "999"}]})
+        return _env_ok({"resource_name": args.get("resource_name"), "display_name": "Someone"})
+    _mock_tools(monkeypatch, {"search_contacts": search, "list_contacts": lambda a: _env_ok({}), "get_contact": get_contact})
     monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse("FABRICATED 555"))
     result = contacts_read.generate_contacts_read_response(user_id="u", connection_id="c", message="find Rintu's phone number")
     assert calls[0].get("page_token") in (None, "")
@@ -471,3 +475,243 @@ def test_pending_clarification_has_identity_markers(monkeypatch):
     result = contacts_read.generate_contacts_read_response(user_id="u", connection_id="c", message="find contact named Rintu", conversation_id="conv-1")
     pending = result.get("pending_contacts_clarification")
     assert pending and pending.get("clarification_id") and pending.get("created_at")
+
+
+def test_multiple_matches_all_fetches_authoritative_for_each(monkeypatch):
+    """All candidates in multiple_matches_all must be fetched via get_contact and rendered from authoritative data."""
+    subhro = {
+        "resource_name": "people/s1",
+        "display_name": "Subhro",
+        "primary_phone": "+91 92309 85025",
+        "phones": [{"value": "+91 92309 85025"}],
+    }
+    subhro_emoji = {
+        "resource_name": "people/s2",
+        "display_name": "Subhro ❤️ 🐻",
+        "primary_phone": "+91 70019 06952",
+        "phones": [{"value": "+91 70019 06952"}],
+    }
+    get_calls = []
+
+    def search_contacts(args):
+        return _env_ok({"contacts": [subhro, subhro_emoji]})
+
+    def get_contact(args):
+        get_calls.append(args.get("resource_name"))
+        rn = args.get("resource_name")
+        if rn == "people/s1":
+            return _env_ok(subhro)
+        if rn == "people/s2":
+            return _env_ok(subhro_emoji)
+        return _env_ok({})
+
+    _mock_tools(monkeypatch, {
+        "search_contacts": search_contacts,
+        "list_contacts": lambda a: _env_ok({}),
+        "get_contact": get_contact,
+    })
+    monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse("nope"))
+
+    result = contacts_read.generate_contacts_read_response(
+        user_id="u1", connection_id="c1",
+        message="give me all phone numbers associated with Subhro",
+        conversation_id="conv1",
+    )
+    text = result.get("assistant_response") or ""
+    assert "92309" in text
+    assert "70019" in text
+    assert set(get_calls) == {"people/s1", "people/s2"}
+
+
+def test_multiple_matches_all_partial_failure_continues(monkeypatch):
+    """If one get_contact fails, show successful ones and a note about the failed contact."""
+    subhro = {
+        "resource_name": "people/s1",
+        "display_name": "Subhro",
+        "primary_phone": "+91 92309 85025",
+        "phones": [{"value": "+91 92309 85025"}],
+    }
+    subhro_emoji = {
+        "resource_name": "people/s2",
+        "display_name": "Subhro ❤️ 🐻",
+        "primary_phone": "+91 70019 06952",
+        "phones": [{"value": "+91 70019 06952"}],
+    }
+
+    def search_contacts(args):
+        return _env_ok({"contacts": [subhro, subhro_emoji]})
+
+    def get_contact(args):
+        rn = args.get("resource_name")
+        if rn == "people/s1":
+            return _env_ok(subhro)
+        if rn == "people/s2":
+            return _env_err("boom")
+        return _env_ok({})
+
+    _mock_tools(monkeypatch, {
+        "search_contacts": search_contacts,
+        "list_contacts": lambda a: _env_ok({}),
+        "get_contact": get_contact,
+    })
+    monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse("nope"))
+
+    result = contacts_read.generate_contacts_read_response(
+        user_id="u1", connection_id="c1",
+        message="give me all phone numbers associated with Subhro",
+        conversation_id="conv1",
+    )
+    text = result.get("assistant_response") or ""
+    assert "+91 92309 85025" in text
+    assert "Could not retrieve details for" in text
+
+
+def test_multiple_matches_all_all_fail_returns_safe_error(monkeypatch):
+    """If no authoritative retrieval succeeds for any candidate, return a safe error."""
+    subhro = {
+        "resource_name": "people/s1",
+        "display_name": "Subhro",
+        "primary_phone": "+91 92309 85025",
+        "phones": [{"value": "+91 92309 85025"}],
+    }
+    subhro_emoji = {
+        "resource_name": "people/s2",
+        "display_name": "Subhro ❤️ 🐻",
+        "primary_phone": "+91 70019 06952",
+        "phones": [{"value": "+91 70019 06952"}],
+    }
+
+    def search_contacts(args):
+        return _env_ok({"contacts": [subhro, subhro_emoji]})
+
+    def get_contact(args):
+        return _env_err("boom")
+
+    _mock_tools(monkeypatch, {
+        "search_contacts": search_contacts,
+        "list_contacts": lambda a: _env_ok({}),
+        "get_contact": get_contact,
+    })
+    monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse("nope"))
+
+    result = contacts_read.generate_contacts_read_response(
+        user_id="u1", connection_id="c1",
+        message="give me all phone numbers associated with Subhro",
+        conversation_id="conv1",
+    )
+    text = (result.get("assistant_response") or "").lower()
+    assert "couldn't" in text or "could not" in text
+
+
+import pytest
+
+@pytest.mark.parametrize("reply,expected_rn,expected_phone", [
+    ("1", "people/p1", "+911111111111"),
+    ("2", "people/p2", "+912222222222"),
+    ("2.", "people/p2", "+912222222222"),
+    ("option 2", "people/p2", "+912222222222"),
+    ("number 2", "people/p2", "+912222222222"),
+    ("choice 2", "people/p2", "+912222222222"),
+    ("select 2", "people/p2", "+912222222222"),
+    ("second one", "people/p2", "+912222222222"),
+    ("Mua Paromita Di", "people/p2", "+912222222222"),
+])
+def test_numeric_clarification_matrix_valid(monkeypatch, reply, expected_rn, expected_phone):
+    """Valid clarification replies select the correct candidate with authoritative get_contact."""
+    candidates = [
+        {"resource_name": "people/p1", "display_name": "Paromita di💕💕", "primary_phone": "+911111111111", "phones": [{"value": "+911111111111"}]},
+        {"resource_name": "people/p2", "display_name": "Mua Paromita Di", "primary_phone": "+912222222222", "phones": [{"value": "+912222222222"}]},
+        {"resource_name": "people/p3", "display_name": "Mua Paromita Di_2", "primary_phone": "+913333333333", "phones": [{"value": "+913333333333"}]},
+    ]
+    pending = {
+        "version": 1,
+        "type": "contacts_read_clarification",
+        "clarification_id": "c1",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+        "user_id": "user-1",
+        "conversation_id": "conv-1",
+        "target_query": "Paromita Di",
+        "requested_attribute": "details",
+        "candidates": candidates,
+    }
+    search_calls = []
+    get_calls = []
+
+    def search_contacts(args):
+        search_calls.append(dict(args))
+        return _env_ok({"contacts": candidates})
+
+    def get_contact(args):
+        get_calls.append(dict(args))
+        rn = args.get("resource_name")
+        for c in candidates:
+            if c["resource_name"] == rn:
+                return _env_ok(c)
+        return _env_ok({})
+
+    _mock_tools(monkeypatch, {
+        "search_contacts": search_contacts,
+        "list_contacts": lambda a: _env_ok({}),
+        "get_contact": get_contact,
+    })
+    monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse("nope"))
+
+    result = contacts_read.generate_contacts_read_response(
+        user_id="user-1", connection_id="conn-1",
+        message=reply,
+        conversation_id="conv-1",
+        pending_clarification=pending,
+    )
+    assert len(get_calls) >= 1
+    assert get_calls[-1]["resource_name"] == expected_rn
+    assert expected_phone in (result.get("assistant_response") or "")
+    assert result.get("pending_contacts_clarification") is None
+
+
+def test_multiple_matches_all_wrong_resource_name_treated_as_failure(monkeypatch):
+    """If get_contact returns a different resource_name, treat as fetch failure (no cross-contact data)."""
+    subhro = {
+        "resource_name": "people/s1",
+        "display_name": "Subhro",
+        "primary_phone": "+91 92309 85025",
+        "phones": [{"value": "+91 92309 85025"}],
+    }
+    subhro_emoji = {
+        "resource_name": "people/s2",
+        "display_name": "Subhro ❤️ 🐻",
+        "primary_phone": "+91 70019 06952",
+        "phones": [{"value": "+91 70019 06952"}],
+    }
+
+    def search_contacts(args):
+        return _env_ok({"contacts": [subhro, subhro_emoji]})
+
+    def get_contact(args):
+        rn = args.get("resource_name")
+        if rn == "people/s1":
+            # Wrong resource returned!
+            return _env_ok({"resource_name": "people/WRONG", "display_name": "Wrong", "primary_phone": "+999", "phones": [{"value": "+999"}]})
+        if rn == "people/s2":
+            return _env_ok(subhro_emoji)
+        return _env_ok({})
+
+    _mock_tools(monkeypatch, {
+        "search_contacts": search_contacts,
+        "list_contacts": lambda a: _env_ok({}),
+        "get_contact": get_contact,
+    })
+    monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse("nope"))
+
+    result = contacts_read.generate_contacts_read_response(
+        user_id="u1", connection_id="c1",
+        message="give me all phone numbers associated with Subhro",
+        conversation_id="conv1",
+    )
+    text = result.get("assistant_response") or ""
+    # The wrong number must NOT appear
+    assert "+999" not in text
+    # The correct one should still appear
+    assert "70019" in text
+    # Should note partial failure
+    assert "Could not retrieve details for" in text

@@ -3417,6 +3417,88 @@ def test_gmail_read_and_search_aliases_map_to_existing_read_tools(monkeypatch):
     assert search_plan["max_results"] == 10
 
 
+def test_send_request_with_explicit_address_overrides_planner_search(
+    monkeypatch,
+):
+    planner_response = LLMResponse(
+        content=json.dumps({
+            "intent": "search_emails",
+            "query": "subrata291291@gmail.com",
+            "max_results": 10,
+        }),
+        provider="test",
+        model="test-model",
+        latency_ms=0,
+        finish_reason="stop",
+    )
+    calls = []
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda request: calls.append(request) or planner_response,
+    )
+    # Force the planner fallback path used when deterministic routing is
+    # bypassed in production, while leaving the recipient guard intact.
+    monkeypatch.setattr(
+        gmail_agent_nodes,
+        "_deterministic_assistant_plan",
+        lambda state: None,
+    )
+    state = _state(
+        "send a test mail to subrata291291@gmail.com",
+        available_gmail_sources={
+            "messages": [
+                {"message_id": "old-1", "thread_id": "thread-1"},
+                {"message_id": "old-2", "thread_id": "thread-2"},
+            ],
+        },
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(state)
+
+    assert calls
+    assert routed["assistant_route"] == "gmail"
+    plan = DraftEmailPlan.model_validate(routed["gmail_plan"])
+    assert plan.intent == "gmail_compose"
+    assert plan.requested_action == "send"
+    assert plan.to == ["subrata291291@gmail.com"]
+    assert "query" not in routed["gmail_plan"]
+
+
+def test_explicit_address_search_is_not_overridden_by_compose_guard(
+    monkeypatch,
+):
+    planner_response = LLMResponse(
+        content=json.dumps({
+            "intent": "search_emails",
+            "sender": "subrata291291@gmail.com",
+            "max_results": 10,
+        }),
+        provider="test",
+        model="test-model",
+        latency_ms=0,
+        finish_reason="stop",
+    )
+    monkeypatch.setattr(
+        gmail_agent_nodes.llm_router,
+        "generate",
+        lambda request: planner_response,
+    )
+    monkeypatch.setattr(
+        gmail_agent_nodes,
+        "_deterministic_assistant_plan",
+        lambda state: None,
+    )
+
+    routed = gmail_agent_nodes.gmail_intent_router_node(
+        _state("Find emails from subrata291291@gmail.com."),
+    )
+
+    assert routed["assistant_route"] == "gmail"
+    assert routed["gmail_plan"]["intent"] == "search_emails"
+    assert routed["gmail_plan"]["sender"] == "subrata291291@gmail.com"
+
+
 def test_send_intent_still_only_enters_editable_draft_flow(monkeypatch):
     called = []
 

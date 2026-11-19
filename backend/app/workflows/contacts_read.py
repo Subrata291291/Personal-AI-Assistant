@@ -579,11 +579,17 @@ def _name_match_bucket(target: str, contact: dict[str, Any]) -> tuple[int, bool]
             if t_tokens and t_tokens.issubset(n_tokens):
                 score = max(score, 65)
             elif t_tokens and n_tokens and (t_tokens & n_tokens):
-                overlap = len(t_tokens & n_tokens)
-                if overlap == len(t_tokens) and len(t_tokens) >= 1:
-                    score = max(score, 60)
-                elif overlap >= 1:
-                    score = max(score, 40)
+                overlap_tokens = t_tokens & n_tokens
+                meaningful_overlap = {x for x in overlap_tokens if len(x) >= 3}
+                if t_tokens.issubset(n_tokens):
+                    score = max(score, 65)
+                elif len(meaningful_overlap) >= 1:
+                    # Require at least one meaningful token overlap to avoid weak suffix matches.
+                    if overlap_tokens == t_tokens and len(t_tokens) >= 2:
+                        score = max(score, 60)
+                    else:
+                        score = max(score, 40)
+                # else: only short/common tokens overlap (e.g., "di") -> ignore
             # Conservative soft-token comparison for common casual variants
             # (e.g. "mams" -> "mam", "rintus" -> "rintu"). Partial strength only; never exact and
             # never a basis for silent auto-selection.
@@ -740,6 +746,137 @@ def _format_field_values(contact: dict[str, Any], attribute: RequestedAttribute)
         uniq = list(dict.fromkeys([e.strip() for e in emails if isinstance(e, str) and e.strip()]))
         return ", ".join(uniq) if uniq else None
     return None
+
+
+_SUSPICIOUS_EMAIL_DOMAINS = frozenset({
+    "example.com",
+    "example.org",
+    "example.net",
+    "example.edu",
+    "test.com",
+    "test.org",
+    "invalid",
+    "localhost",
+})
+_SUSPICIOUS_ORG_MARKERS = (
+    "xyz corp",
+    "example corp",
+    "acme corp",
+    "test corp",
+    "fake company",
+)
+_SUSPICIOUS_ADDRESS_MARKERS = (
+    "123 main st",
+    "springfield",
+    "anytown",
+    "123 example",
+)
+# Common reserved/fake phone exchanges (555-0100..0199, 555-1234, 555-9876).
+_FAKE_PHONE_DIGITS = re.compile(r"555(?:01\d{2}|123|987)")
+
+
+def _contact_values_for_field(
+    contact: dict[str, Any],
+    field: Literal["email", "phone", "organization", "address"],
+) -> list[str]:
+    """Return user-visible values for one field, without logging or exposing them."""
+    values: list[str] = []
+    if field == "email":
+        primary = contact.get("primary_email")
+        if isinstance(primary, str) and primary.strip():
+            values.append(primary.strip())
+        for item in contact.get("emails") or []:
+            if isinstance(item, dict):
+                value = item.get("value")
+                if isinstance(value, str) and value.strip():
+                    values.append(value.strip())
+    elif field == "phone":
+        primary = contact.get("primary_phone")
+        if isinstance(primary, str) and primary.strip():
+            values.append(primary.strip())
+        for item in contact.get("phones") or []:
+            if isinstance(item, dict):
+                value = item.get("value")
+                if isinstance(value, str) and value.strip():
+                    values.append(value.strip())
+    elif field == "organization":
+        value = contact.get("organization")
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    elif field == "address":
+        for item in contact.get("addresses") or []:
+            if not isinstance(item, dict):
+                continue
+            formatted = item.get("formatted")
+            if isinstance(formatted, str) and formatted.strip():
+                values.append(formatted.strip())
+                continue
+            parts = [item.get(key) for key in ("street", "city", "region", "postal_code", "country")]
+            text = ", ".join([str(part).strip() for part in parts if isinstance(part, str) and part.strip()])
+            if text:
+                values.append(text)
+    # Deduplicate while preserving order.
+    return list(dict.fromkeys(values))
+
+
+def _suspicious_contact_patterns(contact: dict[str, Any]) -> list[tuple[str, str]]:
+    """Detect obvious test/fake data patterns without retaining raw values.
+
+    Returns only (field_identifier, pattern_category) pairs so callers can log
+    safely. Raw phone numbers, emails, addresses and names are never returned
+    or logged by this helper.
+    """
+    findings: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(field: str, pattern: str) -> None:
+        key = (field, pattern)
+        if key not in seen:
+            seen.add(key)
+            findings.append(key)
+
+    try:
+        for value in _contact_values_for_field(contact, "email"):
+            _local, _sep, domain = value.rpartition("@")
+            domain = domain.strip().casefold()
+            if not domain:
+                continue
+            if (
+                domain in _SUSPICIOUS_EMAIL_DOMAINS
+                or domain.endswith(".invalid")
+                or domain.endswith(".test")
+            ):
+                add("email", "example_or_test_domain")
+
+        for value in _contact_values_for_field(contact, "phone"):
+            digits = re.sub(r"\D", "", value)
+            if _FAKE_PHONE_DIGITS.search(digits) or "(555)" in value:
+                add("phone", "555_test_number")
+
+        for value in _contact_values_for_field(contact, "organization"):
+            lowered = value.casefold()
+            if any(marker in lowered for marker in _SUSPICIOUS_ORG_MARKERS):
+                add("organization", "test_org")
+
+        for value in _contact_values_for_field(contact, "address"):
+            lowered = value.casefold()
+            if any(marker in lowered for marker in _SUSPICIOUS_ADDRESS_MARKERS):
+                add("address", "test_address")
+    except Exception:
+        # Defensive checks must never break rendering.
+        return findings
+
+    return findings
+
+
+def _log_suspicious_contact_patterns(contact: dict[str, Any]) -> None:
+    """Log only safe field identifiers and pattern categories (never raw values)."""
+    for field, pattern in _suspicious_contact_patterns(contact):
+        logger.warning(
+            "contacts_suspicious_data_detected | field=%s | pattern=%s",
+            field,
+            pattern,
+        )
 
 
 def _format_contact_details(contact: dict[str, Any]) -> str:
@@ -952,6 +1089,18 @@ def _render_trusted_response(outcome: dict[str, Any]) -> str:
     attr = outcome.get("requested_attribute")
     target = outcome.get("target_query")
 
+    # Defensive logging: inspect only contacts that may be rendered, and log
+    # safe field identifiers + pattern categories (never raw values).
+    if status in {"single_match", "multiple_matches_all", "list"}:
+        render_candidates = (
+            outcome.get("contacts")
+            if status == "list"
+            else outcome.get("matches")
+        )
+        for candidate in render_candidates or []:
+            if isinstance(candidate, dict):
+                _log_suspicious_contact_patterns(candidate)
+
     if status == "no_match":
         return (
             f'I couldn\'t find a contact matching "{target}" in your Google Contacts.'
@@ -963,7 +1112,8 @@ def _render_trusted_response(outcome: dict[str, Any]) -> str:
         if outcome.get("data_source") != "google_people_api" or not outcome.get("selected_contact_returned_by_api"):
             return "I couldn't verify the contact details from Google Contacts for this request. Please try again."
         matches = [m for m in (outcome.get("matches") or []) if isinstance(m, dict)]
-        if not matches:
+        failures = outcome.get("partial_failures") or []
+        if not matches and not failures:
             return "I couldn't find matching contacts in your Google Contacts."
         if attr == "phone":
             header = (
@@ -978,6 +1128,11 @@ def _render_trusted_response(outcome: dict[str, Any]) -> str:
                     lines.append(f"- {name}: {value}")
                 else:
                     lines.append(f"- {name}: No phone number available")
+            if failures:
+                names = ", ".join([f.get("display_name") or "A contact" for f in failures[:5]])
+                lines.append(f"Could not retrieve details for: {names}.")
+            if not matches and failures:
+                return "Could not retrieve the requested contact details right now."
             return "\n".join(lines)
         if attr == "email":
             header = (
@@ -992,6 +1147,11 @@ def _render_trusted_response(outcome: dict[str, Any]) -> str:
                     lines.append(f"- {name}: {value}")
                 else:
                     lines.append(f"- {name}: No email address available")
+            if failures:
+                names = ", ".join([f.get("display_name") or "A contact" for f in failures[:5]])
+                lines.append(f"Could not retrieve details for: {names}.")
+            if not matches and failures:
+                return "Could not retrieve the requested contact details right now."
             return "\n".join(lines)
         header = (
             f'Contact details for contacts matching "{target}":'
@@ -1000,6 +1160,11 @@ def _render_trusted_response(outcome: dict[str, Any]) -> str:
         blocks = [header]
         for m in matches[:10]:
             blocks.append(_format_contact_details(m))
+        if failures:
+            names = ", ".join([f.get("display_name") or "A contact" for f in failures[:5]])
+            blocks.append(f"Could not retrieve details for: {names}.")
+        if not matches and failures:
+            return "Could not retrieve the requested contact details right now."
         return "\n\n".join(blocks)
 
     if status == "multiple_matches":
@@ -1131,12 +1296,21 @@ def _resolve_clarification_selection(message: str, candidates: list[dict[str, An
     if not text or not candidates:
         return None
 
-    # Numeric/ordinal selection
-    m = re.fullmatch(r"\s*(?:option\s*)?([1-9][0-9]?)\s*[\).:]?\s*", lowered)
+    # Numeric/ordinal selection (tolerant)
+    m = re.fullmatch(r"\s*(?:(?:option|number|choice|select)\s*)?([1-9][0-9]?)\s*[\).:!\-]?\s*", lowered)
     if m:
         idx = int(m.group(1)) - 1
         if 0 <= idx < len(candidates):
             return candidates[idx]
+    # Also handle "the 2nd one", "2nd"
+    m2 = re.search(r"\b(\d+)\s*(?:st|nd|rd|th)?\b", lowered)
+    if m2 and re.fullmatch(r"\s*(?:the\s+)?\d+\s*(?:st|nd|rd|th)?(?:\s*(?:one|contact|option|number|choice))?\s*", lowered):
+        try:
+            idx = int(m2.group(1)) - 1
+            if 0 <= idx < len(candidates):
+                return candidates[idx]
+        except Exception:
+            pass
     ordinals = {
         "first": 0, "1st": 0, "the first one": 0, "first one": 0, "first contact": 0,
         "second": 1, "2nd": 1, "the second one": 1, "second one": 1, "second contact": 1,
@@ -1818,23 +1992,50 @@ async def _run_contacts_read(
             outcome["max_pages"] = CONTACTS_SEARCH_MAX_PAGES
             outcome["max_results"] = CONTACTS_SEARCH_MAX_RESULTS
 
-        if outcome.get("status") == "single_match" and intent.intent == "get_contact_details":
+        if outcome.get("status") == "single_match" and intent.intent in {"get_contact_details", "get_contact_phone", "get_contact_email", "search_contact"}:
             rn = (outcome.get("matches") or [{}])[0].get("resource_name")
             get_tool = by_name.get("get_contact")
-            if isinstance(rn, str) and rn and get_tool is not None:
-                raw_get = await get_tool.ainvoke({"resource_name": rn})
-                env_get = json.loads(raw_get)
-                if env_get.get("ok") and isinstance(env_get.get("data"), dict):
-                    detailed = env_get["data"]
-                    drn = detailed.get("resource_name") or detailed.get("resourceName")
-                    if drn == rn:
-                        outcome["matches"] = [_minimal_contact(detailed)]
-                        outcome["data_source"] = "google_people_api"
-                        outcome["selected_contact_returned_by_api"] = True
+            if not isinstance(rn, str) or not rn or get_tool is None:
+                outcome = {"status": "error", "error": "I couldn't retrieve this contact's details right now. Please try again."}
+            else:
+                try:
+                    raw_get = await get_tool.ainvoke({"resource_name": rn})
+                    env_get = json.loads(raw_get)
+                    if not env_get.get("ok") or not isinstance(env_get.get("data"), dict):
+                        err = (env_get.get("error") or {}).get("message") if isinstance(env_get.get("error"), dict) else None
+                        outcome = {"status": "error", "error": "I couldn't retrieve this contact's details right now. Please try again."}
+                    else:
+                        detailed = env_get["data"]
+                        drn = detailed.get("resource_name") or detailed.get("resourceName")
+                        if drn != rn:
+                            outcome = {"status": "error", "error": "I couldn't verify this contact from Google Contacts. Please try again."}
+                        else:
+                            authoritative = _minimal_contact(detailed)
+                            outcome["matches"] = [authoritative]
+                            outcome["data_source"] = "google_people_api"
+                            outcome["selected_contact_returned_by_api"] = True
+                            # Recompute field availability from the authoritative
+                            # get_contact payload so provenance/observability cannot
+                            # claim a value was validated when it is missing.
+                            if intent.requested_attribute == "phone":
+                                outcome["field_status"] = (
+                                    "present"
+                                    if _contact_has_phone(authoritative)
+                                    else "missing"
+                                )
+                            elif intent.requested_attribute == "email":
+                                outcome["field_status"] = (
+                                    "present"
+                                    if _contact_has_email(authoritative)
+                                    else "missing"
+                                )
+                            else:
+                                outcome["field_status"] = "present"
+                except Exception:
+                    outcome = {"status": "error", "error": "I couldn't retrieve this contact's details right now. Please try again."}
 
         # If the user explicitly asked for all matching contacts' requested values (e.g. "all phone numbers
-        # associated with Subhro"), return every verified match with its own stored field values from Google
-        # Contacts instead of forcing clarification. Each contact's values remain associated with that contact.
+        # associated with Subhro"), fetch authoritative details for each via get_contact and render fail-soft.
         if (
             outcome.get("status") == "multiple_matches"
             and intent.requested_attribute in {"phone", "email", "details"}
@@ -1842,10 +2043,40 @@ async def _run_contacts_read(
             and isinstance(outcome.get("matches"), list)
             and len(outcome.get("matches") or []) >= 1
         ):
-            outcome["status"] = "multiple_matches_all"
-            outcome["match_strategy"] = (outcome.get("match_strategy") or "multiple_matches") + "_all_requested"
-            outcome["selected_contact_returned_by_api"] = True
-            outcome["data_source"] = "google_people_api"
+            get_tool = by_name.get("get_contact")
+            authoritative_matches: list[dict[str, Any]] = []
+            fetch_failures: list[dict[str, Any]] = []
+            for m in outcome.get("matches") or []:
+                if not isinstance(m, dict):
+                    continue
+                rn = m.get("resource_name")
+                if not isinstance(rn, str) or not rn or get_tool is None:
+                    fetch_failures.append({"resource_name": rn, "display_name": _display_name(m) if isinstance(m, dict) else "Unknown contact"})
+                    continue
+                try:
+                    raw_get = await get_tool.ainvoke({"resource_name": rn})
+                    env_get = json.loads(raw_get)
+                    if not env_get.get("ok") or not isinstance(env_get.get("data"), dict):
+                        fetch_failures.append({"resource_name": rn, "display_name": _display_name(m)})
+                        continue
+                    detailed = env_get["data"]
+                    drn = detailed.get("resource_name") or detailed.get("resourceName")
+                    if drn != rn:
+                        fetch_failures.append({"resource_name": rn, "display_name": _display_name(m)})
+                        continue
+                    authoritative_matches.append(_minimal_contact(detailed))
+                except Exception:
+                    fetch_failures.append({"resource_name": rn, "display_name": _display_name(m)})
+            if not authoritative_matches and fetch_failures:
+                outcome = {"status": "error", "error": "I couldn't retrieve those contacts' details right now. Please try again."}
+            else:
+                outcome["status"] = "multiple_matches_all"
+                outcome["match_strategy"] = (outcome.get("match_strategy") or "multiple_matches") + "_all_requested"
+                outcome["selected_contact_returned_by_api"] = True
+                outcome["data_source"] = "google_people_api"
+                outcome["matches"] = authoritative_matches
+                if fetch_failures:
+                    outcome["partial_failures"] = [{"display_name": f.get("display_name", "Unknown contact")} for f in fetch_failures]
 
         pending = None
         if outcome.get("status") == "multiple_matches" and conversation_id:

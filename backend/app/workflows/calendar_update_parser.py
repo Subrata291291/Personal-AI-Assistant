@@ -236,26 +236,43 @@ def _extract_event_query(text: str) -> str | None:
         return _clean_title(person) if person else generic_meeting.group("kind")
 
     direct_title = re.search(
-        r"\b(?:delete|remove|cancel)\s+(?:my|the)\s+"
+        r"\b(?:delete|remove|cancel)\s+(?:(?:my|the)\s+)?"
         r"(?P<title>[^\r\n]+?)[ \t]*$",
         text,
         re.IGNORECASE | re.MULTILINE,
     )
     if direct_title:
         title = re.sub(
-            r"\s+from\s+(?:my\s+)?(?:primary\s+)?"
+            r"\s+from\s+(?:(?:my|the)\s+)?(?:primary\s+)?"
             r"(?:google\s+)?calendar\b.*$",
             "",
             direct_title.group("title"),
             flags=re.IGNORECASE,
         )
+        # A spoken time range is parsed separately; keep the title query clean.
+        title = re.sub(
+            r"\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+            r"\s*(?:to|[-–—])\s*"
+            r"\d{1,2}(?::\d{2})?\s*(?:am|pm)\b.*$",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        )
         cleaned = _clean_title(title)
         if cleaned:
             normalized = " ".join(cleaned.casefold().split())
-            # Keep generic nouns as searchable queries for legacy/generic requests
-            # (e.g. "Delete my event."); day-scoped generic discovery is handled
-            # separately in parse_calendar_delete_request.
-            if normalized in {"calendar event", "calendar meeting"}:
+            # Generic nouns and demonstratives are not useful title queries;
+            # day-scoped generic discovery is handled separately in
+            # parse_calendar_delete_request.
+            if normalized in {
+                "calendar event",
+                "calendar meeting",
+                "this",
+                "that",
+                "it",
+                "one",
+                "the one",
+            }:
                 return None
         return cleaned
     return None

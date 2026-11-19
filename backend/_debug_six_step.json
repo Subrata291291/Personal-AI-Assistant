@@ -1,0 +1,157 @@
+{
+  "steps": [
+    [
+      1,
+      "google_calendar",
+      "google_calendar",
+      "I found multiple events on your calendar for 2026-11-10. Which one do you want to delete? Please reply with the number (for example, \"delete the second one\") or title/time:\n\n- **Planning** \u2014 2026-11-10 09:00 AM IST to 2026-11-10 10:00 AM IST\n  - Event ID: evt-10nov-1\n  - Calendar ID: primary\n  - Recurrence: single event\n- **Personal AI Assistant - Calendar Test** \u2014 2026-11-10 11:00 AM IST to 2026-11-10 12:00 PM IST\n  - Event ID: evt-10nov-target\n  - Calendar ID: primary\n  - Recurrence: single event\n- **Review** \u2014 2026-11-10 02:00 PM IST to 2026-11-10 03:00 PM IST\n  - Event ID: evt-10nov-3\n  - Calendar ID: primary\n  - Recurrence: single event"
+    ],
+    [
+      2,
+      "google_calendar",
+      "google_calendar",
+      "I prepared an approval request to delete **Personal AI Assistant - Calendar Test** (2026-11-10 11:00 AM IST to 2026-11-10 12:00 PM IST). Review the approval card below. Google Calendar will not be changed unless you approve and separately execute the request."
+    ],
+    [
+      3,
+      "gmail",
+      "summarize_today",
+      "I found no incoming email for today (search: in:inbox newer_than:1d -from:me)."
+    ],
+    [
+      4,
+      "general",
+      "general",
+      "OK"
+    ],
+    [
+      5,
+      "google_contacts",
+      "google_contacts",
+      "Mam's number: +8801700000001"
+    ],
+    [
+      6,
+      "google_calendar",
+      "google_calendar",
+      "Live results from Google Calendar (1 event(s)):\n\n- **Daily Sync** \u2014 2026-11-18 10:00 AM IST to 2026-11-18 10:30 AM IST\n  - Event ID: evt-upcoming-1\n  - Calendar ID: primary\n  - Recurrence: single event"
+    ]
+  ],
+  "gmail_exec_calls": [
+    {
+      "intent": "summarize_today",
+      "max_results": 10
+    }
+  ],
+  "gmail_agent_invocations": [],
+  "step_snapshots": [
+    {
+      "before": {
+        "gmail_exec": 0,
+        "contacts": 0,
+        "gmail_agent": 0,
+        "list_events_service": 0,
+        "list_events_tool": 0,
+        "proposals": 0
+      },
+      "after": {
+        "gmail_exec": 0,
+        "contacts": 0,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 0
+      }
+    },
+    {
+      "before": {
+        "gmail_exec": 0,
+        "contacts": 0,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 0
+      },
+      "after": {
+        "gmail_exec": 0,
+        "contacts": 0,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 1
+      }
+    },
+    {
+      "before": {
+        "gmail_exec": 0,
+        "contacts": 0,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 1
+      },
+      "after": {
+        "gmail_exec": 1,
+        "contacts": 0,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 1
+      }
+    },
+    {
+      "before": {
+        "gmail_exec": 1,
+        "contacts": 0,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 1
+      },
+      "after": {
+        "gmail_exec": 1,
+        "contacts": 0,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 1
+      }
+    },
+    {
+      "before": {
+        "gmail_exec": 1,
+        "contacts": 0,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 1
+      },
+      "after": {
+        "gmail_exec": 1,
+        "contacts": 1,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 1
+      }
+    },
+    {
+      "before": {
+        "gmail_exec": 1,
+        "contacts": 1,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 0,
+        "proposals": 1
+      },
+      "after": {
+        "gmail_exec": 1,
+        "contacts": 1,
+        "gmail_agent": 0,
+        "list_events_service": 1,
+        "list_events_tool": 1,
+        "proposals": 1
+      }
+    }
+  ]
+}

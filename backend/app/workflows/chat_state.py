@@ -5,6 +5,7 @@ from operator import add
 class ChatMessage(TypedDict):
     role: str
     content: str
+    metadata: NotRequired[dict[str, Any]]
 
 
 class ChatContext(TypedDict):

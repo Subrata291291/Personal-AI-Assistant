@@ -1,4 +1,5 @@
 
+import json
 import logging
 from typing import Annotated
 from uuid import UUID
@@ -11,6 +12,7 @@ from fastapi import (
     Query,
     status,
 )
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from supabase import Client
 
@@ -70,6 +72,121 @@ ChatServiceDependency = Annotated[
     ChatService,
     Depends(get_chat_service),
 ]
+
+
+def _google_api_http_exception(exc: GoogleAPIError) -> HTTPException:
+    if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+        return HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Google authorization is no longer valid. Reconnect the "
+                "affected Google service in Connected Apps."
+            ),
+        )
+    if exc.status_code == status.HTTP_403_FORBIDDEN:
+        return HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Google access was denied. Check the connected account's "
+                "permissions in Connected Apps."
+            ),
+        )
+    if exc.status_code == status.HTTP_404_NOT_FOUND:
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="The requested Gmail item is no longer available.",
+        )
+    if (
+        exc.retryable
+        or exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+        or exc.status_code >= 500
+    ):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google is temporarily unavailable. Please try again later.",
+        )
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="Gmail could not complete the request. Please try again.",
+    )
+
+
+def _stream_http_exception(exc: Exception) -> HTTPException:
+    """Map a pre-stream failure to the same statuses as the blocking endpoint."""
+    if isinstance(exc, LookupError):
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found.",
+        )
+    if isinstance(exc, IdempotencyConflictError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
+    if isinstance(
+        exc,
+        (
+            ChatRequestInProgressError,
+            ChatRequestUncertainError,
+            ChatRequestFailedError,
+        ),
+    ):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
+    if isinstance(exc, ValueError):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+    if isinstance(exc, LLMFallbackError):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The AI service could not complete your request. "
+                "Please try again later."
+            ),
+        )
+    if isinstance(exc, GoogleAPIError):
+        return _google_api_http_exception(exc)
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=(
+            "The assistant encountered an unexpected error. "
+            "Please try again later."
+        ),
+    )
+
+
+def _stream_error_message(exc: Exception) -> str:
+    """Public, non-sensitive message for an error that interrupts a stream."""
+    if isinstance(exc, LookupError):
+        return "Conversation not found."
+    if isinstance(
+        exc,
+        (
+            IdempotencyConflictError,
+            ChatRequestInProgressError,
+            ChatRequestUncertainError,
+            ChatRequestFailedError,
+            ValueError,
+        ),
+    ):
+        return str(exc)
+    if isinstance(exc, LLMFallbackError):
+        return (
+            "The AI service could not complete your request. "
+            "Please try again later."
+        )
+    if isinstance(exc, GoogleAPIError):
+        return (
+            "Google service temporarily unavailable. "
+            "Please try again later."
+        )
+    return (
+        "The assistant is temporarily unavailable. Please try again."
+    )
 
 
 @router.post(
@@ -228,6 +345,120 @@ def chat(
                 "Please try again later."
             ),
         )
+
+
+@router.post("/stream")
+def chat_stream(
+    payload: ChatRequest,
+    user: CurrentUser,
+    service: ChatServiceDependency,
+    idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
+):
+    """SSE chat with genuine provider token streaming.
+
+    Tokens are forwarded from the LLM provider through the LangGraph custom
+    stream to this response as they are generated. Tool execution produces
+    short status events; raw tool payloads are never forwarded.
+    """
+    user_metadata = user.get("user_metadata") or {}
+
+    def _sse(event: dict) -> str:
+        return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+
+    def _done_payload(response: dict) -> dict:
+        assistant_msg = response.get("assistant_message") or {}
+        user_msg = response.get("user_message") or {}
+        conversation = response.get("conversation_id")
+        return {
+            "type": "done",
+            "message_id": assistant_msg.get("id"),
+            "user_message_id": user_msg.get("id"),
+            "conversation_id": str(conversation) if conversation else None,
+            "request_id": str(idempotency_key),
+            "provider": response.get("provider"),
+            "model": response.get("model"),
+        }
+
+    events = None
+    try:
+        events = service.stream_message(
+            user_id=UUID(str(user["id"])),
+            conversation_id=payload.conversation_id,
+            content=payload.content,
+            idempotency_key=idempotency_key,
+            gmail_connection_id=payload.gmail_connection_id,
+            user_timezone=payload.user_timezone,
+            default_calendar_connection_id=user_metadata.get("default_calendar_connection_id"),
+            default_contacts_connection_id=user_metadata.get("default_contacts_connection_id"),
+            default_drive_connection_id=user_metadata.get("default_drive_connection_id"),
+            gmail_enabled=(user_metadata.get("gmail_enabled") is not False),
+            calendar_enabled=(user_metadata.get("calendar_enabled") is not False),
+            contacts_enabled=(user_metadata.get("contacts_enabled") is not False),
+            drive_enabled=(user_metadata.get("drive_enabled") is not False),
+        )
+        first_event = next(events)
+    except StopIteration:
+        first_event = None
+    except Exception as exc:
+        log_exception_traceback(
+            logger,
+            "Streaming chat failed before streaming started.",
+            exc,
+        )
+        raise _stream_http_exception(exc)
+
+    def event_generator():
+        content_started = False
+        try:
+            if first_event is not None:
+                if first_event.get("type") == "done":
+                    yield _sse(_done_payload(first_event["response"]))
+                    return
+                if first_event.get("type") in {"token", "replace"}:
+                    content_started = True
+                yield _sse(first_event)
+
+            for event in events:
+                event_type = event.get("type")
+                if event_type == "done":
+                    yield _sse(_done_payload(event["response"]))
+                    return
+                if event_type not in {"token", "status", "replace"}:
+                    continue
+                if event_type in {"token", "replace"}:
+                    content_started = True
+                yield _sse(event)
+        except Exception as exc:
+            log_exception_traceback(
+                logger,
+                "Streaming chat failed.",
+                exc,
+            )
+            yield _sse({
+                "type": "error",
+                "message": _stream_error_message(exc),
+                "partial": content_started,
+            })
+        finally:
+            close = getattr(events, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.debug(
+                        "Streaming chat generator close failed",
+                        exc_info=True,
+                    )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get(

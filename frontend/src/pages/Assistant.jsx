@@ -15,7 +15,6 @@ import {
 } from 'react-router-dom'
 
 import {
-  useMutation,
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query'
@@ -28,6 +27,7 @@ import { resolveAssistantGmailConnection } from '../services/gmailAccountSelecti
 import { conversationService } from '../services/conversationService.js'
 import { api } from '../lib/api.js'
 import AssistantMarkdown from '../components/AssistantMarkdown.jsx'
+import AssistantTypingIndicator from '../components/AssistantTypingIndicator.jsx'
 import {
   requireArrayResponse,
   requireConnectionsResponse,
@@ -84,13 +84,20 @@ function AssistantContent({ user }) {
   const [optimisticMessages, setOptimisticMessages] = useState([])
 
   const [error, setError] = useState('')
+  const [errorRestoredInput, setErrorRestoredInput] = useState(false)
   const [gmailSendNotice, setGmailSendNotice] = useState('')
   const [providerInfo, setProviderInfo] = useState(null)
+  const [isStreaming, setIsStreaming] = useState(false)
+  const [streamStatus, setStreamStatus] = useState('')
 
   const messagesEndRef = useRef(null)
+  const messagesContainerRef = useRef(null)
+  const atBottomRef = useRef(true)
+  const textareaRef = useRef(null)
   const pendingRequestRef = useRef(null)
   const notifiedSendProposalRef = useRef(null)
   const sendingRef = useRef(false)
+  const abortControllerRef = useRef(null)
 
   const hasRestoredRef = useRef(false)
   const lastRequestedIdRef = useRef(undefined)
@@ -257,32 +264,75 @@ function AssistantContent({ user }) {
     userId,
   ])
 
-  const messages = [
-    ...(messagesQuery.data || []),
-    ...optimisticMessages,
-  ]
+  const messages = useMemo(() => {
+    const combined = [
+      ...(messagesQuery.data || []),
+      ...optimisticMessages,
+    ]
+    const seen = new Set()
+    return combined.filter((item) => {
+      if (!item || !item.id || seen.has(item.id)) return false
+      seen.add(item.id)
+      return true
+    })
+  }, [messagesQuery.data, optimisticMessages])
+
+  // Drop optimistic copies once the persisted versions arrive.
+  useEffect(() => {
+    if (!Array.isArray(messagesQuery.data)) return
+    const serverIds = new Set(
+      messagesQuery.data.map((item) => item.id).filter(Boolean)
+    )
+    if (serverIds.size === 0) return
+    setOptimisticMessages((current) => {
+      const remaining = current.filter(
+        (item) => !serverIds.has(item.id)
+      )
+      return remaining.length === current.length
+        ? current
+        : remaining
+    })
+  }, [messagesQuery.data])
 
   const initializing =
     !userId ||
     conversationsQuery.isPending ||
     (
       Boolean(conversationId) &&
-      messagesQuery.isPending
+      messagesQuery.isPending &&
+      !isStreaming
     )
 
   // --------------------------------------------------
   // 4. Scroll to latest message
   // --------------------------------------------------
 
-  const scrollToBottom = useCallback(() => {
+  const scrollToBottom = useCallback((force = false) => {
+    if (!force && !atBottomRef.current) return
     requestAnimationFrame(() => {
       if (!isCurrentUserScope(userId)) return
       messagesEndRef.current?.scrollIntoView({
         behavior: 'smooth',
         block: 'end',
       })
+      atBottomRef.current = true
     })
   }, [isCurrentUserScope, userId])
+
+  function handleMessagesScroll(event) {
+    const element = event.currentTarget
+    const distanceFromBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight
+    atBottomRef.current = distanceFromBottom <= 120
+  }
+
+  // Keep the composer compact while still allowing comfortable multiline input.
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    textarea.style.height = 'auto'
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 144)}px`
+  }, [message])
 
   function updateApprovalMessage(item, updatedMessage) {
     if (!isCurrentUserScope(userId)) return
@@ -327,76 +377,10 @@ function AssistantContent({ user }) {
   }, [messages.length, scrollToBottom])
 
   // --------------------------------------------------
-  // 5. Send message mutation
+  // 5. Streaming send state
   // --------------------------------------------------
 
-  const sendMutation = useMutation({
-    mutationFn: async ({
-      content,
-      idempotencyKey,
-      existingConversationId,
-      selectedConnectionId,
-      userTimezone,
-      requestUserId,
-    }) => {
-      const requestIsCurrent = () =>
-        isCurrentUserScope(requestUserId)
-      if (!requestIsCurrent()) {
-        throw new Error('The active account changed during this request.')
-      }
-
-      let activeConversationId = existingConversationId
-
-      // Create a conversation only for the first message.
-      if (!activeConversationId) {
-        const title =
-          content.length > 197
-            ? `${content.slice(0, 197)}...`
-            : content
-
-        const conversation =
-          await conversationService.createConversation(title)
-
-        activeConversationId = conversation.id
-      }
-
-      try {
-        if (!requestIsCurrent()) {
-          throw new Error('The active account changed during this request.')
-        }
-        const response =
-          await conversationService.sendChatMessage(
-            activeConversationId,
-            content,
-            idempotencyKey,
-            selectedConnectionId || null,
-            userTimezone,
-          )
-
-        if (
-          !response?.user_message ||
-          !response?.assistant_message ||
-          response.conversation_id !== activeConversationId
-        ) {
-          throw new Error(
-            'Unexpected response from the AI backend.'
-          )
-        }
-
-        return {
-          response,
-          conversationId: activeConversationId,
-        }
-      } catch (err) {
-        // Preserve the created conversation ID for retry.
-        err.activeConversationId = activeConversationId
-        throw err
-      }
-    },
-  })
-
-  const sending = sendMutation.isPending
-    && sendMutation.variables?.requestUserId === userId
+  const sending = isStreaming
 
   // --------------------------------------------------
   // 6. Start a new chat
@@ -414,7 +398,10 @@ function AssistantContent({ user }) {
     setOptimisticMessages([])
     setMessage('')
     setError('')
+    setErrorRestoredInput(false)
     setProviderInfo(null)
+    setStreamStatus('')
+    setIsStreaming(false)
 
     pendingRequestRef.current = null
   }
@@ -422,6 +409,33 @@ function AssistantContent({ user }) {
   // --------------------------------------------------
   // 7. Submit message
   // --------------------------------------------------
+
+  // A terminally failed request can never be retried with the same key. Clear
+  // the retry metadata only when the backend confirms `failed` (either in the
+  // error itself or through the scoped status endpoint). Transport failures and
+  // uncertain outcomes keep the key so same-key replay stays duplicate-safe.
+  async function clearFailedRequestIfConfirmed(
+    conversationIdToCheck,
+    idempotencyKey,
+    explicitlyFailed,
+  ) {
+    let confirmed = Boolean(explicitlyFailed)
+    if (!confirmed && conversationIdToCheck && idempotencyKey) {
+      try {
+        const status = await conversationService.getChatRequestStatus(
+          conversationIdToCheck,
+          idempotencyKey,
+        )
+        confirmed = status?.status === 'failed'
+      } catch {
+        // Status is unavailable: treat the outcome as uncertain and keep the key.
+      }
+    }
+    if (confirmed && pendingRequestRef.current?.key === idempotencyKey) {
+      pendingRequestRef.current = null
+    }
+    return confirmed
+  }
 
   async function handleSubmit(event) {
     event.preventDefault()
@@ -433,8 +447,10 @@ function AssistantContent({ user }) {
 
     sendingRef.current = true
     setError('')
+    setErrorRestoredInput(false)
 
     const temporaryId = `pending-${crypto.randomUUID()}`
+    const temporaryAssistantId = `pending-assistant-${crypto.randomUUID()}`
     const configuredTimezone = user?.user_metadata?.timezone
     let userTimezone = 'Asia/Kolkata'
     if (typeof configuredTimezone === 'string' && configuredTimezone) {
@@ -462,6 +478,8 @@ function AssistantContent({ user }) {
     }
 
     const idempotencyKey = pendingRequestRef.current.key
+    const controller = new AbortController()
+    abortControllerRef.current = controller
 
     setOptimisticMessages((current) => [
       ...current,
@@ -471,200 +489,183 @@ function AssistantContent({ user }) {
         content,
         pending: true,
       },
+      {
+        id: temporaryAssistantId,
+        role: 'assistant',
+        content: '',
+        pending: true,
+        streaming: true,
+      },
     ])
 
     setMessage('')
-    scrollToBottom()
+    setIsStreaming(true)
+    setStreamStatus('')
+    atBottomRef.current = true
+    scrollToBottom(true)
+
+    let activeConversationId = conversationId
+    let contentStarted = false
 
     try {
-      const result = await sendMutation.mutateAsync({
-        content,
-        idempotencyKey,
-        existingConversationId: conversationId,
-        selectedConnectionId: selectedGmailConnectionId,
-        userTimezone,
-        requestUserId: userId,
-      })
-
-      if (!isCurrentUserScope(userId)) return
-
-      const {
-        response,
-        conversationId: activeId,
-      } = result
-      if (
-        /authorization is no longer valid|reconnect the selected account/i
-          .test(response.assistant_message.content)
-      ) {
-        queryClient.invalidateQueries({
-          queryKey: ['oauth-connections', userId],
-        })
+      if (!activeConversationId) {
+        const title =
+          content.length > 197
+            ? `${content.slice(0, 197)}...`
+            : content
+        const conversation =
+          await conversationService.createConversation(title)
+        if (!isCurrentUserScope(userId)) return
+        activeConversationId = conversation.id
+        setConversationId(activeConversationId)
       }
 
-      setConversationId(activeId)
-      newChatModeRef.current = false
+      await conversationService.streamChatMessage(
+        activeConversationId,
+        content,
+        idempotencyKey,
+        selectedGmailConnectionId || null,
+        userTimezone,
+        (evt) => {
+          if (!evt || !evt.type) return
+          if (!isCurrentUserScope(userId)) return
 
-      // Immediately update the cached messages.
-      queryClient.setQueryData(
-        ['conversation-messages', userId, activeId],
-        (current = []) => [
-          ...current.filter((item) => item.id !== temporaryId),
-          response.user_message,
-          response.assistant_message,
-        ]
+          if (evt.type === 'status') {
+            setStreamStatus(evt.message || '')
+            return
+          }
+
+          if (evt.type === 'token') {
+            contentStarted = true
+            setOptimisticMessages((current) =>
+              current.map((m) =>
+                m.id === temporaryAssistantId
+                  ? { ...m, content: (m.content || '') + (evt.content || '') }
+                  : m
+              )
+            )
+            scrollToBottom()
+            return
+          }
+
+          if (evt.type === 'replace') {
+            contentStarted = true
+            setOptimisticMessages((current) =>
+              current.map((m) =>
+                m.id === temporaryAssistantId
+                  ? { ...m, content: evt.content || '' }
+                  : m
+              )
+            )
+            scrollToBottom()
+            return
+          }
+
+          if (evt.type === 'done') {
+            const doneConvId = evt.conversation_id || activeConversationId
+            if (doneConvId) {
+              activeConversationId = doneConvId
+              setConversationId(doneConvId)
+            }
+            newChatModeRef.current = false
+            if (evt.provider || evt.model) {
+              setProviderInfo({ provider: evt.provider, model: evt.model })
+            }
+            pendingRequestRef.current = null
+            setOptimisticMessages((current) =>
+              current.map((m) => {
+                if (m.id === temporaryId && evt.user_message_id) {
+                  return { ...m, id: evt.user_message_id, pending: false }
+                }
+                if (m.id === temporaryAssistantId && evt.message_id) {
+                  return {
+                    ...m,
+                    id: evt.message_id,
+                    pending: false,
+                    streaming: false,
+                  }
+                }
+                return { ...m, pending: false, streaming: false }
+              })
+            )
+            setStreamStatus('')
+            setIsStreaming(false)
+            queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+            if (doneConvId) {
+              queryClient.invalidateQueries({
+                queryKey: ['conversation-messages', userId, doneConvId],
+              })
+            }
+            scrollToBottom(true)
+          }
+        },
+        controller.signal,
       )
-
-      setOptimisticMessages([])
-
-      setProviderInfo({
-        provider: response.provider,
-        model: response.model,
-      })
-
-      pendingRequestRef.current = null
-
-      // Refresh the conversation list in the background.
-      queryClient.invalidateQueries({
-        queryKey: ['conversations', userId],
-      })
-
-      scrollToBottom()
     } catch (err) {
       if (!isCurrentUserScope(userId)) return
 
-      if (err.activeConversationId) {
-        setConversationId(err.activeConversationId)
-
-        queryClient.invalidateQueries({
-          queryKey: ['conversations', userId],
-        })
-      }
-
-      const isRequestTimeout =
-        err?.timeout === true ||
-        err?.code === 'REQUEST_TIMEOUT' ||
-        err?.name === 'TimeoutError'
-      const isConflict =
-        err?.status === 409 || err?.status === '409'
-
-      // If the client timed out, attempt bounded read-only recovery polling using
-      // the same idempotency key/request context (no duplicate logical request).
-      if (isRequestTimeout && conversationId) {
-        const pollIntervalMs = 2000
-        const maxPollMs = 30000
-        const startedAt = Date.now()
-        let recovered = null
-        let terminalFailure = null
-        let stopPolling = false
-
-        while (!stopPolling && Date.now() - startedAt < maxPollMs) {
-          if (!isCurrentUserScope(userId)) return
-          try {
-            const statusResult = await conversationService.getChatRequestStatus(
-              conversationId,
-              idempotencyKey,
-            )
-            const status = statusResult?.status
-            if (
-              isCurrentUserScope(userId) &&
-              status === 'completed' &&
-              statusResult?.response
-            ) {
-              recovered = statusResult.response
-              stopPolling = true
-              break
-            }
-            if (status === 'failed') {
-              terminalFailure = statusResult?.error_message || 'The request failed.'
-              stopPolling = true
-              break
-            }
-            if (status !== 'processing') {
-              // Unknown/non-recoverable status for this flow; stop and let user retry safely.
-              stopPolling = true
-              break
-            }
-          } catch (statusErr) {
-            const statusCode = statusErr?.status
-            // Auth/permission/request-not-found should not be polled indefinitely.
-            if (statusCode === 401 || statusCode === 403 || statusCode === 404) {
-              terminalFailure = statusErr?.message || 'Unable to recover the request status.'
-              stopPolling = true
-              break
-            }
-            // Network/transient status-check failure: retry within the bounded window.
-          }
-
-          if (!stopPolling && Date.now() - startedAt < maxPollMs) {
-            await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
-          }
-        }
-
-        if (recovered && isCurrentUserScope(userId)) {
-          setConversationId(recovered.conversation_id || conversationId)
-          newChatModeRef.current = false
-          queryClient.setQueryData(
-            ['conversation-messages', userId, recovered.conversation_id || conversationId],
-            (current = []) => [
-              ...current.filter((item) => item.id !== temporaryId),
-              recovered.user_message,
-              recovered.assistant_message,
-            ]
-          )
-          setOptimisticMessages([])
-          setProviderInfo({
-            provider: recovered.provider,
-            model: recovered.model,
-          })
-          pendingRequestRef.current = null
-          setError('')
-          queryClient.invalidateQueries({
-            queryKey: ['conversations', userId],
-          })
-          scrollToBottom()
-          return
-        }
-
-        if (terminalFailure && isCurrentUserScope(userId)) {
-          pendingRequestRef.current = null
-          setOptimisticMessages((current) =>
-            current.filter((item) => item.id !== temporaryId)
-          )
-          setMessage(content)
-          setError(terminalFailure)
-          return
-        }
-      }
-
-      // Keep the same idempotency key for safe retry/recovery when the backend
-      // request may still be processing or already completed (e.g. frontend
-      // timeout before response). Clear it for definitive server-side failures.
-      if (!isRequestTimeout && !isConflict && err?.status >= 500) {
-        pendingRequestRef.current = null
-      }
-
-      setOptimisticMessages((current) =>
-        current.filter((item) => item.id !== temporaryId)
+      const aborted = err?.name === 'AbortError'
+      const partial = Boolean(err?.partial) || contentStarted
+      const message = String(err?.message || '')
+      const explicitlyFailed = Boolean(
+        (err?.status === 409 || err?.streamError) &&
+          /previously failed/i.test(message),
       )
 
-      // Keep the draft available for retry.
-      setMessage(content)
+      // Only a confirmed terminal failure invalidates the key. Network and
+      // uncertain failures keep it for duplicate-safe same-key replay.
+      const terminalFailure = await clearFailedRequestIfConfirmed(
+        activeConversationId,
+        idempotencyKey,
+        explicitlyFailed,
+      )
+      const failureMessage = terminalFailure
+        ? 'The previous request failed. Retry to send this message as a new request.'
+        : message
 
-      if (isRequestTimeout) {
-        setError(
-          'The request is taking longer than expected. It may still be processing. ' +
-          'Please retry to safely check for the result; your message will not be sent twice.'
+      if (partial || aborted) {
+        // Keep whatever was already rendered; never duplicate it.
+        setOptimisticMessages((current) =>
+          current.map((item) =>
+            item.id === temporaryAssistantId
+              ? { ...item, pending: false, streaming: false }
+              : { ...item, pending: false }
+          )
         )
+        setError(
+          aborted && !terminalFailure
+            ? 'Response stopped before it finished.'
+            : (failureMessage || 'The response was interrupted.')
+        )
+        setErrorRestoredInput(false)
       } else {
-        setError(
-          err.message ||
-          'Unable to process your message. Please try again.'
+        setOptimisticMessages((current) =>
+          current.filter(
+            (item) =>
+              item.id !== temporaryId && item.id !== temporaryAssistantId
+          )
         )
+        setMessage(content)
+        setError(
+          failureMessage ||
+            'Unable to process your message. Please try again.'
+        )
+        setErrorRestoredInput(true)
       }
     } finally {
       if (isCurrentUserScope(userId)) {
         sendingRef.current = false
+        setIsStreaming(false)
+        setStreamStatus('')
+        abortControllerRef.current = null
       }
+    }
+  }
+
+  function handleStop() {
+    const controller = abortControllerRef.current
+    if (controller) {
+      controller.abort()
     }
   }
 
@@ -754,7 +755,7 @@ function AssistantContent({ user }) {
               {initializing
                 ? 'Restoring your conversation...'
                 : sending
-                  ? 'Processing your message...'
+                  ? (streamStatus || 'Generating response...')
                   : providerInfo
                     ? `${providerInfo.provider} · ${providerInfo.model}`
                     : conversationId
@@ -764,17 +765,23 @@ function AssistantContent({ user }) {
           </div>
 
           <span className="flex items-center gap-2 text-xs text-emerald-400">
-            <span className="h-2 w-2 rounded-full bg-emerald-400" />
+            <span className={`h-1.5 w-1.5 rounded-full ${
+              sending ? 'bg-violet-400' : 'bg-emerald-400'
+            }`} />
             {initializing
               ? 'Loading...'
               : sending
-                ? 'Thinking...'
+                ? 'Active'
                 : 'Ready'}
           </span>
         </div>
 
         {/* Messages */}
-        <div className="flex flex-1 flex-col gap-6 overflow-y-auto p-4 sm:p-6">
+        <div
+          ref={messagesContainerRef}
+          onScroll={handleMessagesScroll}
+          className="flex flex-1 flex-col gap-5 overflow-y-auto overscroll-contain p-4 sm:p-6"
+        >
 
           {initializing ? (
             <div className={`m-auto py-10 text-sm ${muted}`}>
@@ -829,12 +836,14 @@ function AssistantContent({ user }) {
                 }`}
               >
                 <div
-                  className={`min-w-0 w-full max-w-[90%] rounded-2xl px-4 py-3 text-sm leading-7 sm:max-w-[85%] ${
+                  className={`min-w-0 rounded-2xl px-4 py-3 text-sm leading-7 shadow-sm ${
                     item.role === 'user'
-                      ? 'rounded-br-sm bg-gradient-to-r from-violet-600 to-indigo-600 text-white'
-                      : isDark
-                        ? 'rounded-bl-sm bg-[#202333] text-slate-200'
-                        : 'rounded-bl-sm bg-slate-100 text-slate-800'
+                      ? 'w-fit max-w-[88%] rounded-br-sm bg-gradient-to-r from-violet-600 to-indigo-600 text-white sm:max-w-[75%]'
+                      : 'w-full max-w-[95%] rounded-bl-sm sm:max-w-[88%] ' + (
+                        isDark
+                          ? 'bg-[#202333] text-slate-200'
+                          : 'bg-slate-100 text-slate-800'
+                      )
                   }`}
                 >
                   {item.role === 'assistant' ? (
@@ -844,6 +853,11 @@ function AssistantContent({ user }) {
                       {item.content}
                     </div>
                   )}
+                  {item.role === 'assistant' &&
+                    item.streaming &&
+                    !item.content && (
+                      <AssistantTypingIndicator />
+                    )}
                   {item.role === 'assistant' &&
                     item.metadata?.response_completion?.status ===
                       'truncated' && (
@@ -900,16 +914,6 @@ function AssistantContent({ user }) {
             ))
           )}
 
-          {sending && (
-            <div className="flex justify-start">
-              <div className={`rounded-xl px-4 py-3 text-xs ${muted} ${
-                isDark ? 'bg-[#202333]' : 'bg-slate-100'
-              }`}>
-                AI is thinking...
-              </div>
-            </div>
-          )}
-
           <div ref={messagesEndRef} />
         </div>
 
@@ -918,9 +922,11 @@ function AssistantContent({ user }) {
           <div className="mx-4 mb-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-400 sm:mx-5">
             {error}
 
-            <p className="mt-1 text-xs">
-              Your message is still in the input. You can retry it.
-            </p>
+            {errorRestoredInput && (
+              <p className="mt-1 text-xs">
+                Your message is still in the input. You can retry it.
+              </p>
+            )}
           </div>
         )}
         {gmailSendNotice && (
@@ -933,12 +939,14 @@ function AssistantContent({ user }) {
         )}
 
         {/* Message composer */}
-        <div className={`border-t p-4 sm:p-5 ${
-          isDark ? 'border-[#252838]' : 'border-slate-200'
+        <div className={`border-t px-4 pb-4 pt-3 sm:px-6 sm:pb-5 ${
+          isDark
+            ? 'border-[#252838] bg-[#161926]/60'
+            : 'border-slate-200 bg-slate-50/60'
         }`}>
           {selectedGmailConnection && (
-            <div className={`mb-3 flex flex-wrap items-center justify-between gap-2 text-xs ${muted}`}>
-              <span>
+            <div className={`mb-2.5 flex flex-wrap items-center justify-between gap-2 text-[11px] ${muted}`}>
+              <span className="truncate">
                 Gmail ready · {selectedGmailConnection.email || 'Connected account'}
               </span>
               <Link
@@ -950,12 +958,13 @@ function AssistantContent({ user }) {
             </div>
           )}
           <form onSubmit={handleSubmit}>
-            <div className={`flex items-end gap-2 rounded-2xl border p-2 ${
+            <div className={`flex items-end gap-2 rounded-[1.25rem] border p-2 shadow-sm transition focus-within:border-violet-500/60 focus-within:ring-2 focus-within:ring-violet-500/15 ${
               isDark
                 ? 'border-[#303448] bg-[#171a27]'
-                : 'border-slate-200 bg-slate-50'
+                : 'border-slate-200 bg-white'
             }`}>
               <textarea
+                ref={textareaRef}
                 value={message}
                 onChange={(event) => setMessage(event.target.value)}
                 onKeyDown={(event) => {
@@ -969,29 +978,60 @@ function AssistantContent({ user }) {
                   }
                 }}
                 placeholder="Message your personal AI..."
-                rows={2}
+                rows={1}
                 maxLength={20000}
                 disabled={sending || initializing}
-                className={`max-h-36 min-h-12 flex-1 resize-none bg-transparent px-3 py-3 text-sm outline-none disabled:opacity-60 ${
+                className={`max-h-36 min-h-[2.75rem] flex-1 resize-none bg-transparent px-3 py-2.5 text-sm leading-6 outline-none placeholder:text-slate-500 disabled:cursor-not-allowed disabled:opacity-50 ${
                   isDark
-                    ? 'text-white placeholder:text-slate-500'
-                    : 'text-slate-800 placeholder:text-slate-400'
+                    ? 'text-white'
+                    : 'text-slate-800'
                 }`}
               />
+
+              {sending && (
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  className="mb-0.5 flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-red-500/40 px-3 text-xs font-semibold text-red-400 transition hover:bg-red-500/10"
+                  aria-label="Stop generating"
+                >
+                  <span className="h-2 w-2 rounded-[2px] bg-current" aria-hidden="true" />
+                  Stop
+                </button>
+              )}
 
               <button
                 type="submit"
                 disabled={!message.trim() || sending || initializing}
-                className="mb-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 text-lg text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+                className="mb-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 text-white shadow-lg shadow-violet-950/30 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
                 aria-label="Send message"
               >
-                {sending ? '…' : '↑'}
+                <svg
+                  viewBox="0 0 24 24"
+                  className="h-4 w-4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M12 19V5" />
+                  <path d="m5 12 7-7 7 7" />
+                </svg>
               </button>
             </div>
 
-            <div className={`mt-3 flex flex-col justify-between gap-2 text-[11px] sm:flex-row sm:items-center ${muted}`}>
-              <span>Enter to send · Shift + Enter for a new line</span>
-              <span>Messages are processed by your AI backend.</span>
+            <div className={`mt-2 flex flex-col gap-1 text-[10px] sm:flex-row sm:items-center sm:justify-between ${muted}`}>
+              <span>
+                <kbd className="rounded border border-current/20 px-1">Enter</kbd>
+                {' '}to send ·{' '}
+                <kbd className="rounded border border-current/20 px-1">Shift + Enter</kbd>
+                {' '}for a new line
+              </span>
+              <span className="hidden sm:inline">
+                Messages are processed by your AI backend.
+              </span>
             </div>
           </form>
         </div>

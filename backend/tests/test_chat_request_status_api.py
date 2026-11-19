@@ -284,3 +284,35 @@ def test_failed_request_status_returns_terminal_error_without_duplicate_executio
         assert repo.reconcile_calls == 0
     finally:
         app.dependency_overrides.pop(chat_endpoint.get_chat_service, None)
+
+
+def test_failed_request_status_is_not_visible_to_other_users_or_conversations(client):
+    idem = uuid4()
+    repo = FakeRepo({
+        "id": uuid4(),
+        "user_id": OTHER_USER_ID,
+        "conversation_id": CONVERSATION_ID,
+        "idempotency_key": idem,
+        "status": "failed",
+        "user_message_id": None,
+        "assistant_message_id": None,
+        "error_message": "private failure",
+    })
+    svc = _service(FakeMessageService(), repo)
+    app.dependency_overrides[chat_endpoint.get_chat_service] = lambda: svc
+    try:
+        other_user = client.get(
+            f"/api/v1/chat/requests/{idem}",
+            params={"conversation_id": str(CONVERSATION_ID)},
+        )
+        assert other_user.status_code == 404
+
+        repo.record["user_id"] = USER_ID
+        other_conversation = client.get(
+            f"/api/v1/chat/requests/{idem}",
+            params={"conversation_id": str(OTHER_CONVERSATION_ID)},
+        )
+        assert other_conversation.status_code == 404
+        assert repo.reconcile_calls == 0
+    finally:
+        app.dependency_overrides.pop(chat_endpoint.get_chat_service, None)

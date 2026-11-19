@@ -85,10 +85,18 @@ def test_exact_contact_mapping_all_numbers_associated(monkeypatch):
     def search_contacts(args):
         return _env_ok({"contacts": [SUBHRO, SUBHRO_EMOJI]})
 
+    def get_contact(args):
+        rn = args.get("resource_name")
+        if rn == SUBHRO["resource_name"]:
+            return _env_ok(SUBHRO)
+        if rn == SUBHRO_EMOJI["resource_name"]:
+            return _env_ok(SUBHRO_EMOJI)
+        return _env_ok({})
+
     _mock_tools(monkeypatch, {
         "search_contacts": search_contacts,
         "list_contacts": lambda a: _env_ok({}),
-        "get_contact": lambda a: _env_ok({}),
+        "get_contact": get_contact,
     })
     # If LLM were consulted, it must not affect output.
     monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse(
@@ -128,10 +136,18 @@ def test_no_hallucinated_numbers_and_missing_phone(monkeypatch):
     def search_contacts(args):
         return _env_ok({"contacts": [SUBHRO, subhro_no_phone]})
 
+    def get_contact(args):
+        rn = args.get("resource_name")
+        if rn == SUBHRO["resource_name"]:
+            return _env_ok(SUBHRO)
+        if rn == subhro_no_phone["resource_name"]:
+            return _env_ok(subhro_no_phone)
+        return _env_ok({})
+
     _mock_tools(monkeypatch, {
         "search_contacts": search_contacts,
         "list_contacts": lambda a: _env_ok({}),
-        "get_contact": lambda a: _env_ok({}),
+        "get_contact": get_contact,
     })
     monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse(HALLUCINATED))
 
@@ -173,10 +189,17 @@ def test_similar_names_and_emoji_preserve_identity(monkeypatch):
     def search_contacts(args):
         return _env_ok({"contacts": contacts})
 
+    def get_contact(args):
+        rn = args.get("resource_name")
+        for c in contacts:
+            if c.get("resource_name") == rn:
+                return _env_ok(c)
+        return _env_ok({})
+
     _mock_tools(monkeypatch, {
         "search_contacts": search_contacts,
         "list_contacts": lambda a: _env_ok({}),
-        "get_contact": lambda a: _env_ok({}),
+        "get_contact": get_contact,
     })
     result = contacts_read.generate_contacts_read_response(
         user_id="user-1",
@@ -199,10 +222,18 @@ def test_stale_context_does_not_override_fresh_contacts_data(monkeypatch):
         calls["search"] += 1
         return _env_ok({"contacts": [SUBHRO, SUBHRO_EMOJI]})
 
+    def get_contact(args):
+        rn = args.get("resource_name")
+        if rn == SUBHRO["resource_name"]:
+            return _env_ok(SUBHRO)
+        if rn == SUBHRO_EMOJI["resource_name"]:
+            return _env_ok(SUBHRO_EMOJI)
+        return _env_ok({})
+
     _mock_tools(monkeypatch, {
         "search_contacts": search_contacts,
         "list_contacts": lambda a: _env_ok({}),
-        "get_contact": lambda a: _env_ok({}),
+        "get_contact": get_contact,
     })
     monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse(HALLUCINATED))
 

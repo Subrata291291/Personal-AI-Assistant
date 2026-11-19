@@ -138,7 +138,15 @@ def test_single_match_with_phone_uses_search_and_trusted_render(monkeypatch):
             }]
         })
 
-    _mock_tools(monkeypatch, {"search_contacts": search_contacts, "list_contacts": lambda a: _env_ok({}), "get_contact": lambda a: _env_ok({})})
+    def get_contact(args):
+        return _env_ok({
+            "resource_name": "people/1",
+            "display_name": "Rintu",
+            "primary_phone": "+8801700000000",
+            "phones": [{"value": "+8801700000000", "primary": True}],
+        })
+
+    _mock_tools(monkeypatch, {"search_contacts": search_contacts, "list_contacts": lambda a: _env_ok({}), "get_contact": get_contact})
 
     def fake_generate(req):
         calls["llm"] += 1
@@ -167,7 +175,15 @@ def test_single_match_with_email(monkeypatch):
             }]
         })
 
-    _mock_tools(monkeypatch, {"search_contacts": search_contacts, "list_contacts": lambda a: _env_ok({}), "get_contact": lambda a: _env_ok({})})
+    def get_contact(args):
+        return _env_ok({
+            "resource_name": "people/2",
+            "display_name": "Rahul",
+            "primary_email": "rahul@example.com",
+            "emails": [{"value": "rahul@example.com", "primary": True}],
+        })
+
+    _mock_tools(monkeypatch, {"search_contacts": search_contacts, "list_contacts": lambda a: _env_ok({}), "get_contact": get_contact})
     monkeypatch.setattr(contacts_read.llm_router, "generate", lambda req: _LLMResponse("Rahul's email is rahul@example.com."))
 
     result = generate_contacts_read_response(
@@ -189,7 +205,15 @@ def test_contact_without_requested_phone(monkeypatch):
             }]
         })
 
-    _mock_tools(monkeypatch, {"search_contacts": search_contacts, "list_contacts": lambda a: _env_ok({}), "get_contact": lambda a: _env_ok({})})
+    def get_contact(args):
+        return _env_ok({
+            "resource_name": "people/3",
+            "display_name": "Rintu",
+            "primary_email": "rintu@example.com",
+            "emails": [{"value": "rintu@example.com"}],
+        })
+
+    _mock_tools(monkeypatch, {"search_contacts": search_contacts, "list_contacts": lambda a: _env_ok({}), "get_contact": get_contact})
 
     def fake_generate(req):
         captured["payload"] = req.messages[1].content
@@ -216,7 +240,15 @@ def test_contact_without_requested_email(monkeypatch):
             }]
         })
 
-    _mock_tools(monkeypatch, {"search_contacts": search_contacts, "list_contacts": lambda a: _env_ok({}), "get_contact": lambda a: _env_ok({})})
+    def get_contact(args):
+        return _env_ok({
+            "resource_name": "people/4",
+            "display_name": "Rahul",
+            "primary_phone": "123",
+            "phones": [{"value": "123"}],
+        })
+
+    _mock_tools(monkeypatch, {"search_contacts": search_contacts, "list_contacts": lambda a: _env_ok({}), "get_contact": get_contact})
 
     def fake_generate(req):
         captured["payload"] = req.messages[1].content

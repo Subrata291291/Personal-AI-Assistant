@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from app.integrations.google.exceptions import GoogleAPIError
 from app.llm.router import llm_router
 from app.llm.schemas import LLMMessage, LLMRequest
+from app.llm.streaming import emit_replace, emit_status, generate_or_stream
 from app.schemas.gmail_agent import (
     ApprovalWorkflowPlan,
     AssistantIntent,
@@ -3122,6 +3123,37 @@ def _deterministic_draft_plan(state: ChatState) -> dict[str, Any] | None:
     ).model_dump(mode="json")
 
 
+def _explicit_new_email_with_recipient_plan(
+    state: ChatState,
+) -> dict[str, Any] | None:
+    """Only trust a deterministic plan for a new email with a typed recipient.
+
+    An address supplied directly by the user is a recipient, not a Gmail
+    search query. This helper is deliberately narrow: replies, forwards,
+    searches, summaries and generic compose requests are left to the normal
+    planner so existing behaviour is preserved.
+    """
+
+    plan = _deterministic_draft_plan(state)
+    if not isinstance(plan, dict):
+        return None
+    if plan.get("draft_type") != "new":
+        return None
+    if plan.get("intent") not in {
+        "gmail_compose",
+        "gmail_send",
+        "gmail_save_draft",
+    }:
+        return None
+    recipients = plan.get("to")
+    if not isinstance(recipients, list) or not any(
+        isinstance(address, str) and address.strip()
+        for address in recipients
+    ):
+        return None
+    return plan
+
+
 def _deterministic_assistant_plan(
     state: ChatState,
 ) -> tuple[dict[str, Any], str] | None:
@@ -3754,9 +3786,21 @@ def _is_calendar_request(user_message: str) -> bool:
         r"reschedule|invite|rsvp|set|put|status|has|created|exists?)\b",
         lowered,
     ))
+    # "delete Gym time 8am to 9am" omits the word calendar/event but is still a
+    # precise Calendar deletion request when it includes a spoken time range.
+    delete_with_spoken_range = bool(
+        re.search(r"\b(?:delete|remove|cancel)\b", lowered)
+        and re.search(
+            r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+            r"\s*(?:to|[-–—])\s*"
+            r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
+            lowered,
+        )
+    )
     return (
         asks_calendar and has_action
         or (google_calendar_phrase and has_action)
+        or delete_with_spoken_range
         or bool(re.search(
             r"\b(?:am i|are we|is it)\b.{0,30}\b(?:free|available)\b",
             lowered,
@@ -4791,6 +4835,21 @@ def gmail_intent_router_node(state: ChatState) -> dict[str, Any]:
             "model": response.model,
         }
 
+    # A direct send/compose instruction with an explicit recipient address is
+    # authoritative. Do not let a planner turn that address into a Gmail query.
+    forced_draft = _explicit_new_email_with_recipient_plan(state)
+    if forced_draft is not None:
+        try:
+            plan = DraftEmailPlan.model_validate(forced_draft)
+        except ValidationError:
+            logger.warning(
+                "Could not apply the explicit-recipient compose guard."
+            )
+        else:
+            logger.info(
+                "Gmail planner overridden by explicit-recipient compose guard."
+            )
+
     normalized_plan = plan.model_dump(mode="json")
     selected_route = (
         plan.intent
@@ -4863,6 +4922,8 @@ def gmail_agent_node(
 ) -> dict[str, Any]:
     plan_data = state.get("gmail_plan") or {}
     intent = plan_data.get("intent", "")
+    if intent in SUPPORTED_READ_INTENTS:
+        emit_status("Searching Gmail...")
     if (
         runtime.context.get("gmail_enabled", True) is False
         and (
@@ -6079,7 +6140,7 @@ def gmail_response_node(
             }
             is_email_summary = intent in summary_intents
             try:
-                response = llm_router.generate(
+                response = generate_or_stream(
                     LLMRequest(
                         messages=[
                             LLMMessage(
@@ -6177,6 +6238,9 @@ def gmail_response_node(
                 )
                 provider = state.get("provider", "")
                 model = state.get("model", "")
+                # Any partial tokens already reached the client; replace them
+                # so the rendered answer matches the persisted one.
+                emit_replace(answer)
 
     user_message = {
         "role": "user",
