@@ -28,10 +28,81 @@ import { conversationService } from '../services/conversationService.js'
 import { api } from '../lib/api.js'
 import AssistantMarkdown from '../components/AssistantMarkdown.jsx'
 import AssistantTypingIndicator from '../components/AssistantTypingIndicator.jsx'
+import TransientStatus from '../components/TransientStatus.jsx'
 import {
   requireArrayResponse,
   requireConnectionsResponse,
 } from '../lib/responseValidation'
+
+const OUTPUT_LIMIT_NOTICE =
+  'The AI reached its output limit. This answer contains only the verified content shown above; narrow the request for a smaller result.'
+
+function completionNotices(completion) {
+  if (!completion || typeof completion !== 'object') return []
+
+  const status = String(completion.status || '').toLowerCase()
+  const outputLimited = Boolean(completion.output_limited)
+  const notices = []
+
+  if (status === 'failed') {
+    notices.push(
+      'This response could not be completed. No email details were verified.',
+    )
+  } else if (status === 'cancelled') {
+    notices.push(
+      'This response was cancelled before email summaries were generated.',
+    )
+  } else if (status === 'partial') {
+    const requested = Number(completion.requested_item_count)
+    const processed = Number(completion.processed_item_count)
+    const remaining = Number(completion.remaining_item_count)
+    const details = []
+    if (Number.isFinite(requested) && Number.isFinite(processed)) {
+      details.push(`${processed} of ${requested} requested items were processed`)
+    }
+    if (Number.isFinite(remaining) && remaining > 0) {
+      details.push(
+        `${remaining} item${remaining === 1 ? '' : 's'} remain${remaining === 1 ? 's' : ''}`,
+      )
+    }
+    notices.push(
+      details.length
+        ? `This response is partial. ${details.join('; ')}.`
+        : 'This response is partial. Some requested items were not included.',
+    )
+  } else if (status === 'truncated') {
+    notices.push(OUTPUT_LIMIT_NOTICE)
+  } else if (status === 'unknown') {
+    notices.push(
+      'This response may be incomplete; its completion status could not be verified.',
+    )
+  }
+
+  if (outputLimited && status !== 'truncated') {
+    notices.push(OUTPUT_LIMIT_NOTICE)
+  }
+
+  return notices
+}
+
+function CompletionNotice({ completion }) {
+  const notices = completionNotices(completion)
+  if (notices.length === 0) return null
+
+  return (
+    <div className="mt-3 space-y-1 border-t border-current/15 pt-2">
+      {notices.map((notice) => (
+        <p
+          key={notice}
+          role="status"
+          className="text-xs leading-5 opacity-80"
+        >
+          {notice}
+        </p>
+      ))}
+    </div>
+  )
+}
 
 function Assistant() {
   const { user } = useAuth()
@@ -89,6 +160,7 @@ function AssistantContent({ user }) {
   const [providerInfo, setProviderInfo] = useState(null)
   const [isStreaming, setIsStreaming] = useState(false)
   const [streamStatus, setStreamStatus] = useState('')
+  const [postContentStatus, setPostContentStatus] = useState('')
 
   const messagesEndRef = useRef(null)
   const messagesContainerRef = useRef(null)
@@ -401,7 +473,9 @@ function AssistantContent({ user }) {
     setErrorRestoredInput(false)
     setProviderInfo(null)
     setStreamStatus('')
+    setPostContentStatus('')
     setIsStreaming(false)
+    setGmailSendNotice('')
 
     pendingRequestRef.current = null
   }
@@ -462,13 +536,24 @@ function AssistantContent({ user }) {
       }
     }
 
-    // Reuse the same idempotency key for the same retry.
-    if (
-      !pendingRequestRef.current ||
-      pendingRequestRef.current.content !== content ||
-      pendingRequestRef.current.connectionId !== selectedGmailConnectionId ||
-      pendingRequestRef.current.userTimezone !== userTimezone
-    ) {
+    // Reuse the same idempotency key for the same retry. A same-key replay
+    // supersedes the previous optimistic pair so a stopped attempt cannot
+    // remain visible alongside the retried one.
+    const previousRequest = pendingRequestRef.current
+    const reuseKey = Boolean(
+      previousRequest &&
+        previousRequest.content === content &&
+        previousRequest.connectionId === selectedGmailConnectionId &&
+        previousRequest.userTimezone === userTimezone,
+    )
+    const supersededIds = reuseKey
+      ? [
+          previousRequest.userMessageId,
+          previousRequest.assistantMessageId,
+        ].filter(Boolean)
+      : []
+
+    if (!reuseKey) {
       pendingRequestRef.current = {
         content,
         key: crypto.randomUUID(),
@@ -476,13 +561,15 @@ function AssistantContent({ user }) {
         userTimezone,
       }
     }
+    pendingRequestRef.current.userMessageId = temporaryId
+    pendingRequestRef.current.assistantMessageId = temporaryAssistantId
 
     const idempotencyKey = pendingRequestRef.current.key
     const controller = new AbortController()
     abortControllerRef.current = controller
 
     setOptimisticMessages((current) => [
-      ...current,
+      ...current.filter((item) => !supersededIds.includes(item.id)),
       {
         id: temporaryId,
         role: 'user',
@@ -501,6 +588,7 @@ function AssistantContent({ user }) {
     setMessage('')
     setIsStreaming(true)
     setStreamStatus('')
+    setPostContentStatus('')
     atBottomRef.current = true
     scrollToBottom(true)
 
@@ -531,12 +619,20 @@ function AssistantContent({ user }) {
           if (!isCurrentUserScope(userId)) return
 
           if (evt.type === 'status') {
-            setStreamStatus(evt.message || '')
+            const statusText = evt.message || ''
+            // Before the first token this belongs beside the typing indicator.
+            // Afterward it must stay visible as an inline progress line.
+            if (contentStarted) setPostContentStatus(statusText)
+            else setStreamStatus(statusText)
             return
           }
 
           if (evt.type === 'token') {
             contentStarted = true
+            // Real text is now on screen; the thinking indicator has served
+            // its purpose and must not linger next to the streamed answer.
+            // Post-content progress stays until a new status or done event.
+            setStreamStatus('')
             setOptimisticMessages((current) =>
               current.map((m) =>
                 m.id === temporaryAssistantId
@@ -550,6 +646,7 @@ function AssistantContent({ user }) {
 
           if (evt.type === 'replace') {
             contentStarted = true
+            setStreamStatus('')
             setOptimisticMessages((current) =>
               current.map((m) =>
                 m.id === temporaryAssistantId
@@ -563,6 +660,10 @@ function AssistantContent({ user }) {
 
           if (evt.type === 'done') {
             const doneConvId = evt.conversation_id || activeConversationId
+            const doneCompletion =
+              evt.completion && typeof evt.completion === 'object'
+                ? evt.completion
+                : null
             if (doneConvId) {
               activeConversationId = doneConvId
               setConversationId(doneConvId)
@@ -573,22 +674,38 @@ function AssistantContent({ user }) {
             }
             pendingRequestRef.current = null
             setOptimisticMessages((current) =>
-              current.map((m) => {
-                if (m.id === temporaryId && evt.user_message_id) {
-                  return { ...m, id: evt.user_message_id, pending: false }
-                }
-                if (m.id === temporaryAssistantId && evt.message_id) {
-                  return {
-                    ...m,
-                    id: evt.message_id,
-                    pending: false,
-                    streaming: false,
+              current
+                .map((m) => {
+                  if (
+                    m.id === temporaryAssistantId &&
+                    !(m.content || '').trim() &&
+                    !Object.keys(m.metadata || {}).some(
+                      (key) => key !== 'response_completion',
+                    )
+                  ) {
+                    // Done-only replay: no token content was streamed, so wait
+                    // for the persisted answer instead of an empty bubble.
+                    return null
                   }
-                }
-                return { ...m, pending: false, streaming: false }
-              })
+                  const next = { ...m, pending: false, streaming: false }
+                  if (m.id === temporaryId && evt.user_message_id) {
+                    next.id = evt.user_message_id
+                  }
+                  if (m.id === temporaryAssistantId && evt.message_id) {
+                    next.id = evt.message_id
+                  }
+                  if (m.id === temporaryAssistantId && doneCompletion) {
+                    next.metadata = {
+                      ...(m.metadata || {}),
+                      response_completion: doneCompletion,
+                    }
+                  }
+                  return next
+                })
+                .filter(Boolean)
             )
             setStreamStatus('')
+            setPostContentStatus('')
             setIsStreaming(false)
             queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
             if (doneConvId) {
@@ -623,14 +740,41 @@ function AssistantContent({ user }) {
         ? 'The previous request failed. Retry to send this message as a new request.'
         : message
 
-      if (partial || aborted) {
-        // Keep whatever was already rendered; never duplicate it.
+      if (aborted && !contentStarted) {
+        // Stopped before any answer arrived: keep the user's message, but do
+        // not leave an empty assistant bubble behind.
         setOptimisticMessages((current) =>
-          current.map((item) =>
-            item.id === temporaryAssistantId
-              ? { ...item, pending: false, streaming: false }
-              : { ...item, pending: false }
-          )
+          current.filter((item) => item.id !== temporaryAssistantId)
+        )
+        setError('Response stopped before it started.')
+        setErrorRestoredInput(false)
+      } else if (partial || aborted) {
+        // Keep whatever was already rendered; never duplicate it. A local Stop
+        // never reaches `done`, so record the cancellation in the optimistic
+        // bubble's completion metadata to surface the same notice.
+        const cancelledLocally = aborted && !terminalFailure
+        setOptimisticMessages((current) =>
+          current.map((item) => {
+            if (item.id !== temporaryAssistantId) {
+              return { ...item, pending: false }
+            }
+            return {
+              ...item,
+              pending: false,
+              streaming: false,
+              ...(cancelledLocally
+                ? {
+                    metadata: {
+                      ...(item.metadata || {}),
+                      response_completion: {
+                        ...(item.metadata?.response_completion || {}),
+                        status: 'cancelled',
+                      },
+                    },
+                  }
+                : {}),
+            }
+          })
         )
         setError(
           aborted && !terminalFailure
@@ -657,6 +801,7 @@ function AssistantContent({ user }) {
         sendingRef.current = false
         setIsStreaming(false)
         setStreamStatus('')
+        setPostContentStatus('')
         abortControllerRef.current = null
       }
     }
@@ -701,7 +846,7 @@ function AssistantContent({ user }) {
   // --------------------------------------------------
 
   return (
-    <div className="mx-auto flex min-h-[calc(100vh-150px)] w-full max-w-5xl flex-col">
+    <div className="mx-auto flex min-h-[calc(100dvh-150px)] w-full max-w-5xl flex-col">
 
       {/* Page heading */}
       <div className="mb-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
@@ -742,7 +887,7 @@ function AssistantContent({ user }) {
         <div className={`flex items-center gap-3 border-b px-4 py-4 sm:px-6 ${
           isDark ? 'border-[#252838]' : 'border-slate-200'
         }`}>
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-violet-500/15 to-indigo-600/15 ring-1 ring-violet-400/20 text-violet-300">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10 ring-1 ring-violet-400/20 text-violet-300">
             <MyOrbitLogo className="h-6 w-6" />
           </div>
 
@@ -755,7 +900,7 @@ function AssistantContent({ user }) {
               {initializing
                 ? 'Restoring your conversation...'
                 : sending
-                  ? (streamStatus || 'Generating response...')
+                  ? 'Generating response...'
                   : providerInfo
                     ? `${providerInfo.provider} · ${providerInfo.model}`
                     : conversationId
@@ -780,7 +925,7 @@ function AssistantContent({ user }) {
         <div
           ref={messagesContainerRef}
           onScroll={handleMessagesScroll}
-          className="flex flex-1 flex-col gap-5 overflow-y-auto overscroll-contain p-4 sm:p-6"
+          className="assistant-scrollport flex flex-1 flex-col gap-5 overflow-y-auto overscroll-contain p-4 sm:p-6"
         >
 
           {initializing ? (
@@ -789,7 +934,7 @@ function AssistantContent({ user }) {
             </div>
           ) : messages.length === 0 ? (
             <div className="m-auto flex w-full max-w-xl flex-col items-center py-10 text-center">
-              <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-500/20 to-indigo-500/20 text-4xl text-violet-400">
+              <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-violet-500/10 text-4xl text-violet-400">
                 ✧
               </div>
 
@@ -838,7 +983,7 @@ function AssistantContent({ user }) {
                 <div
                   className={`min-w-0 rounded-2xl px-4 py-3 text-sm leading-7 shadow-sm ${
                     item.role === 'user'
-                      ? 'w-fit max-w-[88%] rounded-br-sm bg-gradient-to-r from-violet-600 to-indigo-600 text-white sm:max-w-[75%]'
+                      ? 'w-fit max-w-[88%] rounded-br-sm bg-violet-600 text-white sm:max-w-[75%]'
                       : 'w-full max-w-[95%] rounded-bl-sm sm:max-w-[88%] ' + (
                         isDark
                           ? 'bg-[#202333] text-slate-200'
@@ -856,20 +1001,24 @@ function AssistantContent({ user }) {
                   {item.role === 'assistant' &&
                     item.streaming &&
                     !item.content && (
-                      <AssistantTypingIndicator />
+                      <AssistantTypingIndicator status={streamStatus} />
                     )}
                   {item.role === 'assistant' &&
-                    item.metadata?.response_completion?.status ===
-                      'truncated' && (
+                    item.streaming &&
+                    Boolean(item.content) &&
+                    postContentStatus && (
                       <p
                         role="status"
-                        className="mt-3 border-t border-current/15 pt-2 text-xs leading-5 opacity-80"
+                        className={`mt-2 text-xs ${muted}`}
                       >
-                        This response may be incomplete because the AI
-                        reached its output limit. Ask me to continue from
-                        where it stopped.
+                        {postContentStatus}
                       </p>
                     )}
+                  {item.role === 'assistant' && (
+                    <CompletionNotice
+                      completion={item.metadata?.response_completion}
+                    />
+                  )}
                   {item.role === 'assistant' &&
                     item.metadata?.email_draft && (
                       <EmailDraftCard
@@ -929,14 +1078,11 @@ function AssistantContent({ user }) {
             )}
           </div>
         )}
-        {gmailSendNotice && (
-          <div
-            role="status"
-            className="mx-4 mb-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-500 sm:mx-5"
-          >
-            {gmailSendNotice}
-          </div>
-        )}
+        <TransientStatus
+          message={gmailSendNotice}
+          onDismiss={() => setGmailSendNotice('')}
+          className="mx-4 mb-3 px-4 py-3 text-sm sm:mx-5"
+        />
 
         {/* Message composer */}
         <div className={`border-t px-4 pb-4 pt-3 sm:px-6 sm:pb-5 ${
@@ -1003,7 +1149,7 @@ function AssistantContent({ user }) {
               <button
                 type="submit"
                 disabled={!message.trim() || sending || initializing}
-                className="mb-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 text-white shadow-lg shadow-violet-950/30 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
+                className="mb-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-600 text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-40"
                 aria-label="Send message"
               >
                 <svg

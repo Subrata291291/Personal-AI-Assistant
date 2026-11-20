@@ -1,5 +1,19 @@
 @import "tailwindcss";
 
+/* Use the app's manual light/dark toggle instead of only the OS preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* The app has no color-scheme declaration, so Chromium paints the native
+   date-picker indicator dark in every theme. Match it to the manual theme
+   without hiding or replacing the native control. */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0);
+}
+
+.dark input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+}
+
 /* Assistant typing indicator: subtle sequential bounce, no animation library. */
 @keyframes assistant-typing-bounce {
   0%, 60%, 100% {
@@ -32,11 +46,49 @@
   }
 }
 
+/* Temporary action notices stay readable, then fade just before removal. */
+@keyframes transient-status-fade {
+  0%, 92% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.transient-status {
+  animation: transient-status-fade 4s ease-in-out forwards;
+}
+
+.transient-status--error {
+  animation-duration: 10s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transient-status,
+  .transient-status--error {
+    animation: none;
+  }
+}
+
+/* Hide native scrollbars only on intentional scroll containers. Scrolling itself
+   (wheel, trackpad, keyboard, touch) is untouched. */
+html,
+body,
+.scrollbar-hidden,
+.assistant-scrollport,
+.gmail-scrollbar,
+.assistant-markdown pre {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar,
+.scrollbar-hidden::-webkit-scrollbar,
+.assistant-scrollport::-webkit-scrollbar,
+.gmail-scrollbar::-webkit-scrollbar,
+.assistant-markdown pre::-webkit-scrollbar {
+  display: none;
+}
+
 .assistant-markdown {
   line-height: 1.7;
   overflow-wrap: anywhere;
-}
-
-.assistant-markdown pre {
-  scrollbar-width: thin;
 }

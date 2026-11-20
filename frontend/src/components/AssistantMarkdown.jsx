@@ -104,13 +104,13 @@ const markdownComponents = {
   pre: ({ children, ...props }) => (
     <pre
       {...props}
-      className="my-3 max-w-full overflow-x-auto rounded-lg bg-black/10 text-sm dark:bg-black/30"
+      className="scrollbar-hidden my-3 max-w-full overflow-x-auto rounded-lg bg-black/10 text-sm dark:bg-black/30"
     >
       {children}
     </pre>
   ),
   table: ({ children, ...props }) => (
-    <div className="my-4 max-w-full overflow-x-auto rounded-lg border border-current/15">
+    <div className="scrollbar-hidden my-4 max-w-full overflow-x-auto rounded-lg border border-current/15">
       <table {...props} className="w-full border-collapse text-left text-sm">
         {children}
       </table>

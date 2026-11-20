@@ -13,6 +13,7 @@ import {
   supabase,
 } from '../lib/supabase'
 import { queryClient } from '../lib/queryClient'
+import { clearPersistedQueryCache } from '../lib/queryPersistence'
 import { notifyApiAuthChange } from '../lib/api'
 import {
   withAuthTimeout,
@@ -61,6 +62,9 @@ export function AuthProvider({ children }) {
           queryClient.removeQueries({
             predicate: isPreviousUserQuery,
           })
+          // Remove the previous identity's IndexedDB snapshot as well; otherwise
+          // the next page load could restore another account's private data.
+          void clearPersistedQueryCache(previousUserId).catch(() => {})
         }
       }
 

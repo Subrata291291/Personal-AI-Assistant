@@ -490,7 +490,9 @@ def test_streaming_context_is_cleared_when_closed_from_another_context(
 
     assert streaming_enabled() is False
     assert "completed" not in repository.statuses
-    assert "failed" not in repository.statuses
+    # A disconnect before persistence is terminal, even when close() is
+    # invoked from another execution context.
+    assert "failed" in repository.statuses
     assert [message["role"] for message in messages.messages] == ["user"]
 
 
@@ -769,6 +771,25 @@ def test_provider_fallback_occurs_before_first_token():
     assert healthy.stream_calls == 1
 
 
+def test_empty_stream_falls_back_before_first_token():
+    empty = FakeProvider("groq", chunks=())
+    healthy = FakeProvider("openrouter", chunks=["ok", "!"])
+    manager = _manager(
+        {"groq": empty, "openrouter": healthy},
+        ["groq", "openrouter"],
+    )
+
+    received = list(
+        manager.stream(
+            LLMRequest(messages=[LLMMessage(role="user", content="hi")])
+        )
+    )
+
+    assert "".join(chunk.content for chunk in received) == "ok!"
+    assert empty.stream_calls == 1
+    assert healthy.stream_calls == 1
+
+
 def test_provider_failure_after_first_token_never_switches():
     partial = FakeProvider(
         "groq",
@@ -829,7 +850,7 @@ def test_midstream_failure_marks_request_failed_and_keeps_no_assistant(monkeypat
     assert streaming_enabled() is False
 
 
-def test_client_disconnect_does_not_complete_or_fail_request(monkeypatch):
+def test_client_disconnect_marks_unpersisted_request_failed(monkeypatch):
     delayed = DelayedStream()
     monkeypatch.setattr(router_module.llm_router, "stream", delayed.stream)
     graph = FakeStreamingGraph(_llm_node)
@@ -855,7 +876,7 @@ def test_client_disconnect_does_not_complete_or_fail_request(monkeypatch):
     delayed.release.set()
 
     assert "completed" not in repository.statuses
-    assert "failed" not in repository.statuses
+    assert "failed" in repository.statuses
     assert [m["role"] for m in messages.messages] == ["user"]
 
 

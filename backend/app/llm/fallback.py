@@ -749,31 +749,44 @@ class FallbackManager:
                 )
 
                 provider_started_at = perf_counter()
+                content_chunks = 0
                 try:
                     for chunk in provider.stream(attempt_request):
                         if chunk.content:
+                            content_chunks += 1
                             content_emitted = True
                         yield chunk
-                    provider_duration_ms = (
-                        perf_counter() - provider_started_at
-                    ) * 1000
-                    record_timing("llm_provider", provider_duration_ms)
-                    logger.info(
-                        "llm_provider_stream_completed | request_id=%s | provider=%s | model=%s "
-                        "| attempt=%s | duration_ms=%.2f",
-                        request_id(),
-                        provider_name,
-                        provider_model or "unknown",
-                        attempt_number,
-                        provider_duration_ms,
-                    )
-                    return
                 except Exception:
                     provider_duration_ms = (
                         perf_counter() - provider_started_at
                     ) * 1000
                     record_timing("llm_provider", provider_duration_ms)
                     raise
+
+                provider_duration_ms = (
+                    perf_counter() - provider_started_at
+                ) * 1000
+                record_timing("llm_provider", provider_duration_ms)
+
+                # A stream that produced no content is an empty provider
+                # response, not a successful generation. Classify it through
+                # the same failure path as adapters that raise for empty
+                # responses so fallback can happen before any token is emitted.
+                if content_chunks == 0:
+                    raise RuntimeError(
+                        f"Provider {provider_name} returned an empty response."
+                    )
+
+                logger.info(
+                    "llm_provider_stream_completed | request_id=%s | provider=%s | model=%s "
+                    "| attempt=%s | duration_ms=%.2f",
+                    request_id(),
+                    provider_name,
+                    provider_model or "unknown",
+                    attempt_number,
+                    provider_duration_ms,
+                )
+                return
 
             except Exception as error:
                 last_error = error

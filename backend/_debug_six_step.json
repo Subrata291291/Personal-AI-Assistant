@@ -10,7 +10,7 @@
       2,
       "google_calendar",
       "google_calendar",
-      "I prepared an approval request to delete **Personal AI Assistant - Calendar Test** (2026-11-10 11:00 AM IST to 2026-11-10 12:00 PM IST). Review the approval card below. Google Calendar will not be changed unless you approve and separately execute the request."
+      "I prepared an approval request to delete **Personal AI Assistant - Calendar Test**\n\nDelete details:\n- Title: Personal AI Assistant - Calendar Test\n- Calendar: primary\n- Scope: single event\n- Date: 2026-11-10\n- Start: 2026-11-10 11:00 AM IST\n- End: 2026-11-10 12:00 PM IST\n- Time zone: Asia/Kolkata. Review the approval card below. Google Calendar will not be changed unless you approve and separately execute the request."
     ],
     [
       3,

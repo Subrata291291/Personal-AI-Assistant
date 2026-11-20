@@ -12,7 +12,6 @@ import { Link, useOutletContext } from 'react-router-dom'
 import { api } from '../lib/api.js'
 import { formatRequestError } from '../lib/errorMessage.js'
 import { requireConnectionsResponse } from '../lib/responseValidation'
-import { SEMANTIC_STATUS_STYLES } from '../lib/semanticStatusStyles.js'
 import {
   GOOGLE_CONNECTIONS_STALE_TIME,
   PRIVATE_DATA_GC_TIME,
@@ -23,6 +22,8 @@ import { actionApprovalService } from '../services/actionApprovalService.js'
 import { useAuth } from '../context/AuthContext'
 import { sanitizeEmailHtml } from '../utils/sanitizeEmailHtml.js'
 import SenderAvatar from '../components/SenderAvatar.jsx'
+import GoogleServiceIcon from '../components/GoogleServiceIcon.jsx'
+import TransientStatus from '../components/TransientStatus.jsx'
 import {
   formatGmailTimestamp,
   sortGmailMessagesByReceivedTime,
@@ -1639,43 +1640,12 @@ export default function Gmail() {
   return (
     <div className="gmail-page space-y-6">
 
-      {/* Custom scrollbar styling */}
-      <style>{`
-        .gmail-page .gmail-scrollbar {
-          scrollbar-width: thin;
-          scrollbar-color: ${isDark ? '#555b70 transparent' : '#c0c5d0 transparent'};
-        }
-
-        .gmail-page .gmail-scrollbar::-webkit-scrollbar {
-          width: 8px;
-          height: 8px;
-        }
-
-        .gmail-page .gmail-scrollbar::-webkit-scrollbar-track {
-          background: transparent;
-        }
-
-        .gmail-page .gmail-scrollbar::-webkit-scrollbar-thumb {
-          background: ${isDark ? '#555b70' : '#c0c5d0'};
-          border-radius: 20px;
-          border: 2px solid transparent;
-          background-clip: padding-box;
-        }
-
-        .gmail-page .gmail-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: ${isDark ? '#737b94' : '#969eae'};
-          background-clip: padding-box;
-        }
-      `}</style>
-
       {/* Page heading */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 
         <div className="flex items-center gap-3">
 
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-red-500/10 text-2xl text-red-400">
-            ✉
-          </div>
+          <GoogleServiceIcon service="gmail" className="h-11 w-11" />
 
           <div>
             <h1 className={`text-2xl font-bold ${colors.heading}`}>
@@ -1690,6 +1660,46 @@ export default function Gmail() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {connectionsQuery.isLoading ? (
+            <p className={`text-xs ${colors.muted}`}>
+              Checking connected accounts...
+            </p>
+          ) : connectionsQuery.isError ? (
+            <div className="flex flex-wrap items-center gap-2 text-xs text-rose-500">
+              <span>{connectionsQuery.error.message}</span>
+              <button
+                type="button"
+                onClick={() => connectionsQuery.refetch()}
+                className="font-semibold underline"
+              >
+                Retry
+              </button>
+            </div>
+          ) : (
+            <>
+              <label className="sr-only" htmlFor="gmail-account">
+                Google account
+              </label>
+              <select
+                id="gmail-account"
+                aria-label="Google account"
+                value={connectionId}
+                onChange={(event) =>
+                  handleConnectionChange(event.target.value)
+                }
+                className={`max-w-[220px] rounded-lg border px-3 py-2 text-xs outline-none focus:border-violet-500 sm:max-w-[260px] ${colors.input}`}
+              >
+                <option value="">Select a Google account</option>
+
+                {googleConnections.map((account) => (
+                  <option key={account.id} value={account.id}>
+                    {account.email || 'Google account'}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
+
           <button
             type="button"
             onClick={() => openCompose('compose')}
@@ -1699,86 +1709,9 @@ export default function Gmail() {
             ✉ Compose
           </button>
 
-          <div className={`flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold ${
-            !connectionsVerified
-              ? SEMANTIC_STATUS_STYLES.neutral.badge
-              : selectedConnection && isGmailEnabled
-                ? SEMANTIC_STATUS_STYLES.positive.badge
-                : SEMANTIC_STATUS_STYLES.neutral.badge
-          }`}>
-            <span className={`h-2 w-2 rounded-full ${
-              !connectionsVerified
-                ? SEMANTIC_STATUS_STYLES.neutral.dot
-                : selectedConnection && isGmailEnabled
-                  ? SEMANTIC_STATUS_STYLES.positive.dot
-                  : SEMANTIC_STATUS_STYLES.neutral.dot
-            }`} />
-            {connectionsQuery.isError
-              ? 'Connection status unavailable'
-              : !connectionsVerified
-                ? 'Checking connection'
-                : !selectedConnection
-                  ? 'Disconnected'
-                  : isGmailEnabled
-                    ? 'Connected · Enabled'
-                    : 'Connected · Disabled'}
-          </div>
         </div>
 
       </div>
-
-      {/* Connected account selector */}
-      <section className={`rounded-2xl border p-5 ${colors.card}`}>
-
-        <label
-          htmlFor="gmail-account"
-          className={`mb-2 block text-sm font-semibold ${colors.text}`}
-        >
-          Connected Google account
-        </label>
-
-        {connectionsQuery.isLoading ? (
-          <p className={`text-sm ${colors.muted}`}>
-            Checking connected accounts...
-          </p>
-        ) : connectionsQuery.isError ? (
-          <div className="text-sm text-rose-500">
-            {connectionsQuery.error.message}
-
-            <button
-              type="button"
-              onClick={() => connectionsQuery.refetch()}
-              className="ml-2 underline"
-            >
-              Retry
-            </button>
-          </div>
-        ) : (
-          <select
-            id="gmail-account"
-            value={connectionId}
-            onChange={(event) =>
-              handleConnectionChange(event.target.value)
-            }
-            className={`w-full rounded-xl border px-4 py-3 text-sm outline-none focus:border-violet-500 sm:max-w-md ${colors.input}`}
-          >
-            <option value="">Select a Google account</option>
-
-            {googleConnections.map((account) => (
-              <option key={account.id} value={account.id}>
-                {account.email || 'Google account'}
-              </option>
-            ))}
-          </select>
-        )}
-
-        {connectionsVerified && selectedConnection && (
-          <p className={`mt-3 text-xs ${SEMANTIC_STATUS_STYLES.positive.text}`}>
-            Connected: {selectedConnection.email}
-          </p>
-        )}
-
-      </section>
 
       {/* Main Gmail layout */}
       <section className={`overflow-hidden rounded-2xl border ${colors.card}`}>
@@ -1837,18 +1770,6 @@ export default function Gmail() {
 
             </nav>
 
-            <div className={`mt-5 hidden border-t pt-4 md:block ${colors.divider}`}>
-              <p className={`px-3 text-xs ${colors.muted}`}>
-                Connected account
-              </p>
-
-              <p className={`mt-2 break-all px-3 text-xs font-medium ${colors.text}`}>
-                {connectionsVerified
-                  ? selectedConnection?.email || 'No account selected'
-                  : 'Checking connection status'}
-              </p>
-            </div>
-
           </aside>
 
           {/* Inbox content */}
@@ -1886,15 +1807,15 @@ export default function Gmail() {
 
               </div>
 
-              {trashNotice && (
-                <p
-                  role={trashNotice.type === 'error' ? 'alert' : 'status'}
-                  className={`px-5 pt-4 text-sm ${
-                    trashNotice.type === 'error'
-                      ? 'text-rose-500'
-                      : 'text-emerald-500'
-                  }`}
-                >
+              {trashNotice?.type !== 'error' && (
+                <TransientStatus
+                  message={trashNotice?.message || ''}
+                  onDismiss={() => setTrashNotice(null)}
+                  className="mx-5 mt-4 text-sm"
+                />
+              )}
+              {trashNotice?.type === 'error' && (
+                <p role="alert" className="px-5 pt-4 text-sm text-rose-500">
                   {trashNotice.message}
                 </p>
               )}
@@ -2288,14 +2209,11 @@ export default function Gmail() {
 
       </section>
 
-      {composeSuccess && (
-        <div
-          role="status"
-          className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-500"
-        >
-          {composeSuccess}
-        </div>
-      )}
+      <TransientStatus
+        message={composeSuccess}
+        onDismiss={() => setComposeSuccess('')}
+        className="px-4 py-3 text-sm"
+      />
 
       {/* Compose Email Modal */}
       {showCompose && canUseGmail && !gmailDataAccessDenied && (
@@ -2943,7 +2861,7 @@ export default function Gmail() {
                                     }
                                     rows={8}
                                     maxLength={20_000}
-                                    className={`min-h-[10rem] max-h-[40dvh] w-full resize-y overflow-y-auto rounded-lg border px-3 py-3 text-sm leading-6 outline-none focus:border-violet-500 ${colors.input}`}
+                                    className={`scrollbar-hidden min-h-[10rem] max-h-[40dvh] w-full resize-y overflow-y-auto rounded-lg border px-3 py-3 text-sm leading-6 outline-none focus:border-violet-500 ${colors.input}`}
                                   />
                                 </label>
                                 <p className={`text-xs ${colors.muted}`}>

@@ -189,7 +189,10 @@ function DashboardLayout() {
 
   return (
     <div
-      className={`min-h-screen overflow-x-hidden ${
+      data-testid="dashboard-shell"
+      className={`min-h-screen overflow-x-clip ${
+        isDark ? 'dark' : ''
+      } ${
         isDark
           ? 'bg-[#0b0d14] text-slate-100'
           : 'bg-[#f5f6fa] text-slate-800'
@@ -253,7 +256,7 @@ function DashboardLayout() {
         </div>
 
         {/* Navigation */}
-        <nav className="min-h-0 flex-1 space-y-7 overflow-y-auto overflow-x-hidden px-4 pb-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <nav className="scrollbar-hidden min-h-0 flex-1 space-y-7 overflow-y-auto overflow-x-hidden px-4 pb-4">
           {navigation.map((group) => (
             <div key={group.section}>
               <div className={`mb-3 px-3 text-xs font-bold tracking-[1.5px] ${muted}`}>
@@ -322,9 +325,11 @@ function DashboardLayout() {
 
                     {item.name === 'Connectors' && !connectionsQuery.isError && (
                       <span
-                        className={`rounded-full px-2 py-0.5 text-xs ${
-                          isDark ? 'bg-[#292d3c]' : 'bg-slate-200'
-                        }`}
+                        data-testid="connectors-count"
+                        aria-label={connectionsQuery.isLoading
+                          ? 'Checking connected services'
+                          : `${connectedServiceCount} connected services`}
+                        className={`inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full px-1.5 text-[11px] font-semibold leading-none tabular-nums ${SEMANTIC_STATUS_STYLES.positive.badge}`}
                       >
                         {connectionsQuery.isLoading ? '…' : connectedServiceCount}
                       </span>

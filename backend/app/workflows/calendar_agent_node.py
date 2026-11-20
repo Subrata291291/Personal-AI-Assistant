@@ -29,6 +29,8 @@ from app.workflows.calendar_create_draft import (
     draft_to_event_arguments,
 )
 from app.workflows.calendar_update_parser import (
+    build_calendar_search_query,
+    is_bare_calendar_delete_title,
     merge_calendar_update_arguments,
     log_calendar_update_diagnostic,
     parse_calendar_delete_request,
@@ -1126,6 +1128,84 @@ def _recent_created_calendar_event(
     return None, None
 
 
+def _valid_calendar_read_context(
+    pending: object,
+    state: ChatState,
+    now: datetime,
+) -> bool:
+    if not isinstance(pending, dict) or pending.get("version") != 1:
+        return False
+    if pending.get("type") != "calendar_read_continuation":
+        return False
+    if str(pending.get("user_id")) != str(state.get("user_id")):
+        return False
+    if str(pending.get("conversation_id")) != str(state.get("conversation_id")):
+        return False
+    try:
+        expires_at = datetime.fromisoformat(
+            str(pending.get("expires_at")).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return False
+    if expires_at.tzinfo is None or expires_at.astimezone(timezone.utc) <= now:
+        return False
+    return True
+
+
+def _recent_displayed_calendar_event(
+    state: ChatState,
+) -> dict[str, Any] | None:
+    """Resolve "the event I just showed you" from trusted Calendar read output.
+
+    Event IDs are accepted only from scoped, unexpired assistant metadata that
+    was produced by an authoritative Calendar read. LLM text alone is never a
+    source of event IDs.
+    """
+    now_value = state.get("request_time")
+    if isinstance(now_value, datetime):
+        now = now_value
+    elif isinstance(now_value, str):
+        try:
+            now = datetime.fromisoformat(now_value.replace("Z", "+00:00"))
+        except ValueError:
+            now = datetime.now(timezone.utc)
+    else:
+        now = datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    state_pending = state.get("pending_calendar_read")
+    if not _valid_calendar_read_context(state_pending, state, now):
+        return None
+
+    for message in reversed(state.get("messages", [])[-6:]):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if not _valid_calendar_read_context(
+            metadata.get("pending_calendar_read"), state, now
+        ):
+            continue
+        events = metadata.get("calendar_events")
+        if not isinstance(events, list):
+            continue
+        shown: dict[str, Any] | None = None
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_id = event.get("id")
+            if not isinstance(event_id, str) or not event_id.strip():
+                continue
+            if shown is not None and shown.get("id") != event_id:
+                return None
+            shown = event
+        if shown is not None:
+            return shown
+    return None
+
+
 def _resolve_relative_time_changes(
     event: dict[str, Any],
     changes: dict[str, Any],
@@ -1285,8 +1365,10 @@ def _is_calendar_delete_request(text: str) -> bool:
     return bool(
         re.search(
             r"\b(?:delete|remove|cancel)\b.{0,120}"
-            r"\b(?:calendar\s+)?(?:event|series|meeting|appointment|calendar)\b|"
-            r"\b(?:calendar\s+)?(?:event|series|meeting|appointment)\b"
+            r"\b(?:calendar\s+)?(?:event|series|meeting|appointment|session|"
+            r"class|discussion|calendar)\b|"
+            r"\b(?:calendar\s+)?(?:event|series|meeting|appointment|session|"
+            r"class|discussion)\b"
             r".{0,120}\b(?:delete|remove|cancel)\b",
             text,
             re.IGNORECASE,
@@ -1301,6 +1383,47 @@ def _is_calendar_delete_request(text: str) -> bool:
                 re.IGNORECASE,
             )
         )
+        or is_bare_calendar_delete_title(text)
+    )
+
+
+def _title_token_phrase_matches(summary: str, event_query: str) -> bool:
+    """Match a distinctive title phrase without requiring full-title equality.
+
+    Google's ``q`` search is full-text; a user may say "the gym event" while the
+    stored title is "Gym time for". Requiring exact equality discarded the
+    authoritative API result. Token boundaries keep this generic: "gym" does
+    not match "Gymnastics", and both phrases must appear in the same order.
+    """
+
+    def tokens(value: str) -> list[str]:
+        return re.findall(r"\w+", value.casefold())
+
+    normalized_summary = " ".join(summary.split())
+    normalized_query = " ".join(event_query.split())
+    if not normalized_summary or not normalized_query:
+        return False
+    if normalized_summary == normalized_query:
+        return True
+    summary_tokens = tokens(normalized_summary)
+    query_tokens = tokens(normalized_query)
+    if not query_tokens:
+        return False
+
+    def contains_in_order(haystack: list[str], needles: list[str]) -> bool:
+        if not needles:
+            return False
+        index = 0
+        for token in haystack:
+            if token == needles[index]:
+                index += 1
+                if index == len(needles):
+                    return True
+        return False
+
+    return contains_in_order(summary_tokens, query_tokens) or (
+        len(summary_tokens) <= len(query_tokens)
+        and contains_in_order(query_tokens, summary_tokens)
     )
 
 
@@ -1321,9 +1444,7 @@ def _update_event_matches_request(
         summary = event.get("summary")
         if not isinstance(summary, str) or not isinstance(event_query, str):
             return False
-        if " ".join(summary.casefold().split()) != " ".join(
-            event_query.casefold().split()
-        ):
+        if not _title_token_phrase_matches(summary, event_query):
             return False
 
     event_date = details.get("event_date")
@@ -1806,6 +1927,11 @@ def _prepare_event_mutation(
                     if lookup_details
                     else None
                 )
+                search_query = (
+                    None
+                    if generic_delete_discovery
+                    else build_calendar_search_query(event_query)
+                )
                 matches: dict[str, Any] = {}
                 events: list[dict[str, Any]] = []
                 page_token = None
@@ -1820,7 +1946,7 @@ def _prepare_event_mutation(
                             page_token=page_token,
                             time_min=lookup_time_min,
                             time_max=lookup_time_max,
-                            query=(None if generic_delete_discovery else event_query),
+                            query=search_query,
                             time_zone=(
                                 lookup_details.get("time_zone")
                                 if lookup_details
@@ -1836,6 +1962,7 @@ def _prepare_event_mutation(
                     events.extend(
                         event for event in page_events
                         if isinstance(event, dict)
+                        and event.get("status") != "cancelled"
                     )
                     matches = page
                     next_page_token = page.get("next_page_token")
@@ -2312,21 +2439,49 @@ def _prepare_event_mutation(
                     "\n\nBefore → after:\n" + "\n".join(changes_summary)
                 )
         else:
-            event_start = _format_event_time(
-                event.get("start"),
-                state.get("user_timezone", "UTC"),
+            display_timezone = (
+                lookup_details.get("time_zone")
+                if lookup_details
+                and isinstance(lookup_details.get("time_zone"), str)
+                else state.get("user_timezone", "UTC")
             )
-            event_end = _format_event_time(
-                event.get("end"),
-                state.get("user_timezone", "UTC"),
+            event_start = _format_event_time(event.get("start"), display_timezone)
+            event_end = _format_event_time(event.get("end"), display_timezone)
+            event_date = event_start.split(" ")[0] if event_start else "unknown"
+            recurrence_rules = (
+                event.get("recurrence")
+                if isinstance(event.get("recurrence"), list)
+                else []
             )
-            details = f" ({event_start} to {event_end})"
+            recurrence_text = " ".join(
+                str(rule) for rule in recurrence_rules
+            ).upper()
+            unbounded_daily = (
+                "FREQ=DAILY" in recurrence_text
+                and "UNTIL=" not in recurrence_text
+                and "COUNT=" not in recurrence_text
+            )
             if parameters.delete_entire_series:
-                details = (
-                    " (entire daily recurring series with no end date, "
-                    f"including all future occurrences; {event_start} to "
-                    f"{event_end})"
+                scope = (
+                    "entire daily recurring series with no end date, "
+                    "including all future occurrences"
+                    if unbounded_daily
+                    else "entire recurring series"
                 )
+            elif event.get("recurring_event_id"):
+                scope = "single occurrence of a recurring event"
+            else:
+                scope = "single event"
+            details = (
+                "\n\nDelete details:\n"
+                f"- Title: {event_title}\n"
+                f"- Calendar: {parameters.calendar_id}\n"
+                f"- Scope: {scope}\n"
+                f"- Date: {event_date}\n"
+                f"- Start: {event_start}\n"
+                f"- End: {event_end}\n"
+                f"- Time zone: {display_timezone}"
+            )
         response = (
             f"I prepared an approval request to {verb} **{event_title}**"
             f"{details}. "
@@ -2428,6 +2583,117 @@ def _pending_delete_title_clarification(state: ChatState) -> str | None:
     ):
         return None
     return title
+
+
+def _valid_timezone_name(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return ZoneInfo(value.strip()).key
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+
+
+def _local_day_boundary(day: date, timezone_name: str) -> datetime | None:
+    zone = ZoneInfo(timezone_name)
+    naive = datetime.combine(day, time.min)
+    for fold in (0, 1):
+        candidate = naive.replace(tzinfo=zone, fold=fold)
+        round_trip = candidate.astimezone(UTC).astimezone(zone)
+        if round_trip.replace(tzinfo=None) == naive:
+            return candidate
+    return None
+
+
+def _message_specifies_timezone(text: str) -> bool:
+    """Return whether the user supplied an explicit timezone for this request."""
+    lowered = text.casefold()
+    slash_match = re.search(
+        r"\b[A-Za-z_+-]+/[A-Za-z_+-]+\b",
+        text,
+        re.IGNORECASE,
+    )
+    if slash_match:
+        return True
+    return bool(re.search(
+        r"\b(?:utc|gmt|pst|pdt|mst|mdt|cst|cdt|est|edt|bst|"
+        r"asia\s+india|india)\b",
+        lowered,
+    ))
+
+
+def _apply_connected_calendar_timezone(
+    state: dict[str, Any],
+    tools: list[Any],
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Use the connected primary calendar's timezone when none was supplied.
+
+    The Calendar List API returns the primary calendar's authoritative
+    ``timeZone``. It is preferred over the application-level user timezone for
+    relative free/busy ranges, provided it is a valid IANA zone and the local
+    day boundaries can be constructed safely.
+    """
+    if _message_specifies_timezone(str(state.get("user_message") or "")):
+        return arguments
+    list_tool = next(
+        (tool for tool in tools if tool.name == "list_calendars"),
+        None,
+    )
+    if list_tool is None:
+        return arguments
+    try:
+        output = asyncio.run(_list_all_calendars(list_tool))
+        envelope = json.loads(output)
+    except Exception:
+        logger.warning(
+            "Connected Calendar timezone lookup failed | error_type=%s",
+            "lookup_error",
+        )
+        return arguments
+    if not isinstance(envelope, dict) or envelope.get("ok") is not True:
+        return arguments
+    data = envelope.get("data")
+    calendars = data.get("calendars") if isinstance(data, dict) else None
+    if not isinstance(calendars, list):
+        return arguments
+    connected_timezone = None
+    for calendar in calendars:
+        if not isinstance(calendar, dict) or calendar.get("primary") is not True:
+            continue
+        connected_timezone = _valid_timezone_name(calendar.get("time_zone"))
+        if connected_timezone is not None:
+            break
+    if connected_timezone is None:
+        return arguments
+    try:
+        current_timezone = _valid_timezone_name(arguments.get("time_zone"))
+        start = datetime.fromisoformat(
+            str(arguments["time_min"]).replace("Z", "+00:00")
+        )
+        end = datetime.fromisoformat(
+            str(arguments["time_max"]).replace("Z", "+00:00")
+        )
+    except (KeyError, TypeError, ValueError):
+        return arguments
+    if current_timezone is None or start.tzinfo is None or end.tzinfo is None:
+        return arguments
+    if connected_timezone == current_timezone:
+        return arguments
+    target_date = start.astimezone(ZoneInfo(current_timezone)).date()
+    next_date = end.astimezone(ZoneInfo(current_timezone)).date()
+    if next_date != target_date + timedelta(days=1):
+        return arguments
+    new_start = _local_day_boundary(target_date, connected_timezone)
+    new_end = _local_day_boundary(next_date, connected_timezone)
+    if new_start is None or new_end is None or new_end <= new_start:
+        return arguments
+    return {
+        **arguments,
+        "time_min": new_start.isoformat(),
+        "time_max": new_end.isoformat(),
+        "time_zone": connected_timezone,
+    }
 
 
 def calendar_agent_node(
@@ -2602,6 +2868,26 @@ def calendar_agent_node(
         if delete_details.get("event_query"):
             arguments["event_query"] = delete_details["event_query"]
 
+        if (
+            delete_details.get("delete_future_occurrences_only")
+            and not delete_details.get("delete_entire_series")
+        ):
+            response = (
+                "I can’t delete only the future occurrences of a recurring "
+                "event yet. I can delete a single occurrence or, with explicit "
+                "series wording, prepare the entire series for approval. "
+                "Nothing was changed."
+            )
+            return {
+                "assistant_response": response,
+                "provider": "",
+                "model": "",
+                "messages": [
+                    {"role": "user", "content": state["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+
         # Resolve contextual references such as "the event I just created"
         # using the most recent trusted Calendar creation result in this
         # conversation. This never trusts an event id from LLM text alone.
@@ -2647,7 +2933,9 @@ def calendar_agent_node(
         }
         explicit_context_reference = bool(re.search(
             r"\b(?:just created|you (?:just )?created|"
-            r"i just created|we just (?:created|made)|"
+            r"i just created|we (?:just )?(?:created|made)|"
+            r"(?:last|previous|most recent)\s+(?:event|one)\s+"
+            r"(?:we|you|i)\s+(?:just\s+)?(?:created|made)|"
             r"that event|this event)\b",
             state["user_message"],
             re.IGNORECASE,
@@ -2696,6 +2984,43 @@ def calendar_agent_node(
                 **state,
                 "trusted_calendar_event_ids": {contextual_event_id},
             }
+
+        # Resolve references to an event displayed by an earlier Calendar read
+        # ("Remove the event I just showed you") from scoped, fresh metadata.
+        displayed_reference = bool(re.search(
+            r"\b(?:just\s+(?:showed|shown|displayed)|"
+            r"shown\s+above|(?:above|previous)\s+(?:event|one))\b",
+            state["user_message"],
+            re.IGNORECASE,
+        ))
+        if (
+            displayed_reference
+            and not isinstance(arguments.get("event_id"), str)
+        ):
+            shown_event = _recent_displayed_calendar_event(state)
+            if isinstance(shown_event, dict):
+                shown_id = shown_event.get("id")
+                if isinstance(shown_id, str) and shown_id.strip():
+                    arguments["event_id"] = shown_id.strip()
+                    pending_read = state.get("pending_calendar_read")
+                    if (
+                        not isinstance(arguments.get("calendar_id"), str)
+                        and isinstance(pending_read, dict)
+                        and isinstance(pending_read.get("calendar_id"), str)
+                    ):
+                        arguments["calendar_id"] = pending_read["calendar_id"]
+                    shown_title = shown_event.get("title")
+                    if isinstance(shown_title, str) and shown_title.strip():
+                        arguments["event_query"] = shown_title.strip()
+                        delete_details["event_query"] = shown_title.strip()
+                    trusted_ids = set(
+                        state.get("trusted_calendar_event_ids") or set()
+                    )
+                    trusted_ids.add(shown_id.strip())
+                    state = {
+                        **state,
+                        "trusted_calendar_event_ids": trusted_ids,
+                    }
 
         clarification_title = _pending_delete_title_clarification(state)
         current_query = arguments.get("event_query")
@@ -3827,6 +4152,12 @@ def calendar_agent_node(
                     )
                 )
         else:
+            if is_freebusy:
+                arguments = _apply_connected_calendar_timezone(
+                    state,
+                    tools,
+                    arguments,
+                )
             collect_all_event_pages = (
                 tool_name == "list_calendar_events"
                 and re.search(
@@ -3965,6 +4296,11 @@ def calendar_agent_node(
         "provider": "",
         "model": "",
         "calendar_events": calendar_events,
+        **(
+            {"calendar_executed_arguments": dict(arguments)}
+            if is_freebusy and isinstance(arguments, dict)
+            else {}
+        ),
         "messages": [
             {"role": "user", "content": state["user_message"]},
             {"role": "assistant", "content": response},

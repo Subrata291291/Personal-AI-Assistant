@@ -176,8 +176,10 @@ export const conversationService = {
     const decoder = new TextDecoder('utf-8')
     let buffer = ''
     let sawDone = false
+    let sawMalformed = false
 
     const dispatch = (evt) => {
+      if (sawMalformed) return
       if (!evt || typeof evt !== 'object' || !evt.type) return
       if (evt.type === 'error') {
         const err = new Error(evt.message || 'Streaming failed')
@@ -197,7 +199,9 @@ export const conversationService = {
       try {
         evt = JSON.parse(jsonStr)
       } catch {
-        // Ignore malformed events; never let a parse failure look like success.
+        // A malformed frame must never be presented as a complete answer.
+        // Suppress later events (including `done`) and fail at stream end.
+        sawMalformed = true
         return
       }
       dispatch(evt)
@@ -224,6 +228,11 @@ export const conversationService = {
       }
     }
 
+    if (sawMalformed) {
+      const err = new Error('Some streamed content could not be parsed.')
+      err.partial = true
+      throw err
+    }
     if (!sawDone) {
       const err = new Error('The response stream ended before completion.')
       err.partial = true

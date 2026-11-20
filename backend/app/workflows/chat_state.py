@@ -69,6 +69,7 @@ class ChatState(TypedDict):
     assistant_capabilities: NotRequired[dict[str, Any]]
 
     pending_calendar_action: NotRequired[dict[str, Any]]
+    pending_calendar_availability: NotRequired[dict[str, Any]]
     calendar_action_request: NotRequired[str]
 
     pending_calendar_create_proposal: NotRequired[dict[str, Any]]
@@ -79,6 +80,8 @@ class ChatState(TypedDict):
     assistant_route: NotRequired[str]
 
     gmail_plan: NotRequired[dict[str, Any]]
+    gmail_connection_id: NotRequired[str | None]
+    calendar_executed_arguments: NotRequired[dict[str, Any]]
     calendar_action_proposal: NotRequired[dict[str, Any]]
     calendar_create_event_proposal: NotRequired[dict[str, Any]]
     contacts_action_proposal: NotRequired[dict[str, Any]]
@@ -92,6 +95,10 @@ class ChatState(TypedDict):
     messages: Annotated[list[ChatMessage], add]
 
     response_metadata: NotRequired[dict[str, Any]]
+    contacts_provenance: NotRequired[dict[str, Any]]
+    calendar_approval_result: NotRequired[dict[str, Any]]
+    calendar_action_details: NotRequired[dict[str, Any]]
+    email_draft_connection_id: NotRequired[str]
 
     calendar_events: NotRequired[list[dict[str, Any]]]
 

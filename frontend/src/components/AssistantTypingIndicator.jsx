@@ -1,5 +1,5 @@
 /** Compact animated typing indicator shown while the assistant has no text yet. */
-export default function AssistantTypingIndicator() {
+export default function AssistantTypingIndicator({ status = '' }) {
   return (
     <div
       className="flex items-center gap-3"
@@ -13,7 +13,7 @@ export default function AssistantTypingIndicator() {
         <span className="assistant-typing-dot h-1.5 w-1.5 rounded-full bg-violet-400" />
       </span>
       <span className="truncate text-[11px] leading-4 text-slate-400">
-        Thinking
+        {status || 'Preparing your response...'}
       </span>
     </div>
   )

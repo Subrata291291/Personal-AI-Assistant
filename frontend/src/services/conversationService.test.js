@@ -204,7 +204,7 @@ describe('conversationService chat streaming', () => {
     ).rejects.toThrow('render failed')
   })
 
-  it('ignores malformed SSE payloads but still completes on done', async () => {
+  it('reports malformed SSE payloads instead of presenting a complete answer', async () => {
     global.fetch = vi.fn().mockResolvedValue(
       streamingResponse([
         '{"type": "token", "content": "kept"}',
@@ -214,18 +214,20 @@ describe('conversationService chat streaming', () => {
     )
     const received = []
 
-    await conversationService.streamChatMessage(
-      'conversation-1',
-      'hello',
-      'idempotency-key',
-      null,
-      'UTC',
-      (event) => received.push(event),
-    )
+    await expect(
+      conversationService.streamChatMessage(
+        'conversation-1',
+        'hello',
+        'idempotency-key',
+        null,
+        'UTC',
+        (event) => received.push(event),
+      ),
+    ).rejects.toMatchObject({
+      message: 'Some streamed content could not be parsed.',
+      partial: true,
+    })
 
-    expect(received).toEqual([
-      { type: 'token', content: 'kept' },
-      { type: 'done', message_id: 'assistant-1' },
-    ])
+    expect(received).toEqual([{ type: 'token', content: 'kept' }])
   })
 })

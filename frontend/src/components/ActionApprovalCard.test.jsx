@@ -1,4 +1,8 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  QueryClient,
+  QueryClientProvider,
+  useQuery,
+} from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -88,7 +92,7 @@ function createCalendarMutationProposal(actionType, status = 'pending') {
   }
 }
 
-function renderProposalCard(proposal, queryClient = null) {
+function renderProposalCard(proposal, queryClient = null, children = null) {
   const message = {
     id: 'approval-message-1',
     metadata: { action_approval: proposal },
@@ -106,11 +110,70 @@ function renderProposalCard(proposal, queryClient = null) {
           isDark={false}
           onUpdated={setCurrentMessage}
         />
+        {children}
       </QueryClientProvider>
     )
   }
 
   return render(<Harness />)
+}
+
+const calendarEventsQueryKey = (connectionId = 'connection-1') => [
+  'calendar-events',
+  'user-1',
+  connectionId,
+  'Asia/Kolkata',
+  'week',
+  'primary',
+  '2026-06-08',
+  '2026-06-14',
+  '',
+]
+
+const calendarViewQueryKey = (view, connectionId = 'connection-1') => [
+  'calendar-events',
+  'user-1',
+  connectionId,
+  'Asia/Kolkata',
+  view,
+  'primary',
+  '2026-06-08',
+  '2026-06-14',
+  '',
+]
+
+function multiPageCalendarData(firstEvents, secondEvents) {
+  return {
+    pages: [
+      { events: firstEvents, next_page_token: 'page-2' },
+      { events: secondEvents, next_page_token: null },
+    ],
+    pageParams: [undefined, 'page-2'],
+  }
+}
+
+function cachedEventIds(queryClient, queryKey) {
+  const data = queryClient.getQueryData(queryKey)
+  return (data?.pages || []).flatMap((page) => (page.events || []).map((event) => event.id))
+}
+
+function CalendarEventsProbe({
+  connectionId = 'connection-1',
+  eventsAfterConfirmation,
+  testId = 'calendar-events-probe',
+}) {
+  const { data = [] } = useQuery({
+    queryKey: calendarEventsQueryKey(connectionId),
+    queryFn: async () => eventsAfterConfirmation,
+    staleTime: Infinity,
+    refetchOnMount: false,
+  })
+
+  return (
+    <div data-testid={testId}>
+      {data.map((event) => event.summary).join(', ') || 'No events'}
+    </div>
+  )
 }
 
 describe('ActionApprovalCard approval and execution lifecycle', () => {
@@ -668,6 +731,199 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
     },
   )
 
+  it.each([
+    [
+      'calendar.create_event',
+      'created',
+      [],
+      [{ id: 'event-1', summary: 'Design review' }],
+      'Design review',
+    ],
+    [
+      'calendar.update_event',
+      'updated',
+      [{ id: 'event-1', summary: 'Design review' }],
+      [{ id: 'event-1', summary: 'Updated design review' }],
+      'Updated design review',
+    ],
+    [
+      'calendar.delete_event',
+      'deleted',
+      [{ id: 'event-1', summary: 'Design review' }],
+      [],
+      'No events',
+    ],
+  ])(
+    'refreshes the Calendar UI after status-confirmed %s without a reload',
+    async (
+      actionType,
+      outcome,
+      initialEvents,
+      eventsAfterConfirmation,
+      expectedText,
+    ) => {
+      const queryClient = new QueryClient({
+        defaultOptions: {
+          queries: { retry: false },
+          mutations: { retry: false },
+        },
+      })
+      queryClient.setQueryData(calendarEventsQueryKey(), initialEvents)
+      const proposal = actionType === 'calendar.create_event'
+        ? createCalendarProposal('execution_uncertain')
+        : createCalendarMutationProposal(actionType, 'execution_uncertain')
+      actionApprovalService.getProposal.mockResolvedValue({
+        ...proposal,
+        status: 'completed',
+        result: { outcome, google_event_id: 'event-1' },
+      })
+
+      renderProposalCard(
+        proposal,
+        queryClient,
+        <CalendarEventsProbe eventsAfterConfirmation={eventsAfterConfirmation} />,
+      )
+
+      const initialText = initialEvents.length
+        ? initialEvents.map((event) => event.summary).join(', ')
+        : 'No events'
+      expect(screen.getByTestId('calendar-events-probe'))
+        .toHaveTextContent(initialText)
+      fireEvent.click(screen.getByRole('button', {
+        name: 'Check Calendar change status',
+      }))
+
+      await waitFor(() => {
+        expect(screen.getByTestId('calendar-events-probe'))
+          .toHaveTextContent(expectedText)
+      })
+    },
+  )
+
+  it('does not remove the event when deletion status remains unconfirmed', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    const invalidateQueries = vi.spyOn(queryClient, 'invalidateQueries')
+    const event = { id: 'event-1', summary: 'Design review' }
+    queryClient.setQueryData(calendarEventsQueryKey(), [event])
+    const proposal = createCalendarMutationProposal(
+      'calendar.delete_event',
+      'execution_uncertain',
+    )
+    actionApprovalService.getProposal.mockResolvedValue({
+      ...proposal,
+      status: 'execution_uncertain',
+      result: {
+        outcome: 'unconfirmed',
+        reason: 'read_failed',
+        checked_now: true,
+      },
+    })
+
+    renderProposalCard(
+      proposal,
+      queryClient,
+      <CalendarEventsProbe eventsAfterConfirmation={[event]} />,
+    )
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Check Calendar change status',
+    }))
+
+    expect(await screen.findByText(
+      /Google Calendar status could not be verified/,
+    )).toBeInTheDocument()
+    expect(screen.getByTestId('calendar-events-probe'))
+      .toHaveTextContent('Design review')
+    expect(invalidateQueries).not.toHaveBeenCalled()
+  })
+
+  it('refreshes Calendar data when an execute error is reconciled as completed', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    const event = { id: 'event-1', summary: 'Design review' }
+    queryClient.setQueryData(calendarEventsQueryKey(), [event])
+    const proposal = createCalendarMutationProposal(
+      'calendar.delete_event',
+      'approved',
+    )
+    const networkError = new Error('Connection lost.')
+    networkError.networkFailure = true
+    actionApprovalService.execute.mockRejectedValue(networkError)
+    actionApprovalService.getProposal.mockResolvedValue({
+      ...proposal,
+      status: 'completed',
+      result: { outcome: 'deleted', google_event_id: 'event-1' },
+    })
+
+    renderProposalCard(
+      proposal,
+      queryClient,
+      <CalendarEventsProbe eventsAfterConfirmation={[]} />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Calendar event' }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('calendar-events-probe'))
+        .toHaveTextContent('No events')
+    })
+  })
+
+  it('never removes similar-titled events from other connections or tenants', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    const target = { id: 'event-1', summary: 'Design review' }
+    const similar = { id: 'event-2', summary: 'Design review backup' }
+    queryClient.setQueryData(calendarEventsQueryKey('connection-1'), [target, similar])
+    queryClient.setQueryData(calendarEventsQueryKey('connection-2'), [target])
+    const proposal = createCalendarMutationProposal(
+      'calendar.delete_event',
+      'execution_uncertain',
+    )
+    actionApprovalService.getProposal.mockResolvedValue({
+      ...proposal,
+      status: 'completed',
+      result: { outcome: 'deleted', google_event_id: 'event-1' },
+    })
+
+    renderProposalCard(
+      proposal,
+      queryClient,
+      <>
+        <CalendarEventsProbe eventsAfterConfirmation={[similar]} />
+        <CalendarEventsProbe
+          connectionId="connection-2"
+          eventsAfterConfirmation={[target]}
+          testId="other-calendar-events-probe"
+        />
+      </>,
+    )
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Check Calendar change status',
+    }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('calendar-events-probe'))
+        .toHaveTextContent(/^Design review backup$/)
+      expect(screen.getByTestId('other-calendar-events-probe'))
+        .toHaveTextContent('Design review')
+    })
+  })
+
   it('shows a rejected approval without offering execution', async () => {
     actionApprovalService.reject.mockResolvedValue({
       proposal: createCalendarProposal('rejected'),
@@ -915,5 +1171,252 @@ describe('ActionApprovalCard approval and execution lifecycle', () => {
     expect(screen.queryByRole('button', { name: 'Create Calendar event' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Execute Gmail send' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Check Calendar change status' })).toBeInTheDocument()
+  })
+
+  it('removes a confirmed deletion from inactive month, week and day caches by identity', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    const target = { id: 'event-1', summary: 'Design review' }
+    const similar = { id: 'event-2', summary: 'Design review backup' }
+    const later = { id: 'event-3', summary: 'Later event' }
+    for (const view of ['month', 'week', 'day']) {
+      queryClient.setQueryData(
+        calendarViewQueryKey(view),
+        multiPageCalendarData([target, similar], [later]),
+      )
+    }
+    const detailKey = ['calendar-event', 'user-1', 'connection-1', 'event-1']
+    queryClient.setQueryData(detailKey, target)
+    const otherConnectionKey = calendarViewQueryKey('week', 'connection-2')
+    queryClient.setQueryData(
+      otherConnectionKey,
+      multiPageCalendarData([target], []),
+    )
+    const proposal = {
+      ...createCalendarMutationProposal('calendar.delete_event', 'completed'),
+      result: { outcome: 'deleted', google_event_id: 'event-1' },
+    }
+
+    renderProposalCard(proposal, queryClient)
+
+    await waitFor(() => {
+      for (const view of ['month', 'week', 'day']) {
+        expect(cachedEventIds(queryClient, calendarViewQueryKey(view)))
+          .not.toContain('event-1')
+      }
+    })
+    for (const view of ['month', 'week', 'day']) {
+      expect(cachedEventIds(queryClient, calendarViewQueryKey(view)))
+        .toEqual(['event-2', 'event-3'])
+    }
+    const weekData = queryClient.getQueryData(calendarViewQueryKey('week'))
+    expect(weekData.pages[0].next_page_token).toBe('page-2')
+    expect(weekData.pages[1].next_page_token).toBeNull()
+    expect(weekData.pageParams).toEqual([undefined, 'page-2'])
+    expect(queryClient.getQueryData(detailKey)).toBeUndefined()
+    expect(cachedEventIds(queryClient, otherConnectionKey)).toContain('event-1')
+  })
+
+  it('preserves cached events when the authoritative outcome is not a confirmed delete', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    const target = { id: 'event-1', summary: 'Design review' }
+    const similar = { id: 'event-2', summary: 'Design review backup' }
+    queryClient.setQueryData(
+      calendarEventsQueryKey(),
+      multiPageCalendarData([target, similar], []),
+    )
+    const proposal = {
+      ...createCalendarMutationProposal('calendar.delete_event', 'failed'),
+      result: { outcome: 'delete_failed', reason: 'provider_rejected' },
+    }
+
+    renderProposalCard(proposal, queryClient)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /Google Calendar rejected the request/,
+    )
+    expect(cachedEventIds(queryClient, calendarEventsQueryKey()))
+      .toEqual(['event-1', 'event-2'])
+  })
+
+  it('uses recurring identity for single-instance and whole-series deletions', async () => {
+    const master = { id: 'master-1', summary: 'Gym' }
+    const instanceOne = {
+      id: 'instance-1',
+      summary: 'Gym',
+      recurring_event_id: 'master-1',
+    }
+    const instanceTwo = {
+      id: 'instance-2',
+      summary: 'Gym',
+      recurring_event_id: 'master-1',
+    }
+    const similar = { id: 'other-1', summary: 'Gym backup' }
+    const seedEvents = [master, instanceOne, instanceTwo]
+
+    const singleQueryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    singleQueryClient.setQueryData(
+      calendarEventsQueryKey(),
+      multiPageCalendarData(seedEvents, [similar]),
+    )
+    const singleProposal = createCalendarMutationProposal(
+      'calendar.delete_event',
+      'completed',
+    )
+    singleProposal.parameters.event_id = 'instance-1'
+    singleProposal.status = 'completed'
+    singleProposal.result = {
+      outcome: 'deleted',
+      google_event_id: 'instance-1',
+    }
+    const firstView = renderProposalCard(singleProposal, singleQueryClient)
+
+    await waitFor(() => {
+      expect(cachedEventIds(singleQueryClient, calendarEventsQueryKey()))
+        .not.toContain('instance-1')
+    })
+    expect(cachedEventIds(singleQueryClient, calendarEventsQueryKey()))
+      .toEqual(['master-1', 'instance-2', 'other-1'])
+    firstView.unmount()
+
+    const seriesQueryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    seriesQueryClient.setQueryData(
+      calendarEventsQueryKey(),
+      multiPageCalendarData(seedEvents, [similar]),
+    )
+    const seriesProposal = createCalendarMutationProposal(
+      'calendar.delete_event',
+      'completed',
+    )
+    seriesProposal.parameters.event_id = 'master-1'
+    seriesProposal.parameters.delete_entire_series = true
+    seriesProposal.status = 'completed'
+    seriesProposal.result = { outcome: 'deleted', google_event_id: 'master-1' }
+
+    renderProposalCard(seriesProposal, seriesQueryClient)
+
+    await waitFor(() => {
+      expect(cachedEventIds(seriesQueryClient, calendarEventsQueryKey()))
+        .not.toContain('master-1')
+    })
+    expect(cachedEventIds(seriesQueryClient, calendarEventsQueryKey()))
+      .toEqual(['other-1'])
+  })
+
+  it('synchronizes real cached Calendar data when approval polling reconciles a deletion', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    queryClient.setQueryData(
+      calendarEventsQueryKey(),
+      multiPageCalendarData(
+        [{ id: 'event-1', summary: 'Design review' }],
+        [{ id: 'event-2', summary: 'Design review backup' }],
+      ),
+    )
+    const proposal = createCalendarMutationProposal(
+      'calendar.delete_event',
+      'execution_uncertain',
+    )
+    actionApprovalService.getProposal.mockResolvedValue({
+      ...proposal,
+      status: 'completed',
+      result: { outcome: 'deleted', google_event_id: 'event-1' },
+    })
+
+    renderProposalCard(proposal, queryClient)
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Check Calendar change status',
+    }))
+
+    await waitFor(() => {
+      expect(cachedEventIds(queryClient, calendarEventsQueryKey()))
+        .not.toContain('event-1')
+    })
+    expect(cachedEventIds(queryClient, calendarEventsQueryKey()))
+      .toEqual(['event-2'])
+    expect(await screen.findByText(/confirmed the event was deleted/))
+      .toBeInTheDocument()
+  })
+
+  it('ignores repeated identical completion responses', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    queryClient.setQueryData(
+      calendarEventsQueryKey(),
+      multiPageCalendarData(
+        [{ id: 'event-1', summary: 'Design review' }],
+        [{ id: 'event-2', summary: 'Design review backup' }],
+      ),
+    )
+    const setQueryData = vi.spyOn(queryClient, 'setQueryData')
+    const proposal = {
+      ...createCalendarMutationProposal('calendar.delete_event', 'completed'),
+      result: { outcome: 'deleted', google_event_id: 'event-1' },
+    }
+
+    function Harness() {
+      const [message, setMessage] = useState(() => ({
+        id: 'approval-message-1',
+        metadata: { action_approval: proposal },
+      }))
+      return (
+        <QueryClientProvider client={queryClient}>
+          <button
+            type="button"
+            onClick={() => setMessage((current) => ({
+              ...current,
+              metadata: {
+                ...current.metadata,
+                action_approval: { ...proposal },
+              },
+            }))}
+          >
+            Repeat completion
+          </button>
+          <ActionApprovalCard
+            message={message}
+            isDark={false}
+            onUpdated={setMessage}
+          />
+        </QueryClientProvider>
+      )
+    }
+
+    render(<Harness />)
+
+    await waitFor(() => {
+      expect(cachedEventIds(queryClient, calendarEventsQueryKey()))
+        .toEqual(['event-2'])
+    })
+    const listUpdates = () => setQueryData.mock.calls.filter(([key]) => (
+      key[0] === 'calendar-events' &&
+      key[5] === 'primary' &&
+      key[2] === 'connection-1'
+    ))
+    expect(listUpdates()).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Repeat completion' }))
+
+    expect(cachedEventIds(queryClient, calendarEventsQueryKey()))
+      .toEqual(['event-2'])
+    expect(listUpdates()).toHaveLength(1)
   })
 })

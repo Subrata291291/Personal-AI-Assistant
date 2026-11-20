@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 
 import { actionApprovalService } from '../services/actionApprovalService.js'
 import { formatRequestError } from '../lib/errorMessage.js'
+import TransientStatus from './TransientStatus.jsx'
 
 function displayValue(value) {
   if (Array.isArray(value)) return value.join(', ')
@@ -296,6 +297,96 @@ function updateProposalMessage(message, proposal, onUpdated) {
   })
 }
 
+function buildCalendarDeletionTarget(latest, proposal) {
+  const eventId =
+    latest.result?.google_event_id ||
+    latest.calendar_event_id ||
+    latest.parameters?.event_id ||
+    ''
+  const connectionId = latest.connection_id || proposal.connection_id || ''
+  const calendarId =
+    latest.parameters?.calendar_id ||
+    latest.result?.calendar_id ||
+    proposal.parameters?.calendar_id ||
+    ''
+  if (!eventId || !connectionId || !calendarId) return null
+
+  return {
+    eventId,
+    connectionId,
+    calendarId,
+    deleteEntireSeries:
+      latest.parameters?.delete_entire_series === true ||
+      proposal.parameters?.delete_entire_series === true,
+  }
+}
+
+function eventMatchesDeletionTarget(event, target) {
+  if (!event || typeof event !== 'object') return false
+
+  // The query key supplies connection and calendar identity. An event's own
+  // calendar fields, when present, must agree before anything is removed.
+  const eventCalendarId = event.calendar_id || event.calendarId
+  if (eventCalendarId && eventCalendarId !== target.calendarId) return false
+
+  if ([event.id, event.google_event_id, event.googleEventId].includes(target.eventId)) {
+    return true
+  }
+  if (!target.deleteEntireSeries) return false
+
+  return [event.recurring_event_id, event.recurringEventId].includes(target.eventId)
+}
+
+function removeDeletedEventFromCalendarData(oldData, target) {
+  if (Array.isArray(oldData)) {
+    const events = oldData.filter((event) => !eventMatchesDeletionTarget(event, target))
+    return events.length === oldData.length ? oldData : events
+  }
+  if (!oldData || typeof oldData !== 'object' || !Array.isArray(oldData.pages)) {
+    return oldData
+  }
+
+  let changed = false
+  const pages = oldData.pages.map((page) => {
+    if (!page || !Array.isArray(page.events)) return page
+    const events = page.events.filter((event) => {
+      const matches = eventMatchesDeletionTarget(event, target)
+      if (matches) changed = true
+      return !matches
+    })
+    if (events.length === page.events.length) return page
+    return { ...page, events }
+  })
+
+  return changed ? { ...oldData, pages } : oldData
+}
+
+function removeDeletedEventFromCalendarCache(queryClient, target) {
+  for (const query of queryClient.getQueryCache().findAll()) {
+    const queryKey = query.queryKey
+    if (
+      queryKey[0] === 'calendar-events' &&
+      queryKey[2] === target.connectionId &&
+      queryKey[5] === target.calendarId
+    ) {
+      queryClient.setQueryData(
+        queryKey,
+        (oldData) => removeDeletedEventFromCalendarData(oldData, target),
+      )
+    }
+  }
+
+  const detailQueries = queryClient.getQueryCache().findAll().filter((query) => {
+    const queryKey = query.queryKey
+    return queryKey[0] === 'calendar-event' &&
+      queryKey[2] === target.connectionId &&
+      queryKey[3] === target.eventId
+  })
+  for (const query of detailQueries) {
+    queryClient.removeQueries({ queryKey: query.queryKey, exact: true })
+  }
+}
+
 function ActionApprovalCard({ message, isDark, onUpdated }) {
   const queryClient = useQueryClient()
   const proposal = message.metadata.action_approval
@@ -331,9 +422,80 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
   const [error, setError] = useState('')
   const [expired, setExpired] = useState(false)
   const [executionAttemptFailed, setExecutionAttemptFailed] = useState(false)
+  const [dismissedCalendarToastKey, setDismissedCalendarToastKey] = useState('')
   const requestInProgress = useRef(false)
   const availabilityRefreshProposalId = useRef(null)
   const latestProposalFetchId = useRef(0)
+  const calendarSyncKeyRef = useRef(null)
+
+  const syncCalendarAfterConfirmedProposal = useCallback(async (latest) => {
+    if (!isCalendarAction || !latest) return
+    if (
+      latest.status !== 'completed' ||
+      latest.result?.outcome !== calendarOutcome
+    ) return
+
+    const eventId =
+      latest.result?.google_event_id ||
+      latest.calendar_event_id ||
+      latest.parameters?.event_id ||
+      ''
+    const syncKey = [
+      latest.proposal_id,
+      latest.status,
+      latest.result?.outcome,
+      eventId,
+    ].join(':')
+    if (calendarSyncKeyRef.current === syncKey) return
+    calendarSyncKeyRef.current = syncKey
+
+    const deletionTarget = isCalendarDelete
+      ? buildCalendarDeletionTarget(latest, proposal)
+      : null
+
+    try {
+      // Cancel first so an older request that started before Google confirmed
+      // the deletion cannot repopulate the cache after we patch it.
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ['calendar-events'] }),
+        queryClient.cancelQueries({ queryKey: ['calendar-event'] }),
+      ])
+
+      // Remove by the authoritative event ID and the proposal's connection and
+      // calendar identity. Every cached view (month/week/day/search/detail) is
+      // patched; nothing is removed by title or by clearing whole queries.
+      if (deletionTarget) {
+        removeDeletedEventFromCalendarCache(queryClient, deletionTarget)
+      }
+
+      // Invalidation still reconciles all cached variants with Google and keeps
+      // create/update proposals working exactly as before.
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ['calendar-events'],
+          refetchType: 'all',
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['calendar-event'],
+          refetchType: 'all',
+        }),
+      ])
+    } catch {
+      // A failed refetch leaves the query stale; it must not undo the confirmed
+      // backend mutation or block the approval UI from updating.
+    }
+  }, [
+    calendarOutcome,
+    isCalendarAction,
+    isCalendarDelete,
+    proposal,
+    queryClient,
+  ])
+
+  useEffect(() => {
+    void syncCalendarAfterConfirmedProposal(proposal)
+  }, [proposal, syncCalendarAfterConfirmedProposal])
+
   useEffect(() => {
     if (proposal.status !== 'pending') return undefined
 
@@ -385,22 +547,7 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       setError('')
       setExecutionAttemptFailed(false)
       updateProposalMessage(message, response.proposal, onUpdated)
-      if (
-        isCalendarAction &&
-        response.proposal.status === 'completed' &&
-        response.proposal.result?.outcome === calendarOutcome
-      ) {
-        await Promise.all([
-          queryClient.invalidateQueries({
-            queryKey: ['calendar-events'],
-            refetchType: 'all',
-          }),
-          queryClient.invalidateQueries({
-            queryKey: ['calendar-event'],
-            refetchType: 'all',
-          }),
-        ])
-      }
+      await syncCalendarAfterConfirmedProposal(response.proposal)
     },
     onError: async (mutationError) => {
       const fallback = isCalendarAction
@@ -422,6 +569,7 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
         )
         if (fetchId !== latestProposalFetchId.current) return
         updateProposalMessage(message, latest, onUpdated)
+        await syncCalendarAfterConfirmedProposal(latest)
         if (
           ['completed', 'failed', 'execution_uncertain', 'executing', 'rejected', 'expired'].includes(
             latest?.status,
@@ -463,10 +611,11 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
       return actionApprovalService.getProposal(proposal.proposal_id)
         .then((latest) => ({ latest, fetchId }))
     },
-    onSuccess: ({ latest, fetchId }) => {
+    onSuccess: async ({ latest, fetchId }) => {
       if (fetchId !== latestProposalFetchId.current) return
       setError('')
       updateProposalMessage(message, latest, onUpdated)
+      await syncCalendarAfterConfirmedProposal(latest)
     },
     onError: (mutationError) => {
       setError(formatRequestError(
@@ -504,6 +653,18 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
   const isExpired = proposal.status === 'pending' && expired
   const visibleStatus = isExpired ? 'expired' : proposal.status
   const isPending = visibleStatus === 'pending'
+
+  // Temporary confirmation for completed Calendar actions. The persistent
+  // status line lower in the card remains the audit/history record.
+  const calendarToastKey = isCalendarAction && visibleStatus === 'completed'
+    ? [proposal.proposal_id, visibleStatus, proposal.result?.outcome].join(':')
+    : ''
+  const confirmedCalendarToast = calendarToastKey
+    ? `Calendar event ${proposal.result?.outcome || calendarOutcome} successfully.`
+    : ''
+  const calendarToast = dismissedCalendarToastKey === calendarToastKey
+    ? ''
+    : confirmedCalendarToast
   const approvalStatus = {
     pending: 'Pending',
     approved: 'Approved',
@@ -613,6 +774,11 @@ function ActionApprovalCard({ message, isDark, onUpdated }) {
           : 'border-amber-200 bg-white'
       }`}
     >
+      <TransientStatus
+        message={calendarToast}
+        onDismiss={() => setDismissedCalendarToastKey(calendarToastKey)}
+        className="mx-4 mt-3 px-3 py-2 text-xs"
+      />
       <header className={`flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3 ${
         isDark
           ? 'border-[#303245] bg-amber-500/5'

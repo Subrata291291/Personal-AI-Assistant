@@ -685,7 +685,7 @@ function Conversations() {
                     No messages in this conversation yet.
                   </p>
                 ) : (
-                  <div className="flex max-h-[420px] flex-col gap-4 overflow-y-auto">
+                  <div className="scrollbar-hidden flex max-h-[420px] flex-col gap-4 overflow-y-auto">
                     {messages.map((message) => (
                       <div key={message.id}>
                         <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-violet-400">

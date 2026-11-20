@@ -9,6 +9,11 @@ from app.workflows.calendar_create_draft import extract_explicit_calendar_date
 
 logger = logging.getLogger(__name__)
 
+# Bounded window used only for title-only deletes that omit a date. Google's
+# default ``timeMin=now`` would otherwise hide an event earlier in the local day.
+NO_DATE_LOOKBACK_DAYS = 1
+NO_DATE_LOOKAHEAD_DAYS = 30
+
 _TIME = re.compile(
     r"(?<![\w:])(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?"
     r"\s*(?P<meridiem>a\.?m\.?|p\.?m\.?)?(?![\w:])",
@@ -95,6 +100,152 @@ _PRESERVE_TITLE = re.compile(
     r"\bdo\s+not\s+change\s+(?:the\s+)?title\b",
     re.IGNORECASE,
 )
+
+_MONTH_NAMES = (
+    r"january|february|march|april|may|june|july|august|"
+    r"september|october|november|december|"
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec"
+)
+_DATE_VALUE = (
+    r"\d{4}-\d{2}-\d{2}|"
+    r"\d{1,2}/\d{1,2}/\d{2,4}|"
+    r"\d{1,2}(?:st|nd|rd|th)?\s+(?:" + _MONTH_NAMES + r")\b(?:,?\s+\d{4})?|"
+    r"(?:" + _MONTH_NAMES + r")\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?"
+)
+_RELATIVE_DAY_VALUE = (
+    r"today(?:'s|s)?|tomorrow(?:'s|s)?|yesterday(?:'s|s)?|tonight"
+)
+_DATE_LANGUAGE = re.compile(
+    rf"(?<!\w)(?:(?:on|from|for|during|in)\s+)?"
+    rf"(?:(?:{_RELATIVE_DAY_VALUE})|(?:{_DATE_VALUE}))(?!\w)",
+    re.IGNORECASE,
+)
+_TIME_RANGE_IN_TITLE = re.compile(
+    rf"{_CLOCK_TEXT}\s*(?:to|[-–—])\s*{_CLOCK_TEXT}",
+    re.IGNORECASE,
+)
+_CLOCK_LANGUAGE = re.compile(
+    r"(?<![\w:])\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)(?![\w:])|"
+    r"(?<![\w:])\d{1,2}:\d{2}(?![\w:])",
+    re.IGNORECASE,
+)
+_RANGE_CLOCK = (
+    r"\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)|\d{1,2}:\d{2}"
+)
+_GENERIC_TIME_RANGE = re.compile(
+    rf"(?<![\w:])(?P<start>{_RANGE_CLOCK})\s*"
+    rf"(?:\s*,\s*)?(?:to|[-–—])(?:\s*,\s*)?"
+    rf"(?P<end>{_RANGE_CLOCK})(?![\w:])",
+    re.IGNORECASE,
+)
+_CONTEXTUAL_EVENT_REFERENCE = re.compile(
+    r"\b(?:event|one)\s+(?:i|you)\s+(?:just\s+)?"
+    r"(?:showed|shown|displayed)\b",
+    re.IGNORECASE,
+)
+_CALENDAR_SOURCE_SUFFIX = re.compile(
+    r"\s+from\s+(?:(?:my|the)\s+)?(?:primary\s+)?"
+    r"(?:google\s+)?calend(?:ar|er)\b.*$",
+    re.IGNORECASE,
+)
+_TITLE_TRAILING_FILLER = re.compile(
+    r"(?:\s*\b(?:for|on|at|from|during|in|of)\b\s*)+$",
+    re.IGNORECASE,
+)
+_LEADING_GENERIC_DELETE_TITLE = re.compile(
+    r"^\s*(?:(?:the|my|a|an)\s+)*(?:calendar\s+)?"
+    r"(?:event|meeting|appointment|session)\s+"
+    r"(?:(?:on|from|for|at|about|called|named|titled)\s+)?",
+    re.IGNORECASE,
+)
+_GENERIC_TITLE_QUERY_VALUES = {
+    "event", "events", "my event", "the event", "calendar event",
+    "meeting", "meetings", "my meeting", "the meeting",
+    "appointment", "appointments", "my appointment", "the appointment",
+    "session", "my session", "the session",
+    "class", "my class", "the class",
+    "this", "that", "it", "one", "the one",
+}
+_BARE_DELETE_PREFIX = re.compile(
+    r"^\s*(?:please\s+)?(?:delete|remove|cancel)\s+",
+    re.IGNORECASE,
+)
+_NON_CALENDAR_DELETE_DOMAIN = re.compile(
+    r"\b(?:email|emails|gmail|inbox|message|messages|thread|threads|draft|drafts|"
+    r"contact|contacts|drive|file|files|document|documents|doc|docs|"
+    r"spreadsheet|sheet|note|notes|memory|memories|task|tasks|todo|to-do)\b",
+    re.IGNORECASE,
+)
+_OTHER_MUTATION_ACTION = re.compile(
+    r"\b(?:send|reply|forward|draft|create|add|book|schedule|update|edit|"
+    r"change|move|reschedule|invite|rsvp|upload|download)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_generic_event_title(value: str) -> str:
+    """Drop a generic event noun only when a distinctive title remains.
+
+    Phrases such as "delete the event from 15th november gym time" leave
+    "event gym time" after date removal. The generic noun must not be stripped
+    from a legitimate one-word title such as "Event Horizon".
+    """
+    match = _LEADING_GENERIC_DELETE_TITLE.match(value)
+    if not match:
+        return value
+    remainder = value[match.end():].strip()
+    if len(remainder.split()) < 2:
+        return value
+    return remainder
+
+
+def _strip_title_date_time(value: str | None) -> str | None:
+    """Remove date/time language that belongs to lookup bounds, not the title."""
+    if not isinstance(value, str):
+        return None
+    text = _CALENDAR_SOURCE_SUFFIX.sub("", value)
+    text = _TIME_RANGE_IN_TITLE.sub(" ", text)
+    text = _CLOCK_LANGUAGE.sub(" ", text)
+    text = _DATE_LANGUAGE.sub(" ", text)
+    text = re.sub(r"\s*(?:,|;|:|\.)\s*", " ", text)
+    text = re.sub(r"^\s*[-–—]\s*|\s*[-–—]\s*$", " ", text)
+    text = _strip_leading_generic_event_title(text)
+    text = _TITLE_TRAILING_FILLER.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip(' \t"\'`“”')
+    return text or None
+
+
+def extract_calendar_title_phrase(value: str | None) -> str | None:
+    """Return the title-like portion of free text without lookup language."""
+    return _strip_title_date_time(value)
+
+
+def build_calendar_search_query(value: str | None) -> str | None:
+    """Derive a Google Calendar ``q`` value from a normalized title phrase."""
+    cleaned = _strip_title_date_time(value)
+    if not cleaned:
+        return None
+    normalized = " ".join(cleaned.casefold().split())
+    if not normalized or normalized in _GENERIC_TITLE_QUERY_VALUES:
+        return None
+    return cleaned
+
+
+def is_bare_calendar_delete_title(text: str) -> bool:
+    """Recognize ``delete <title>`` phrasing without a calendar/event noun.
+
+    This is intentionally narrow: it only applies to deletion commands with a
+    distinctive title-like payload and no other service domain or action verb.
+    """
+    if not isinstance(text, str) or not _BARE_DELETE_PREFIX.match(text):
+        return False
+    if _NON_CALENDAR_DELETE_DOMAIN.search(text):
+        return False
+    if _OTHER_MUTATION_ACTION.search(text):
+        return False
+    payload = _BARE_DELETE_PREFIX.sub("", text, count=1)
+    cleaned = build_calendar_search_query(payload)
+    return bool(cleaned)
 
 
 def _label_value(text: str, *labels: str) -> str | None:
@@ -203,10 +354,15 @@ def _extract_event_query(text: str) -> str | None:
     if recurring_series:
         return _clean_title(recurring_series.group("title"))
 
+    if _CONTEXTUAL_EVENT_REFERENCE.search(text):
+        return None
+
     contextual_descriptor = re.search(
         r"\b(?:my|the)\s+"
-        r"(?P<descriptor>[A-Za-z][\w'-]{0,40})\s+"
-        r"(?:event|meeting|appointment|discussion)\b",
+        r"(?P<descriptor>[A-Za-z][\w'-]*"
+        r"(?:\s+(?!title\b|to\b|from\b|on\b|at\b|for\b|with\b|about\b|"
+        r"named\b|called\b|titled\b)[A-Za-z][\w'-]*){0,3})\s+"
+        r"(?:event|meeting|appointment|session|class|discussion)\b",
         text,
         re.IGNORECASE,
     )
@@ -242,38 +398,23 @@ def _extract_event_query(text: str) -> str | None:
         re.IGNORECASE | re.MULTILINE,
     )
     if direct_title:
-        title = re.sub(
-            r"\s+from\s+(?:(?:my|the)\s+)?(?:primary\s+)?"
-            r"(?:google\s+)?calendar\b.*$",
-            "",
-            direct_title.group("title"),
-            flags=re.IGNORECASE,
-        )
-        # A spoken time range is parsed separately; keep the title query clean.
-        title = re.sub(
-            r"\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
-            r"\s*(?:to|[-–—])\s*"
-            r"\d{1,2}(?::\d{2})?\s*(?:am|pm)\b.*$",
-            "",
-            title,
-            flags=re.IGNORECASE,
-        )
-        cleaned = _clean_title(title)
-        if cleaned:
-            normalized = " ".join(cleaned.casefold().split())
-            # Generic nouns and demonstratives are not useful title queries;
-            # day-scoped generic discovery is handled separately in
-            # parse_calendar_delete_request.
-            if normalized in {
-                "calendar event",
-                "calendar meeting",
-                "this",
-                "that",
-                "it",
-                "one",
-                "the one",
-            }:
-                return None
+        cleaned = _strip_title_date_time(direct_title.group("title"))
+        if not cleaned:
+            return None
+        normalized = " ".join(cleaned.casefold().split())
+        # Demonstratives and contextual references cannot identify a stored
+        # title on their own; day-scoped generic discovery is handled
+        # separately in parse_calendar_delete_request.
+        if normalized in {
+            "calendar event",
+            "calendar meeting",
+            "this",
+            "that",
+            "it",
+            "one",
+            "the one",
+        } or _CONTEXTUAL_EVENT_REFERENCE.search(text):
+            return None
         return cleaned
     return None
 
@@ -430,6 +571,8 @@ def _parse_calendar_request_details(
     text: str,
     planner_time_zone: object | None = None,
     reference_time: datetime | None = None,
+    *,
+    allow_bare_time_range: bool = True,
 ) -> dict[str, Any]:
     """Extract shared event identity and timing details."""
     event_query = _extract_event_query(text)
@@ -506,17 +649,29 @@ def _parse_calendar_request_details(
                 )
                 if len(clocks) == 2:
                     original_start, original_end = clocks
+    if allow_bare_time_range and original_start is None and original_end is None:
+        # Date-language can repeat between the two clocks in a user-supplied
+        # range ("9:00 AM – Nov 15, 2026, 10:00 AM"). Strip it before matching
+        # the generic clock pair so the times still disambiguate candidates.
+        date_free_text = _DATE_LANGUAGE.sub(" ", text)
+        time_range = _GENERIC_TIME_RANGE.search(date_free_text)
+        if time_range:
+            clocks = _parse_clock_values(
+                f"{time_range.group('start')} {time_range.group('end')}"
+            )
+            if len(clocks) == 2:
+                original_start, original_end = clocks
     if original_start is None:
         original_start, original_error = _labeled_single_time(
             text,
-            ("Original start time", "Current start time", "Start time"),
+            ("Original start time", "Current start time", "Start time", "Start"),
         )
         if original_error:
             errors.append(original_error)
     if original_end is None:
         original_end, original_error = _labeled_single_time(
             text,
-            ("Original end time", "Current end time", "End time"),
+            ("Original end time", "Current end time", "End time", "End"),
         )
         if original_error:
             errors.append(original_error)
@@ -765,7 +920,7 @@ def _parse_calendar_request_details(
                 re.IGNORECASE,
             )
             or re.search(
-                r"\b(?:event|meeting|appointment)\s+"
+                r"\b(?:event|meeting|appointment|session|class|discussion)\s+"
                 r"(?:(?:(?:recurring|calendar)\s+)?series\s+)?"
                 r"(?:named|called|titled)\s+",
                 text,
@@ -776,6 +931,7 @@ def _parse_calendar_request_details(
                 text,
                 re.IGNORECASE,
             )
+            or (is_bare_calendar_delete_title(text) and bool(event_query))
             or _TITLE_PREFIX.search(text)
         ),
         "event_title_is_prefix": bool(_TITLE_PREFIX.search(text)),
@@ -800,7 +956,16 @@ def parse_calendar_delete_request(
     details["delete_entire_series"] = bool(re.search(
         r"\b(?:entire|whole|complete|full|all)\b.{0,50}"
         r"\b(?:recurring\s+)?series\b|"
-        r"\b(?:all\s+future\s+occurrences|entire\s+recurrence)\b",
+        r"\bentire\s+recurrence\b",
+        lowered,
+    ))
+    # Future-only recurrence deletion is deliberately separate from series-wide
+    # deletion. It is not implemented and must be rejected before search so a
+    # simple confirmation can never escalate into a series delete.
+    details["delete_future_occurrences_only"] = bool(re.search(
+        r"\b(?:all|every|any)\s+future\s+(?:occurrences?|instances?|events?)\b|"
+        r"\b(?:future\s+occurrences?|future\s+instances?)\b|"
+        r"\b(?:from\s+now\s+on|going\s+forward|from\s+today\s+onward)\b",
         lowered,
     ))
     if re.search(
@@ -847,6 +1012,48 @@ def parse_calendar_delete_request(
                 except Exception as exc:
                     details.setdefault("errors", []).append(str(exc))
 
+    # A distinctive title with no date still needs an explicit local-time
+    # window. Without it the service falls back to timeMin=now UTC and an
+    # earlier same-local-day event can never be retrieved.
+    details["no_date_lookup_window"] = False
+    if (
+        not details.get("delete_entire_series")
+        and not details.get("delete_future_occurrences_only")
+        and details.get("event_date") is None
+        and details.get("lookup_time_min") is None
+        and build_calendar_search_query(details.get("event_query"))
+    ):
+        zone = None
+        if isinstance(details.get("time_zone"), str):
+            try:
+                zone = ZoneInfo(details["time_zone"])
+            except Exception:
+                zone = None
+        ref = reference_time
+        if isinstance(ref, str):
+            try:
+                ref = datetime.fromisoformat(ref.replace("Z", "+00:00"))
+            except Exception:
+                ref = None
+        if zone is not None:
+            base = (
+                ref.astimezone(zone).date()
+                if isinstance(ref, datetime)
+                else datetime.now(zone).date()
+            )
+            try:
+                details["lookup_time_min"] = _aware_local_datetime(
+                    base - timedelta(days=NO_DATE_LOOKBACK_DAYS), time.min, zone
+                )
+                details["lookup_time_max"] = _aware_local_datetime(
+                    base + timedelta(days=NO_DATE_LOOKAHEAD_DAYS + 1),
+                    time.min,
+                    zone,
+                )
+                details["no_date_lookup_window"] = True
+            except Exception as exc:
+                details.setdefault("errors", []).append(str(exc))
+
     missing_fields: list[str] = []
     # Generic deletion (e.g. "delete the event from today's calendar") without a specific title/time
     # should discover/list that day's actual events instead of failing on missing title.
@@ -879,6 +1086,11 @@ def parse_calendar_delete_request(
         if not has_specific_time and has_day_scope and (generic_title_like or bulk_all_scope):
             generic_event_discovery = True
             details["event_query"] = None
+            # The query is now intentionally absent; a previously detected
+            # "explicit title" flag would otherwise filter out every listed
+            # event during candidate matching.
+            details["event_title_is_explicit"] = False
+            details["event_title_is_prefix"] = False
 
     if not details.get("event_query") and not generic_event_discovery:
         missing_fields.append("event title")
@@ -912,6 +1124,7 @@ def parse_calendar_update_message(
         text,
         planner_time_zone,
         reference_time,
+        allow_bare_time_range=False,
     )
 
 

@@ -260,22 +260,36 @@ def _important_summary_request_result():
     )
 
 
-def test_summarize_important_empty_sets_pending_unread_fallback(monkeypatch):
+def test_summarize_important_empty_result_does_not_substitute_unread(monkeypatch):
     service, message_service, _ = _make_service()
     gmail_exec = _patch_common(monkeypatch)
-    gmail_exec.return_value = {"messages": [], "search_criteria": "is:important newer_than:7d", "period": "last 7 days"}
+    gmail_exec.return_value = {
+        "messages": [],
+        "search_criteria": "is:important",
+        "period": "unspecified (all dates)",
+        "scope": "all",
+        "criteria": {
+            "importance": "gmail_important",
+            "read_status": "any",
+            "scope": "all",
+            "period": "any",
+            "period_label": None,
+            "window_days": None,
+            "sender": None,
+            "recipient": None,
+            "topic": None,
+        },
+    }
 
     r = _send(service, "Help me summarize my important emails.")
     text = r["assistant_message"]["content"] or ""
     meta = r["assistant_message"].get("metadata") or {}
     pending = meta.get("pending_gmail_clarification")
-    assert "search your unread Inbox emails instead?" in text
-    assert isinstance(pending, dict)
-    assert pending["type"] == "gmail_search_fallback_clarification"
-    assert pending["from_intent"] == "summarize_important"
-    assert pending["fallback_intent"] == "summarize_unread"
-    assert pending["user_id"] == str(USER_ID)
-    assert pending["conversation_id"] == str(CONVERSATION_ID)
+    assert "didn't find any important emails" in text.lower()
+    assert "gmail query: is:important" in text.lower()
+    assert "did not substitute unread" in text.lower()
+    assert "search your unread inbox emails instead?" not in text.lower()
+    assert pending is None
     assert gmail_exec.await_count >= 1
 
 

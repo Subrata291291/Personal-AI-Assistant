@@ -14,6 +14,11 @@ from pydantic import (
 from app.schemas.email_draft import normalize_email_address
 
 
+# Bounded safety ceiling for Gmail read plans. Long requests are processed in
+# batches; this value limits retrieval work, not the completeness claim.
+MAX_GMAIL_READ_RESULTS = 50
+
+
 class GmailPlanBase(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -156,7 +161,7 @@ class SearchEmailsPlan(GmailPlanBase):
     after: date | None = None
     before: date | None = None
     has_attachment: bool | None = None
-    max_results: int = Field(default=5, ge=1, le=10)
+    max_results: int = Field(default=5, ge=1, le=MAX_GMAIL_READ_RESULTS)
 
     @field_validator("query", "sender", "subject")
     @classmethod
@@ -193,22 +198,66 @@ class SearchEmailsPlan(GmailPlanBase):
 
 class SummarizeImportantPlan(GmailPlanBase):
     intent: Literal["summarize_important"]
-    max_results: int = Field(default=10, ge=1, le=10)
+    max_results: int = Field(default=10, ge=1, le=MAX_GMAIL_READ_RESULTS)
+    importance_source: Literal["gmail_important"] = "gmail_important"
+    read_status: Literal["any", "unread", "read"] = "any"
+    scope: Literal["all", "inbox", "sent"] = "all"
+    period: Literal[
+        "any",
+        "today",
+        "yesterday",
+        "last_n_days",
+        "this_week",
+        "custom",
+    ] = "any"
+    window_days: int | None = Field(default=None, ge=1, le=365)
+    sender: str | None = Field(default=None, min_length=1, max_length=320)
+    recipient: str | None = Field(default=None, min_length=1, max_length=320)
+    topic: str | None = Field(default=None, min_length=1, max_length=200)
+    after: date | None = None
+    before: date | None = None
+    time_zone: str | None = Field(default=None, min_length=1, max_length=100)
+    period_label: str | None = Field(default=None, max_length=100)
+
+    @field_validator("sender", "recipient", "topic", "time_zone", "period_label")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value or any(ord(character) < 32 for character in value):
+            raise ValueError("Text criteria cannot be empty or contain control characters.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_important_criteria(self) -> "SummarizeImportantPlan":
+        if self.after and self.before and self.after >= self.before:
+            raise ValueError("'after' must be earlier than 'before'.")
+        if self.period == "last_n_days" and self.window_days is None:
+            raise ValueError("'window_days' is required for a relative day range.")
+        if self.period == "custom" and not (self.after or self.before):
+            raise ValueError("A custom range requires at least one date boundary.")
+        if self.time_zone:
+            try:
+                ZoneInfo(self.time_zone)
+            except (ValueError, ZoneInfoNotFoundError):
+                raise ValueError("Unknown Gmail summary time zone.")
+        return self
 
 
 class SummarizeUrgentPlan(GmailPlanBase):
     intent: Literal["summarize_urgent"]
-    max_results: int = Field(default=10, ge=1, le=10)
+    max_results: int = Field(default=10, ge=1, le=MAX_GMAIL_READ_RESULTS)
 
 
 class SummarizeAttentionPlan(GmailPlanBase):
     intent: Literal["summarize_attention"]
-    max_results: int = Field(default=10, ge=1, le=10)
+    max_results: int = Field(default=10, ge=1, le=MAX_GMAIL_READ_RESULTS)
 
 
 class SummarizeTodayPlan(GmailPlanBase):
     intent: Literal["summarize_today"]
-    max_results: int = Field(default=10, ge=1, le=10)
+    max_results: int = Field(default=10, ge=1, le=MAX_GMAIL_READ_RESULTS)
 
 
 class SummarizeLatestThreadPlan(GmailPlanBase):
@@ -236,10 +285,17 @@ class GetEmailPlan(GmailPlanBase):
 
 class GetLatestEmailPlan(GmailPlanBase):
     intent: Literal["get_latest_email"]
-    sender: str = Field(
+    sender: str | None = Field(
+        default=None,
         min_length=1,
         max_length=320,
     )
+    # "all" covers received mail (sent messages are excluded separately);
+    # "sent" restricts the lookup to the Sent mailbox.
+    folder: Literal["all", "sent"] = "all"
+    # Bounded count for "latest five"/"last N" phrasings. One remains the
+    # default so every legacy single-message caller keeps its old contract.
+    max_results: int = Field(default=1, ge=1, le=MAX_GMAIL_READ_RESULTS)
 
 
 class GetThreadPlan(GmailPlanBase):
@@ -253,7 +309,7 @@ class GetThreadPlan(GmailPlanBase):
 
 class SummarizeUnreadPlan(GmailPlanBase):
     intent: Literal["summarize_unread"]
-    max_results: int = Field(default=5, ge=1, le=5)
+    max_results: int = Field(default=5, ge=1, le=MAX_GMAIL_READ_RESULTS)
 
 
 class SummarizeThreadPlan(GmailPlanBase):

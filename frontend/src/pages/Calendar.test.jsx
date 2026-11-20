@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { useState } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
   fireEvent,
@@ -31,6 +34,16 @@ vi.mock('../services/calendarService.js', () => ({
   },
 }))
 
+vi.mock('../services/actionApprovalService.js', () => ({
+  actionApprovalService: {
+    approve: vi.fn(),
+    reject: vi.fn(),
+    execute: vi.fn(),
+    getProposal: vi.fn(),
+  },
+}))
+
+import ActionApprovalCard from '../components/ActionApprovalCard.jsx'
 import Calendar from './Calendar.jsx'
 import {
   localDateTimeCandidates,
@@ -39,6 +52,12 @@ import {
 } from './Calendar.jsx'
 import { api } from '../lib/api.js'
 import { calendarService } from '../services/calendarService.js'
+
+const appCss = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf8')
+const calendarSvg = readFileSync(
+  resolve(process.cwd(), 'public/icons/google/calendar.svg'),
+  'utf8',
+)
 
 describe('Calendar local date-time conversion', () => {
   it('resolves ordinary calendar-day boundaries in the selected timezone', () => {
@@ -104,10 +123,10 @@ describe('Calendar local date-time conversion', () => {
 
 function CalendarLayout({ isDark = true }) {
   return (
-    <>
+    <div className={isDark ? 'dark' : ''}>
       <Link to="/dashboard/away">Away</Link>
       <Outlet context={{ isDark }} />
-    </>
+    </div>
   )
 }
 
@@ -166,6 +185,93 @@ const emptyEventList = {
   events: [],
   next_page_token: null,
   time_zone: 'Asia/Kolkata',
+}
+
+function timedCalendarEvent(id, summary) {
+  return {
+    id,
+    summary,
+    start: { date_time: '2026-11-21T03:30:00Z', time_zone: 'Asia/Kolkata' },
+    end: { date_time: '2026-11-21T04:30:00Z', time_zone: 'Asia/Kolkata' },
+    attendees: [],
+  }
+}
+
+function completedCalendarDeleteProposal() {
+  return {
+    proposal_id: 'calendar-delete-proposal',
+    action_type: 'calendar.delete_event',
+    status: 'completed',
+    execution_available: true,
+    connection_id: 'calendar-account',
+    account_email: 'calendar@example.com',
+    parameters: {
+      calendar_id: 'primary',
+      event_id: 'gym-event-1',
+      expected_etag: '"etag-1"',
+      current_event: {
+        summary: 'Gym time for',
+        start: { dateTime: '2026-11-21T03:30:00Z', timeZone: 'Asia/Kolkata' },
+        end: { dateTime: '2026-11-21T04:30:00Z', timeZone: 'Asia/Kolkata' },
+      },
+    },
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    result: { outcome: 'deleted', google_event_id: 'gym-event-1' },
+  }
+}
+
+function CalendarDeletionApproval({ proposal }) {
+  const [message, setMessage] = useState(() => ({
+    id: 'calendar-delete-approval-message',
+    metadata: { action_approval: proposal },
+  }))
+
+  return (
+    <ActionApprovalCard
+      message={message}
+      isDark
+      onUpdated={setMessage}
+    />
+  )
+}
+
+function CalendarDeletionRoute({ proposal }) {
+  const [showApproval, setShowApproval] = useState(false)
+
+  return (
+    <>
+      <button type="button" onClick={() => setShowApproval(true)}>
+        Reveal approval
+      </button>
+      <Calendar />
+      {showApproval && <CalendarDeletionApproval proposal={proposal} />}
+    </>
+  )
+}
+
+function renderCalendarWithDeletionApproval(proposal) {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, gcTime: 0 },
+      mutations: { retry: false },
+    },
+  })
+
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/dashboard/calendar']}>
+        <Routes>
+          <Route element={<CalendarLayout isDark />}>
+            <Route
+              path="/dashboard/calendar"
+              element={<CalendarDeletionRoute proposal={proposal} />}
+            />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  )
+  return { ...view, queryClient }
 }
 
 async function openEventDetailsWithDescription(description) {
@@ -246,6 +352,95 @@ describe('Calendar workspace', () => {
       pageToken: undefined,
       signal: expect.any(AbortSignal),
     })
+  })
+
+  it('keeps the weekly timeline in the document scroll flow while allowing horizontal overflow', async () => {
+    renderCalendar()
+
+    expect(await screen.findByRole('heading', { name: 'Google Calendar' }))
+      .toBeInTheDocument()
+    const timeline = await screen.findByTestId('calendar-timeline-scroll')
+    expect(timeline).toHaveClass('scrollbar-hidden', 'overflow-x-auto')
+    expect(timeline).toHaveClass('overflow-y-hidden')
+    expect(timeline.className).not.toContain('overflow-y-auto')
+  })
+
+  it('keeps the month grid in the document scroll flow while allowing horizontal overflow', async () => {
+    renderCalendar()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'month' }))
+
+    const monthGrid = await screen.findByTestId('calendar-month-scroll')
+    expect(monthGrid).toHaveClass('scrollbar-hidden', 'overflow-x-auto')
+    expect(monthGrid).toHaveClass('overflow-y-hidden')
+    expect(monthGrid.className).not.toContain('overflow-y-auto')
+  })
+
+  it.each([true, false])('renders the original Calendar logo in both themes (isDark=%s)', async (
+    isDark,
+  ) => {
+    const { unmount } = renderCalendar(isDark)
+
+    const logo = await screen.findByRole('img', { name: 'Google Calendar logo' })
+    expect(logo.tagName).toBe('IMG')
+    expect(logo).toHaveAttribute('src', '/icons/google/calendar.svg')
+    expect(logo).toHaveAttribute('alt', 'Google Calendar logo')
+    expect(logo).toHaveClass('h-10', 'w-10')
+    expect(logo).not.toHaveAttribute('data-testid')
+    expect(logo.className).not.toContain('brightness-0')
+    expect(logo.className).not.toContain('invert')
+    expect(logo.className).not.toContain('grayscale')
+    unmount()
+  })
+
+  it('keeps the original multicolour Calendar SVG asset', () => {
+    for (const color of [
+      '#4285f4',
+      '#EA4335',
+      '#34A853',
+      '#FBBC04',
+      '#188038',
+      '#1967D2',
+    ]) {
+      expect(calendarSvg).toContain(`fill="${color}"`)
+    }
+    expect(calendarSvg).toContain('<path fill="#fff"')
+  })
+
+  it('styles the native date-picker indicator from the manual theme', () => {
+    expect(appCss).toContain('input[type="date"]::-webkit-calendar-picker-indicator')
+    expect(appCss).toMatch(
+      /input\[type="date"\]::-webkit-calendar-picker-indicator\s*\{[^}]*filter:\s*invert\(0\)/,
+    )
+    expect(appCss).toMatch(
+      /\.dark input\[type="date"\]::-webkit-calendar-picker-indicator\s*\{[^}]*filter:\s*invert\(1\)/,
+    )
+    expect(appCss).not.toMatch(
+      /calendar-picker-indicator\s*\{[^}]*display:\s*none/,
+    )
+    expect(appCss).not.toMatch(
+      /calendar-picker-indicator\s*\{[^}]*appearance:\s*none/,
+    )
+  })
+
+  it.each([true, false])('keeps the native date input inside the manual theme shell (isDark=%s)', async (
+    isDark,
+  ) => {
+    const { unmount } = renderCalendar(isDark)
+
+    const dateInput = await screen.findByLabelText('Calendar date')
+    expect(dateInput).toHaveAttribute('type', 'date')
+    expect(dateInput.value).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+    expect(dateInput.className).not.toContain('hidden')
+    expect(dateInput.className).not.toContain('invisible')
+    expect(dateInput.className).not.toContain('sr-only')
+    expect(dateInput.className).not.toContain('appearance-none')
+    if (isDark) {
+      expect(dateInput.closest('.dark')).toBeInTheDocument()
+    } else {
+      expect(dateInput.closest('.dark')).toBeNull()
+    }
+    unmount()
   })
 
   it('loads additional event pages, preserves events, and removes overlapping duplicates', async () => {
@@ -1077,5 +1272,115 @@ describe('Calendar workspace', () => {
       'That local time does not exist in the selected time zone.',
     )
     expect(calendarService.getFreeBusy).not.toHaveBeenCalled()
+  })
+
+  it('removes a confirmed Assistant deletion from the rendered Calendar without a refresh', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-21T06:00:00.000Z'))
+    const deletedEvent = timedCalendarEvent('gym-event-1', 'Gym time for')
+    const similarEvent = timedCalendarEvent('gym-event-2', 'Gym time backup')
+    calendarService.listEvents
+      .mockResolvedValueOnce({
+        ...emptyEventList,
+        events: [deletedEvent, similarEvent],
+      })
+      .mockResolvedValue({
+        ...emptyEventList,
+        events: [similarEvent],
+      })
+
+    const { queryClient } = renderCalendarWithDeletionApproval(
+      completedCalendarDeleteProposal(),
+    )
+
+    expect(await screen.findByRole('button', { name: /Gym time for/ }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Gym time backup/ }))
+      .toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reveal approval' }))
+
+    expect(await screen.findByText(
+      /Google Calendar confirmed the event was deleted/,
+    )).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /Gym time for/ }))
+        .not.toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: /Gym time backup/ }))
+      .toBeInTheDocument()
+    expect(calendarService.listEvents).toHaveBeenCalledTimes(2)
+
+    const cachedPages = queryClient
+      .getQueryCache()
+      .findAll()
+      .filter((query) => query.queryKey[0] === 'calendar-events')
+      .flatMap((query) => query.state.data?.pages || [])
+    expect(cachedPages.flatMap((page) => page.events || []).map((event) => event.id))
+      .not.toContain('gym-event-1')
+    expect(cachedPages.flatMap((page) => page.events || []).map((event) => event.id))
+      .toContain('gym-event-2')
+  })
+
+  it('cannot be repopulated by a pre-delete list response that finishes late', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-21T06:00:00.000Z'))
+    const deletedEvent = timedCalendarEvent('gym-event-1', 'Gym time for')
+    let resolveStaleResponse
+    let staleSignal
+    const staleResponse = new Promise((resolve) => {
+      resolveStaleResponse = resolve
+    })
+    let callCount = 0
+    calendarService.listEvents.mockImplementation(({ signal }) => {
+      callCount += 1
+      if (callCount === 1) {
+        staleSignal = signal
+        return staleResponse
+      }
+      return Promise.resolve({ ...emptyEventList, events: [] })
+    })
+
+    renderCalendarWithDeletionApproval(completedCalendarDeleteProposal())
+
+    await waitFor(() => expect(calendarService.listEvents).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByRole('button', { name: 'Reveal approval' }))
+
+    expect(await screen.findByText(
+      /Google Calendar confirmed the event was deleted/,
+    )).toBeInTheDocument()
+    await waitFor(() => expect(calendarService.listEvents).toHaveBeenCalledTimes(2))
+
+    resolveStaleResponse({
+      ...emptyEventList,
+      events: [deletedEvent],
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /Gym time for/ }))
+        .not.toBeInTheDocument()
+    })
+    expect(staleSignal.aborted).toBe(true)
+  })
+
+  it('does not render a cancelled event tombstone returned by a stale list response', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-21T06:00:00.000Z'))
+    const cancelledEvent = {
+      ...timedCalendarEvent('gym-event-1', 'Gym time for'),
+      status: 'cancelled',
+    }
+    const activeEvent = timedCalendarEvent('gym-event-2', 'Gym time backup')
+    calendarService.listEvents.mockResolvedValue({
+      ...emptyEventList,
+      events: [cancelledEvent, activeEvent],
+    })
+
+    renderCalendar()
+
+    expect(await screen.findByRole('button', { name: /Gym time backup/ }))
+      .toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Gym time for/ }))
+      .not.toBeInTheDocument()
   })
 })

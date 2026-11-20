@@ -236,6 +236,21 @@ class GmailEmailParser:
         )
         headers = cls.extract_headers(payload)
         attachments = cls.extract_attachments(payload)
+        full_bodies = cls.extract_bodies(
+            payload,
+            include_html=include_html,
+            max_body_chars=None,
+        )
+        body_truncated = (
+            (
+                max_body_chars is not None
+                and len(full_bodies.get("plain_text", "")) > max_body_chars
+            )
+            or (
+                max_body_chars is not None
+                and len(full_bodies.get("html", "")) > max_body_chars
+            )
+        )
 
         return {
             "id": message.get("id"),
@@ -244,6 +259,7 @@ class GmailEmailParser:
             "internal_date": message.get("internalDate"),
             "headers": headers,
             "body": bodies,
+            "body_truncated": body_truncated,
             "labels": message.get("labelIds", []),
             "attachments": attachments,
         }

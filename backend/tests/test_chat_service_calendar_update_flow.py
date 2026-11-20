@@ -853,7 +853,7 @@ def test_timed_out_completed_chat_retry_recovers_saved_calendar_proposal(
     [
         (
             "Delete my Personal AI Assistant - Calendar Test.",
-            "Personal AI Assistant - Calendar Test",
+            "Personal AI Assistant - Calendar Test on November 10, 2026",
             "Personal AI Assistant - Calendar Test",
         ),
         ("Delete my event.", "Gym", "Gym"),

@@ -3,7 +3,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from threading import Event, Thread
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -27,7 +27,11 @@ from app.repositories.chat_request_repository import (
 from app.services.message_service import MessageService
 from app.services.user_connection_service import UserConnectionService
 from app.workflows.chat_graph import ASSISTANT_ROUTE_NODES, chat_graph
-from app.workflows.gmail_agent_nodes import build_runtime_capabilities
+from app.workflows.gmail_agent_nodes import (
+    _extract_explicit_calendar_date,
+    _relative_calendar_date,
+    build_runtime_capabilities,
+)
 from app.services import message_service
 from app.schemas.action_approval import ApprovalProposalCreate
 from app.services.action_approval_service import ActionApprovalService
@@ -271,6 +275,7 @@ class ChatService:
         *,
         user_id: UUID,
         conversation_id: UUID,
+        connection_id: UUID | str | None = None,
         now: datetime,
     ) -> dict[str, Any] | None:
         for message in reversed(history):
@@ -292,6 +297,13 @@ class ChatService:
                 or pending.get("type") != "contacts_read_clarification"
                 or str(pending.get("user_id")) != str(user_id)
                 or str(pending.get("conversation_id")) != str(conversation_id)
+            ):
+                return None
+            pending_connection_id = pending.get("connection_id")
+            if (
+                pending_connection_id is not None
+                and connection_id is not None
+                and str(pending_connection_id) != str(connection_id)
             ):
                 return None
             try:
@@ -328,6 +340,7 @@ class ChatService:
         user_id: UUID,
         conversation_id: UUID,
         now: datetime,
+        connection_id: str | None = None,
     ) -> dict[str, Any] | None:
         for message in reversed(history):
             if message.get("role") != "assistant":
@@ -339,12 +352,18 @@ class ChatService:
                 else None
             )
             if not isinstance(pending, dict):
-                return None
+                # A later turn may suspend this state by omitting it. Keep
+                # scanning so a valid, unexpired earlier state can be restored.
+                continue
             if (
                 pending.get("version") != 1
                 or pending.get("operation") != "availability"
                 or pending.get("user_id") != str(user_id)
                 or pending.get("conversation_id") != str(conversation_id)
+                or (
+                    connection_id is not None
+                    and pending.get("connection_id") != str(connection_id)
+                )
             ):
                 return None
             try:
@@ -368,6 +387,7 @@ class ChatService:
         *,
         user_id: UUID,
         conversation_id: UUID,
+        connection_id: str | None,
         now: datetime,
     ) -> dict[str, Any] | None:
         for message in reversed(history):
@@ -388,6 +408,8 @@ class ChatService:
                 or pending.get("operation") != "delete_selection"
                 or str(pending.get("user_id")) != str(user_id)
                 or str(pending.get("conversation_id")) != str(conversation_id)
+                or not connection_id
+                or str(pending.get("connection_id")) != str(connection_id)
             ):
                 return None
             try:
@@ -524,6 +546,7 @@ class ChatService:
         *,
         user_id: UUID,
         conversation_id: UUID,
+        connection_id: UUID | None = None,
         now: datetime,
     ) -> dict[str, Any] | None:
         for item in reversed(history):
@@ -545,6 +568,13 @@ class ChatService:
             if (
                 str(pending.get("user_id")) != str(user_id)
                 or str(pending.get("conversation_id")) != str(conversation_id)
+            ):
+                continue
+            pending_connection_id = pending.get("connection_id")
+            if (
+                pending_connection_id is not None
+                and connection_id is not None
+                and str(pending_connection_id) != str(connection_id)
             ):
                 continue
             try:
@@ -1101,6 +1131,32 @@ class ChatService:
             return None
         return cls.STREAM_NODE_STATUS.get(name)
 
+    def _mark_chat_request_failed(
+        self,
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        idempotency_key: UUID,
+        worker_id: str,
+        error_message: str,
+    ) -> None:
+        """Persist a terminal request failure using the active worker's fence."""
+        try:
+            self.request_repository.update_status(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                idempotency_key=idempotency_key,
+                worker_id=worker_id,
+                status="failed",
+                error_message=error_message,
+            )
+        except Exception as exc:
+            log_exception_traceback(
+                logger,
+                "Could not persist the failed chat request status.",
+                exc,
+            )
+
     def _send_message_generator(
         self,
         user_id: UUID,
@@ -1297,6 +1353,9 @@ class ChatService:
         heartbeat_stop_event = None
         heartbeat_lease_lost_event = None
         heartbeat_thread = None
+        # Set only once an assistant message has actually been saved. A client
+        # disconnect before this point must leave a terminal request status.
+        assistant_message = None
 
         try:
             # 8. Recover or create the request-linked user message.
@@ -1448,6 +1507,11 @@ class ChatService:
                 user_id=user_id,
                 conversation_id=conversation_id,
                 now=request_time,
+                connection_id=(
+                    str(freebusy_connection_id)
+                    if freebusy_connection_id
+                    else None
+                ),
             )
             calendar_capabilities = {
                 **calendar_access["capabilities"],
@@ -1665,6 +1729,9 @@ class ChatService:
                 history,
                 user_id=user_id,
                 conversation_id=conversation_id,
+                connection_id=(
+                    str(write_connection_id) if write_connection_id else None
+                ),
                 now=request_time,
             )
             if pending_calendar_delete_selection is not None:
@@ -1683,10 +1750,15 @@ class ChatService:
                 history,
                 user_id=user_id,
                 conversation_id=conversation_id,
+                connection_id=effective_gmail_connection_id,
                 now=request_time,
             )
             if pending_gmail_clarification is not None:
                 initial_state["pending_gmail_clarification"] = pending_gmail_clarification
+            if effective_gmail_connection_id is not None:
+                initial_state["gmail_connection_id"] = str(
+                    effective_gmail_connection_id
+                )
             pending_calendar_draft = self._pending_calendar_create_draft(
                 history,
             )
@@ -1705,6 +1777,7 @@ class ChatService:
                 history,
                 user_id=user_id,
                 conversation_id=conversation_id,
+                connection_id=contacts_connection_id,
                 now=request_time,
             )
             if pending_contacts_clarification is not None:
@@ -1924,6 +1997,23 @@ class ChatService:
                     heartbeat_thread=heartbeat_thread,
                 )
 
+            if (
+                isinstance(
+                    initial_state.get("pending_calendar_delete_selection"),
+                    dict,
+                )
+                and result.get("assistant_route") != "google_calendar"
+                and "pending_calendar_delete_selection" in result
+            ):
+                # LangGraph preserves inherited state keys. A fresh non-Calendar
+                # turn must suspend (not clear) the old clarification, so omit
+                # it from this turn's persisted metadata without writing None.
+                result = {
+                    key: value
+                    for key, value in result.items()
+                    if key != "pending_calendar_delete_selection"
+                }
+
             assistant_content = result.get("assistant_response")
 
             if (
@@ -2025,6 +2115,10 @@ class ChatService:
                         assistant_metadata["gmail_sources"] = (
                             result["gmail_sources"]
                         )
+                    if result.get("contacts_provenance"):
+                        assistant_metadata["contacts_provenance"] = (
+                            result["contacts_provenance"]
+                        )
                     if result.get("response_metadata"):
                         assistant_metadata["response_completion"] = (
                             result["response_metadata"]
@@ -2054,17 +2148,105 @@ class ChatService:
                         assistant_metadata["pending_calendar_action"] = (
                             pending_action
                         )
+                    _gmail_plan = result.get("gmail_plan")
+                    _calendar_tool = (
+                        _gmail_plan.get("calendar_tool")
+                        if isinstance(_gmail_plan, dict)
+                        else None
+                    )
+                    _availability_tool = _calendar_tool in {
+                        "clarify",
+                        "check_calendar_availability",
+                    }
                     if (
                         result.get("assistant_route") == "google_calendar"
-                        and isinstance(result.get("gmail_plan"), dict)
-                        and result["gmail_plan"].get("calendar_tool")
-                        == "clarify"
+                        and _availability_tool
                         and re.search(
-                            r"\b(?:free|available|availability)\b",
+                            r"\b(?:free|available|availability|busy)\b",
                             normalized_content,
                             re.IGNORECASE,
                         )
                     ):
+                        # Keep a short-lived, fully scoped availability context so
+                        # immediate refinements ("check full day", "asia india")
+                        # can resume the same local day without another broad
+                        # clarification. A successful free/busy check also leaves
+                        # this context because the user may still refine it.
+                        _plan_args = (
+                            _gmail_plan.get("calendar_arguments")
+                            if isinstance(_gmail_plan, dict)
+                            and isinstance(
+                                _gmail_plan.get("calendar_arguments"),
+                                dict,
+                            )
+                            else {}
+                        )
+                        _executed_args = result.get(
+                            "calendar_executed_arguments"
+                        )
+                        _availability_args = (
+                            _executed_args
+                            if isinstance(_executed_args, dict)
+                            else _plan_args
+                        )
+                        _availability_tz = str(
+                            _availability_args.get("time_zone")
+                            or user_timezone
+                        )
+                        _target_date: date | None = None
+                        _whole_day = bool(re.search(
+                            r"\b(?:full|all|whole)\s+day\b",
+                            normalized_content,
+                            re.IGNORECASE,
+                        ))
+                        try:
+                            _resolved_zone = ZoneInfo(_availability_tz)
+                            _raw_start = _availability_args.get("time_min")
+                            _raw_end = _availability_args.get("time_max")
+                            if isinstance(_raw_start, str) and isinstance(
+                                _raw_end,
+                                str,
+                            ):
+                                _start_dt = datetime.fromisoformat(
+                                    _raw_start.replace("Z", "+00:00")
+                                )
+                                _end_dt = datetime.fromisoformat(
+                                    _raw_end.replace("Z", "+00:00")
+                                )
+                                _target_date = _start_dt.astimezone(
+                                    _resolved_zone
+                                ).date()
+                                _whole_day = (
+                                    _start_dt.astimezone(
+                                        _resolved_zone
+                                    ).time()
+                                    == datetime.min.time()
+                                    and _end_dt.astimezone(
+                                        _resolved_zone
+                                    ).date()
+                                    == _target_date + timedelta(days=1)
+                                    and _end_dt.astimezone(
+                                        _resolved_zone
+                                    ).time()
+                                    == datetime.min.time()
+                                )
+                        except (ValueError, KeyError, TypeError):
+                            _target_date = None
+                        if _target_date is None:
+                            _temp_state = {
+                                "user_timezone": _availability_tz,
+                                "request_time": request_time,
+                            }
+                            _target_date = _relative_calendar_date(
+                                normalized_content, _temp_state
+                            )
+                        if _target_date is None:
+                            _target_date = _extract_explicit_calendar_date(
+                                normalized_content,
+                                reference_date=request_time.astimezone(
+                                    ZoneInfo(_availability_tz)
+                                ).date(),
+                            )
                         assistant_metadata[
                             "pending_calendar_availability"
                         ] = {
@@ -2073,8 +2255,8 @@ class ChatService:
                             "user_id": str(user_id),
                             "conversation_id": str(conversation_id),
                             "connection_id": str(
-                                event_read_connection_id
-                                or freebusy_connection_id
+                                freebusy_connection_id
+                                or event_read_connection_id
                                 or write_connection_id
                                 or ""
                             ),
@@ -2082,14 +2264,17 @@ class ChatService:
                                 request_time + timedelta(minutes=5)
                             ).isoformat(),
                             "original_request": normalized_content,
-                            "whole_day": bool(
-                                re.search(
-                                    r"\bwhole\s+day\b",
-                                    normalized_content,
-                                    re.IGNORECASE,
-                                )
+                            "whole_day": _whole_day,
+                            "time_zone": _availability_tz,
+                            "target_date": (
+                                _target_date.isoformat()
+                                if isinstance(_target_date, date)
+                                else None
                             ),
-                            "time_zone": user_timezone,
+                            "resolved": (
+                                _calendar_tool
+                                == "check_calendar_availability"
+                            ),
                         }
                     if "calendar_create_draft" in result:
                         assistant_metadata["calendar_create_draft"] = (
@@ -2495,23 +2680,33 @@ class ChatService:
         except ChatRequestUncertainError:
             raise
 
-        except Exception:
-            # Only the active worker can mark the request failed.
-            try:
-                self.request_repository.update_status(
+        except GeneratorExit:
+            # A mid-stream client disconnect is not a completed response. When
+            # nothing was persisted, mark the request failed so a retry gets
+            # deterministic terminal guidance instead of a stuck conflict.
+            # If the assistant message was already saved, leave it untouched
+            # so the reconcile path can still complete the original request.
+            if assistant_message is None:
+                self._mark_chat_request_failed(
                     user_id=user_id,
                     conversation_id=conversation_id,
                     idempotency_key=idempotency_key,
                     worker_id=worker_id,
-                    status="failed",
-                    error_message="Chat execution failed.",
+                    error_message=(
+                        "Chat request ended before the assistant response was saved."
+                    ),
                 )
-            except Exception as exc:
-                log_exception_traceback(
-                    logger,
-                    "Could not persist the failed chat request status.",
-                    exc,
-                )
+            raise
+
+        except Exception:
+            # Only the active worker can mark the request failed.
+            self._mark_chat_request_failed(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                idempotency_key=idempotency_key,
+                worker_id=worker_id,
+                error_message="Chat execution failed.",
+            )
             raise
 
     def send_message(

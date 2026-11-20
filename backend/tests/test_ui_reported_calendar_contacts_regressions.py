@@ -219,6 +219,9 @@ def test_issue4_contacts_clarification_candidates_displayed_and_stored_consisten
             "total_items": 3,
         })
     monkeypatch.setattr(contacts_read, "create_contacts_tools", lambda **_: [FakeContactsTool("search_contacts", search_contacts), FakeContactsTool("get_contact", lambda a: _cenv_ok({}))])
+    # Force the deterministic extractor: this regression is about candidate
+    # parity and must never depend on a live provider response.
+    monkeypatch.setattr(contacts_read, "extract_contacts_read_intent_llm", lambda message: None)
     result = contacts_read.generate_contacts_read_response(
         user_id=str(USER_ID), connection_id=str(CONTACTS_CONNECTION_ID),
         message="show me mams number", conversation_id=str(CONVERSATION_ID),

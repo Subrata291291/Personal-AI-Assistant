@@ -578,7 +578,10 @@ function CalendarTimeline({
   )
   const currentMinute = Number(nowParts.hour) * 60 + Number(nowParts.minute)
   return (
-    <div className="overflow-x-auto">
+    <div
+      data-testid="calendar-timeline-scroll"
+      className="scrollbar-hidden overflow-x-auto overflow-y-hidden"
+    >
       <div
         className="grid min-w-[760px]"
         style={{ gridTemplateColumns: `4.5rem repeat(${dates.length}, minmax(0, 1fr))` }}
@@ -962,6 +965,11 @@ export default function Calendar() {
     return (eventsQuery.data?.pages || [])
       .flatMap((page) => page.events || [])
       .filter((event) => {
+        // Google can briefly return deletion tombstones from a stale list
+        // response. Never render an event that the provider marked cancelled.
+        if (typeof event.status === 'string' && event.status.toLowerCase() === 'cancelled') {
+          return false
+        }
         if (seen.has(event.id)) return false
         seen.add(event.id)
         return true
@@ -1537,7 +1545,10 @@ export default function Calendar() {
                     eventsQuery.data && !eventId && (
                     view === 'month'
                       ? (
-                        <div className="overflow-x-auto">
+                        <div
+                          data-testid="calendar-month-scroll"
+                          className="scrollbar-hidden overflow-x-auto overflow-y-hidden"
+                        >
                           <div className="min-w-[700px]">
                             <div className={isDark
                               ? `grid grid-cols-7 border-l border-t ${calendarGrid}`
@@ -1685,9 +1696,9 @@ export default function Calendar() {
                       role="dialog"
                       aria-modal="true"
                       aria-labelledby="calendar-event-title"
-                      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 sm:items-center"
+                      className="scrollbar-hidden fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 sm:items-center"
                     >
-                      <article className={`max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-x-hidden overflow-y-auto overscroll-contain rounded-2xl border p-6 ${servicePanel}`}>
+                      <article className={`scrollbar-hidden max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-x-hidden overflow-y-auto overscroll-contain rounded-2xl border p-6 ${servicePanel}`}>
                         <div className="flex items-start justify-between gap-4">
                           <h3 id="calendar-event-title" className="text-xl font-semibold">
                             {eventQuery.data?.summary?.trim() || 'Event details'}

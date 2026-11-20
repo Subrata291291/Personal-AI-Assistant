@@ -546,6 +546,30 @@ describe('Connected Apps', () => {
     )).toBeInTheDocument()
   })
 
+  it('omits the connected-account line from the Gmail card but keeps permissions and account management', async () => {
+    api.get.mockResolvedValue(connectedResponse([googleConnection]))
+    renderConnectors()
+
+    const gmailHeading = await screen.findByRole('heading', { name: 'Gmail' })
+    const gmailCard = gmailHeading.closest('article')
+    expect(gmailCard).toBeTruthy()
+    expect(await within(gmailCard).findByText('Connected · Enabled'))
+      .toBeInTheDocument()
+    expect(within(gmailCard).queryByText(/Connected account:/i))
+      .not.toBeInTheDocument()
+    expect(within(gmailCard).queryByText('person@example.com'))
+      .not.toBeInTheDocument()
+
+    // Permission and capability information must stay on the card.
+    expect(within(gmailCard).getByText('Read permission: Granted'))
+      .toBeInTheDocument()
+    expect(within(gmailCard).getByText('Email search: Available'))
+      .toBeInTheDocument()
+
+    // Account data remains available in the account-management section.
+    expect(screen.getByText('person@example.com')).toBeInTheDocument()
+  })
+
   it('does not offer write consent when the backend cannot verify permission status', async () => {
     api.get.mockResolvedValue(connectedResponse([{
       ...googleConnection,
@@ -655,7 +679,9 @@ describe('Connected Apps', () => {
         '/api/v1/oauth/connections/connection-1',
       )
     })
-    await screen.findByText('Google account disconnected successfully.')
+    const notice = await screen.findByText('Google account disconnected successfully.')
+    expect(notice.closest('[role="status"]').className).toContain('bg-emerald-50')
+    expect(notice.closest('[role="status"]').className).toContain('text-emerald-700')
     expect(await screen.findByRole('button', { name: 'Connect Gmail' }))
       .toBeInTheDocument()
     expect(screen.queryByRole('button', {

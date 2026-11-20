@@ -34,7 +34,7 @@ function ApiCheck() {
       <p className="mt-4">{result}</p>
 
       {data !== null && (
-        <pre className="mt-5 overflow-auto rounded-xl bg-[#171a27] p-5 text-sm">
+        <pre className="scrollbar-hidden mt-5 overflow-auto rounded-xl bg-[#171a27] p-5 text-sm">
           {JSON.stringify(data, null, 2)}
         </pre>
       )}

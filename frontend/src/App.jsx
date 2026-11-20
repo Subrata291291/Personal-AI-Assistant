@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import {
   BrowserRouter,
   Navigate,
@@ -5,8 +6,12 @@ import {
   Route,
   Routes,
 } from 'react-router-dom'
-import { QueryClientProvider } from '@tanstack/react-query'
+import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client'
 import { queryClient } from './lib/queryClient'
+import {
+  createPersistenceOptions,
+  pruneForeignQueries,
+} from './lib/queryPersistence'
 import Assistant from './pages/Assistant'
 import Dashboard from './pages/Dashboard'
 import DashboardLayout from './components/layout/DashboardLayout'
@@ -59,8 +64,23 @@ function PublicRoute({ children }) {
 }
 
 function App() {
+  const { user } = useAuth()
+  const userId = user?.id ?? null
+  const persistOptions = useMemo(
+    () => createPersistenceOptions(userId),
+    [userId],
+  )
+
   return (
-    <QueryClientProvider client={queryClient}>
+    <PersistQueryClientProvider
+      key={userId || 'anonymous'}
+      client={queryClient}
+      persistOptions={persistOptions}
+      onSuccess={() => pruneForeignQueries(queryClient, userId)}
+      onError={() => {
+        console.warn('Unable to restore the persistent query cache.')
+      }}
+    >
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
@@ -108,7 +128,7 @@ function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </BrowserRouter>
-    </QueryClientProvider>
+    </PersistQueryClientProvider>
   )
 }
 

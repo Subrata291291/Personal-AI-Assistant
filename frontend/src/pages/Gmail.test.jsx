@@ -1196,7 +1196,8 @@ describe('Gmail archive flow', () => {
     renderGmail()
 
     expect(await screen.findByText('Quarterly update')).toBeInTheDocument()
-    expect(screen.getByText('Connected: user@example.com')).toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: 'Google account' }))
+      .toHaveValue('connection-1')
 
     disconnected = true
     fireEvent.click(screen.getByRole('button', { name: '↻ Refresh' }))
@@ -1204,8 +1205,11 @@ describe('Gmail archive flow', () => {
     expect(await screen.findByText('Gmail is disconnected'))
       .toBeInTheDocument()
     expect(screen.queryByText('Quarterly update')).not.toBeInTheDocument()
-    expect(screen.queryByText('Connected: user@example.com'))
-      .not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByRole('combobox', { name: 'Google account' }))
+        .toHaveValue('')
+    })
+    expect(screen.queryByText('Connected account')).not.toBeInTheDocument()
   })
 
   it('resolves to the disconnected state for a fresh user', async () => {
@@ -1247,10 +1251,51 @@ describe('Gmail archive flow', () => {
     }
     renderGmail()
 
-    expect(await screen.findByText('Connected · Disabled'))
-      .toBeInTheDocument()
-    expect(await screen.findByText('Connected: user@example.com'))
-      .toBeInTheDocument()
+    expect(screen.queryByText('Connected · Disabled')).not.toBeInTheDocument()
+    expect(await screen.findByRole('combobox', { name: 'Google account' }))
+      .toHaveValue('connection-1')
+    expect(screen.queryByText(/^Connected:/)).not.toBeInTheDocument()
     expect(gmailService.getMessages).not.toHaveBeenCalled()
+  })
+})
+
+describe('Gmail page chrome', () => {
+  beforeEach(() => {
+    gmailUser.current = { id: 'user-1', user_metadata: {} }
+    sessionStorage.clear()
+    api.get.mockResolvedValue({
+      connections: [{
+        id: 'connection-1',
+        provider: 'google',
+        status: 'connected',
+        email: 'user@example.com',
+        capabilities: { gmail: true },
+      }],
+    })
+    gmailService.getMessages.mockResolvedValue({
+      messages: [],
+      next_page_token: null,
+    })
+  })
+
+  it('renders the official multicolour Gmail logo instead of a generic envelope', async () => {
+    renderGmail()
+
+    expect(await screen.findByRole('img', { name: 'Gmail logo' }))
+      .toHaveAttribute('src', '/icons/google/gmail.svg')
+    expect(screen.queryByText('✉')).not.toBeInTheDocument()
+  })
+
+  it('keeps account selection and Compose without the connection status badge', async () => {
+    renderGmail()
+
+    expect(await screen.findByRole('combobox', { name: 'Google account' }))
+      .toHaveValue('connection-1')
+    expect(screen.getByRole('button', { name: /compose/i })).toBeInTheDocument()
+    expect(screen.queryByText('Connected · Enabled')).not.toBeInTheDocument()
+    expect(screen.queryByText('Connected · Disabled')).not.toBeInTheDocument()
+    expect(screen.queryByText('Connected Google account')).not.toBeInTheDocument()
+    expect(screen.queryByText('Connected account')).not.toBeInTheDocument()
+    expect(screen.queryByText(/^Connected:/)).not.toBeInTheDocument()
   })
 })

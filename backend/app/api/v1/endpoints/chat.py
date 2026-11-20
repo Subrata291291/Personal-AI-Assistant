@@ -136,9 +136,10 @@ def _stream_http_exception(exc: Exception) -> HTTPException:
             detail=str(exc),
         )
     if isinstance(exc, ValueError):
+        # ValueError text can carry provider/tool payloads; never expose it.
         return HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
+            detail="The request contains an invalid value. Please check your input and try again.",
         )
     if isinstance(exc, LLMFallbackError):
         return HTTPException(
@@ -170,10 +171,13 @@ def _stream_error_message(exc: Exception) -> str:
             ChatRequestInProgressError,
             ChatRequestUncertainError,
             ChatRequestFailedError,
-            ValueError,
         ),
     ):
+        # Conflict messages carry user-facing idempotency/retry guidance.
         return str(exc)
+    if isinstance(exc, ValueError):
+        # ValueError text can carry provider/tool payloads; never echo it.
+        return "The request contains an invalid value. Please check your input and try again."
     if isinstance(exc, LLMFallbackError):
         return (
             "The AI service could not complete your request. "
@@ -369,7 +373,7 @@ def chat_stream(
         assistant_msg = response.get("assistant_message") or {}
         user_msg = response.get("user_message") or {}
         conversation = response.get("conversation_id")
-        return {
+        payload = {
             "type": "done",
             "message_id": assistant_msg.get("id"),
             "user_message_id": user_msg.get("id"),
@@ -378,6 +382,13 @@ def chat_stream(
             "provider": response.get("provider"),
             "model": response.get("model"),
         }
+        # Surface explicit completeness state to the streaming client so it
+        # cannot present a bounded/partial answer as complete.
+        assistant_metadata = assistant_msg.get("metadata") or {}
+        completion = assistant_metadata.get("response_completion")
+        if isinstance(completion, dict):
+            payload["completion"] = completion
+        return payload
 
     events = None
     try:

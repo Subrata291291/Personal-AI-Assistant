@@ -140,6 +140,7 @@ def _mock_calendar_service(monkeypatch, *, events=None, event=None, validate_err
         "remove the event I just created",
         "delete Gym time from google calendar",
         "delete Gym time 8am to 9am",
+        "Remove the last event we created",
     ),
 )
 def test_contextual_delete_phrases_resolve_trusted_event_id(monkeypatch, message):

@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react'
 import { MemoryRouter, Outlet, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -375,7 +376,8 @@ describe('Assistant true streaming', () => {
     expect(indicator).toBeInTheDocument()
     expect(indicator.querySelectorAll('.assistant-typing-dot'))
       .toHaveLength(3)
-    expect(screen.getByText('Preparing your response...')).toBeInTheDocument()
+    expect(within(indicator).getByText('Preparing your response...'))
+      .toBeInTheDocument()
     expect(screen.queryByText('AI is thinking...')).not.toBeInTheDocument()
 
     // Release the first token; the indicator must yield to real text.
@@ -386,7 +388,8 @@ describe('Assistant true streaming', () => {
     expect(await screen.findByText('First')).toBeInTheDocument()
     expect(screen.queryByTestId('assistant-typing-indicator'))
       .not.toBeInTheDocument()
-    expect(screen.getByText('Preparing your response...')).toBeInTheDocument()
+    expect(screen.queryByText('Preparing your response...'))
+      .not.toBeInTheDocument()
 
     await act(async () => {
       completionGate.resolve()
@@ -401,6 +404,150 @@ describe('Assistant true streaming', () => {
       expect(screen.queryByTestId('assistant-typing-indicator'))
         .not.toBeInTheDocument()
     })
+  })
+
+  it('shows the active tool status beside the typing indicator until the first token', async () => {
+    const firstTokenGate = deferred()
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'status', message: 'Searching Gmail...' })
+        await firstTokenGate.promise
+        onEvent({ type: 'token', content: 'Found it' })
+        onEvent({
+          type: 'done',
+          conversation_id: 'conversation-a',
+          message_id: 'server-assistant',
+          user_message_id: 'server-user',
+        })
+      }
+    )
+
+    renderAssistant()
+    await screen.findByText('conversation-a-private-message')
+    await submitMessage('Check my last mail')
+
+    const indicator = await screen.findByTestId('assistant-typing-indicator')
+    expect(within(indicator).getByText('Searching Gmail...'))
+      .toBeInTheDocument()
+    expect(indicator.querySelectorAll('.assistant-typing-dot'))
+      .toHaveLength(3)
+
+    await act(async () => {
+      firstTokenGate.resolve()
+    })
+
+    expect(await screen.findByText('Found it')).toBeInTheDocument()
+    expect(screen.queryByTestId('assistant-typing-indicator'))
+      .not.toBeInTheDocument()
+  })
+
+  it('removes the empty assistant bubble when stopped before the first token', async () => {
+    conversationMocks.streamChatMessage.mockImplementation(
+      (convId, content, key, connId, tz, onEvent, signal) => {
+        onEvent({ type: 'status', message: 'Checking Google Calendar...' })
+        return new Promise((resolve, reject) => {
+          signal.addEventListener('abort', () => {
+            const error = new Error('aborted')
+            error.name = 'AbortError'
+            reject(error)
+          })
+        })
+      }
+    )
+
+    renderAssistant()
+    await screen.findByText('conversation-a-private-message')
+    await submitMessage('Check my calendar')
+
+    const indicator = await screen.findByTestId('assistant-typing-indicator')
+    expect(within(indicator).getByText('Checking Google Calendar...'))
+      .toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop generating' }))
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('assistant-typing-indicator'))
+        .not.toBeInTheDocument()
+    })
+    expect(screen.getByText('Response stopped before it started.'))
+      .toBeInTheDocument()
+    expect(screen.getByText('Check my calendar')).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('Message your personal AI...'))
+      .toBeEnabled()
+  })
+
+  it('keeps the conversation scrollport and composer in the viewport', async () => {
+    renderAssistant()
+    await screen.findByText('conversation-a-private-message')
+
+    const messages = screen.getByText('conversation-a-private-message')
+      .closest('.overflow-y-auto')
+    expect(messages).toHaveClass('overflow-y-auto')
+    expect(messages).toHaveClass('overscroll-contain')
+    expect(messages).toHaveClass('flex-1')
+    expect(messages).toHaveClass('assistant-scrollport')
+    expect(messages.className).not.toContain('overflow-hidden')
+    expect(messages.closest('section')).toHaveClass('min-h-[520px]')
+    const shell = messages.closest('section').parentElement
+    expect(shell).toHaveClass('max-w-5xl')
+    expect(shell.className).toContain('min-h-[calc(100dvh-150px)]')
+    expect(shell).not.toHaveClass('h-[calc(100dvh-150px)]')
+
+    const composer = screen.getByPlaceholderText('Message your personal AI...')
+      .closest('form').parentElement
+    expect(composer.className).not.toContain('fixed')
+    expect(composer.className).not.toContain('absolute')
+    expect(screen.getByRole('button', { name: 'Send message' }))
+      .toBeInTheDocument()
+  })
+
+  it('hides the native scrollbar without disabling the conversation scrollport', async () => {
+    renderAssistant()
+    await screen.findByText('conversation-a-private-message')
+
+    const messages = screen.getByText('conversation-a-private-message')
+      .closest('.assistant-scrollport')
+    expect(messages).toHaveClass('overflow-y-auto', 'overscroll-contain')
+    expect(messages.className).not.toContain('overflow-hidden')
+
+    // The scroll handler remains wired for wheel, touch and keyboard scrolling.
+    expect(() => fireEvent.scroll(messages)).not.toThrow()
+    expect(messages).toHaveClass('overflow-y-auto')
+  })
+
+  it('auto-scrolls streamed content into view', async () => {
+    const requestAnimationFrame = vi.spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((callback) => {
+        callback(0)
+        return 1
+      })
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'token', content: 'Streamed answer' })
+        onEvent({
+          type: 'done',
+          conversation_id: 'conversation-a',
+          message_id: 'streamed-assistant',
+          user_message_id: 'streamed-user',
+          provider: 'test-provider',
+          model: 'test-model',
+        })
+      },
+    )
+
+    try {
+      renderAssistant()
+      await screen.findByText('conversation-a-private-message')
+      await submitMessage('Summarize my important emails.')
+
+      await waitFor(() => {
+        expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledWith({
+          behavior: 'smooth',
+          block: 'end',
+        })
+      })
+    } finally {
+      requestAnimationFrame.mockRestore()
+    }
   })
 
   it('appends chunks to one assistant message without duplicates', async () => {
@@ -477,6 +624,39 @@ describe('Assistant true streaming', () => {
     await act(async () => {
       release.resolve()
     })
+  })
+
+  it('replaces streamed unsupported content with the verified final answer', async () => {
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'token', content: 'You have a 3pm meeting.' })
+        onEvent({
+          type: 'replace',
+          content: "I can't verify personal Calendar events in a general response.",
+        })
+        onEvent({
+          type: 'done',
+          conversation_id: 'conversation-a',
+          message_id: 'server-assistant',
+          user_message_id: 'server-user',
+          provider: 'test-provider',
+          model: 'test-model',
+        })
+      }
+    )
+
+    renderAssistant()
+    await screen.findByText('conversation-a-private-message')
+    await submitMessage('Plan my day')
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          "I can't verify personal Calendar events in a general response.",
+        ),
+      ).toBeInTheDocument()
+    })
+    expect(screen.queryByText('You have a 3pm meeting.')).not.toBeInTheDocument()
   })
 
   it('stops the generating indicator on completion', async () => {
@@ -845,7 +1025,7 @@ describe('Assistant retry idempotency', () => {
     ).toHaveValue('')
   })
 
-  it('keeps the key after a stopped stream and reuses it on resubmission', async () => {
+  it('keeps the key after a stopped stream but does not duplicate messages on resubmission', async () => {
     conversationMocks.streamChatMessage
       .mockImplementationOnce(
         (convId, content, key, connId, tz, onEvent, signal) => {
@@ -859,10 +1039,39 @@ describe('Assistant retry idempotency', () => {
           })
         },
       )
-      .mockImplementationOnce(successfulStream())
+      .mockImplementationOnce(successfulStream('Recovered answer'))
     conversationMocks.getChatRequestStatus.mockResolvedValue({
       status: 'processing',
     })
+    conversationMocks.getMessages
+      .mockResolvedValueOnce([
+        {
+          id: 'conversation-a-message',
+          conversation_id: 'conversation-a',
+          role: 'assistant',
+          content: 'conversation-a-private-message',
+        },
+      ])
+      .mockResolvedValue([
+        {
+          id: 'conversation-a-message',
+          conversation_id: 'conversation-a',
+          role: 'assistant',
+          content: 'conversation-a-private-message',
+        },
+        {
+          id: 'server-user',
+          conversation_id: 'conversation-a',
+          role: 'user',
+          content: 'Stopped message',
+        },
+        {
+          id: 'server-assistant',
+          conversation_id: 'conversation-a',
+          role: 'assistant',
+          content: 'Recovered answer',
+        },
+      ])
 
     await ready()
     await submit('Stopped message')
@@ -872,9 +1081,386 @@ describe('Assistant retry idempotency', () => {
     expect(
       await screen.findByText('Response stopped before it finished.'),
     ).toBeInTheDocument()
+    expect(
+      await screen.findByText(
+        'This response was cancelled before email summaries were generated.',
+      ),
+    ).toBeInTheDocument()
 
     await submit('Stopped message')
     await waitFor(() => expect(keys()).toHaveLength(2))
     expect(keys()[1]).toBe(keys()[0])
+
+    await waitFor(() => {
+      expect(
+        document.querySelectorAll('.assistant-markdown'),
+      ).toHaveLength(2)
+    })
+    expect(screen.getAllByText('Stopped message')).toHaveLength(1)
+  })
+})
+
+describe('Assistant long-response completion', () => {
+  beforeEach(() => {
+    authMock.user = {
+      id: 'user-a',
+      user_metadata: { timezone: 'Asia/Kolkata' },
+    }
+    vi.clearAllMocks()
+    HTMLElement.prototype.scrollIntoView = vi.fn()
+    conversationMocks.getConversations.mockResolvedValue([
+      conversation('conversation-a'),
+    ])
+    conversationMocks.createConversation.mockResolvedValue(
+      conversation('created-conversation'),
+    )
+  })
+
+  function initialMessages() {
+    return [
+      {
+        id: 'conversation-a-message',
+        conversation_id: 'conversation-a',
+        role: 'assistant',
+        content: 'conversation-a-private-message',
+      },
+    ]
+  }
+
+  function finalMessages(content, completion) {
+    return [
+      ...initialMessages(),
+      {
+        id: 'server-user',
+        conversation_id: 'conversation-a',
+        role: 'user',
+        content: 'Summarize all my emails today.',
+      },
+      {
+        id: 'server-assistant',
+        conversation_id: 'conversation-a',
+        role: 'assistant',
+        content,
+        metadata: completion ? { response_completion: completion } : {},
+      },
+    ]
+  }
+
+  function mockPersistedMessages(content, completion) {
+    conversationMocks.getMessages
+      .mockResolvedValueOnce(initialMessages())
+      .mockResolvedValue(finalMessages(content, completion))
+  }
+
+  function doneEvent(completion) {
+    return {
+      type: 'done',
+      conversation_id: 'conversation-a',
+      message_id: 'server-assistant',
+      user_message_id: 'server-user',
+      provider: 'test-provider',
+      model: 'test-model',
+      ...(completion ? { completion } : {}),
+    }
+  }
+
+  async function ready() {
+    renderAssistant()
+    await screen.findByText('conversation-a-private-message')
+  }
+
+  function submit(text = 'Summarize all my emails today.') {
+    fireEvent.change(
+      screen.getByPlaceholderText('Message your personal AI...'),
+      { target: { value: text } },
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+  }
+
+  it('shows an accurate partial notice from done.completion', async () => {
+    const completion = {
+      status: 'partial',
+      requested_item_count: 30,
+      processed_item_count: 30,
+      remaining_item_count: 5,
+      output_limited: false,
+    }
+    mockPersistedMessages('#### 1. Subject m1', completion)
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'token', content: '#### 1. Subject m1' })
+        onEvent(doneEvent(completion))
+      },
+    )
+
+    await ready()
+    await submit()
+
+    expect(
+      await screen.findByText(
+        'This response is partial. 30 of 30 requested items were processed; 5 items remain.',
+      ),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText(/may be incomplete because the AI reached its output limit/i),
+    ).not.toBeInTheDocument()
+  })
+
+  it.each([
+    [
+      {
+        status: 'failed',
+        requested_item_count: 3,
+        processed_item_count: 0,
+        failed_item_count: 3,
+      },
+      'This response could not be completed. No email details were verified.',
+    ],
+    [
+      {
+        status: 'cancelled',
+        requested_item_count: 50,
+        processed_item_count: 0,
+      },
+      'This response was cancelled before email summaries were generated.',
+    ],
+    [
+      {
+        status: 'truncated',
+        finish_reason: 'length',
+      },
+      'The AI reached its output limit. This answer contains only the verified content shown above; narrow the request for a smaller result.',
+    ],
+    [
+      {
+        status: 'unknown',
+        finish_reason: 'content_filter',
+      },
+      'This response may be incomplete; its completion status could not be verified.',
+    ],
+  ])('shows the correct notice for %j', async (completion, expectedNotice) => {
+    mockPersistedMessages('Verified content', completion)
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'token', content: 'Verified content' })
+        onEvent(doneEvent(completion))
+      },
+    )
+
+    await ready()
+    await submit()
+
+    expect(await screen.findByText(expectedNotice)).toBeInTheDocument()
+  })
+
+  it('shows both coverage and output-limit notices when a batch is capped', async () => {
+    const completion = {
+      status: 'partial',
+      requested_item_count: 50,
+      processed_item_count: 45,
+      remaining_item_count: 5,
+      output_limited: true,
+      finish_reason: 'length',
+    }
+    mockPersistedMessages('#### 1. Subject m1', completion)
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'token', content: '#### 1. Subject m1' })
+        onEvent(doneEvent(completion))
+      },
+    )
+
+    await ready()
+    await submit()
+
+    expect(
+      await screen.findByText(
+        'This response is partial. 45 of 50 requested items were processed; 5 items remain.',
+      ),
+    ).toBeInTheDocument()
+    expect(
+      await screen.findByText(
+        'The AI reached its output limit. This answer contains only the verified content shown above; narrow the request for a smaller result.',
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('does not show a false warning for a complete response', async () => {
+    const completion = {
+      status: 'complete',
+      requested_item_count: 5,
+      processed_item_count: 5,
+      remaining_item_count: 0,
+      output_limited: false,
+    }
+    mockPersistedMessages('#### 1. Subject m1', completion)
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'token', content: '#### 1. Subject m1' })
+        onEvent(doneEvent(completion))
+      },
+    )
+
+    await ready()
+    await submit()
+
+    await waitFor(() => {
+      expect(screen.getByText(/Subject m1/)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/this response is partial/i))
+      .not.toBeInTheDocument()
+    expect(screen.queryByText(/reached its output limit/i))
+      .not.toBeInTheDocument()
+    expect(screen.queryByText(/could not be completed/i))
+      .not.toBeInTheDocument()
+    expect(screen.queryByText(/was cancelled/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps batch progress visible after content starts and clears it on done', async () => {
+    const secondBatchGate = deferred()
+    const completionGate = deferred()
+    const completion = {
+      status: 'complete',
+      requested_item_count: 50,
+      processed_item_count: 50,
+      remaining_item_count: 0,
+    }
+    mockPersistedMessages('## Email Summary', completion)
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'status', message: 'Processing email batch 1 of 10...' })
+        onEvent({ type: 'token', content: '## Email Summary' })
+        onEvent({ type: 'status', message: 'Processing email batch 2 of 10...' })
+        await secondBatchGate.promise
+        onEvent({ type: 'status', message: 'Processing email batch 3 of 10...' })
+        await completionGate.promise
+        onEvent(doneEvent(completion))
+      },
+    )
+
+    await ready()
+    await submit()
+
+    expect(
+      await screen.findByText('Processing email batch 2 of 10...'),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByTestId('assistant-typing-indicator'),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText('Processing email batch 1 of 10...'),
+    ).not.toBeInTheDocument()
+
+    await act(async () => {
+      secondBatchGate.resolve()
+    })
+    expect(
+      await screen.findByText('Processing email batch 3 of 10...'),
+    ).toBeInTheDocument()
+
+    await act(async () => {
+      completionGate.resolve()
+    })
+    await waitFor(() => {
+      expect(
+        screen.queryByText('Processing email batch 3 of 10...'),
+      ).not.toBeInTheDocument()
+    })
+  })
+
+  it('keeps post-token progress visible until the next progress or done event', async () => {
+    const completionGate = deferred()
+    const completion = { status: 'complete' }
+    mockPersistedMessages('## Email Summary', completion)
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'status', message: 'Processing email batch 1 of 3...' })
+        onEvent({ type: 'token', content: '## Email Summary' })
+        onEvent({ type: 'status', message: 'Processing email batch 2 of 3...' })
+        onEvent({ type: 'token', content: '\n\n#### 1. Subject m1' })
+        await completionGate.promise
+        onEvent(doneEvent(completion))
+      },
+    )
+
+    await ready()
+    await submit()
+
+    expect(
+      await screen.findByText('Processing email batch 2 of 3...'),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText('Processing email batch 1 of 3...'),
+    ).not.toBeInTheDocument()
+
+    await act(async () => {
+      completionGate.resolve()
+    })
+    await waitFor(() => {
+      expect(
+        screen.queryByText('Processing email batch 2 of 3...'),
+      ).not.toBeInTheDocument()
+    })
+  })
+
+  it('does not render an empty assistant bubble for a done-only replay', async () => {
+    const persistedGate = deferred()
+    const completion = { status: 'complete' }
+    conversationMocks.getMessages
+      .mockResolvedValueOnce(initialMessages())
+      .mockImplementationOnce(async () => {
+        await persistedGate.promise
+        return finalMessages('Saved answer', completion)
+      })
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent(doneEvent(completion))
+      },
+    )
+
+    await ready()
+    await submit()
+
+    await waitFor(() => {
+      expect(document.querySelectorAll('.assistant-markdown')).toHaveLength(1)
+    })
+    expect(screen.queryByText('Saved answer')).not.toBeInTheDocument()
+
+    await act(async () => {
+      persistedGate.resolve()
+    })
+    expect(await screen.findByText('Saved answer')).toBeInTheDocument()
+    expect(document.querySelectorAll('.assistant-markdown')).toHaveLength(2)
+  })
+
+  it('replaces raw batch output with the final answer and keeps completion state', async () => {
+    const completion = {
+      status: 'partial',
+      requested_item_count: 30,
+      processed_item_count: 30,
+      remaining_item_count: 5,
+    }
+    mockPersistedMessages('#### 1. Subject m1', completion)
+    conversationMocks.streamChatMessage.mockImplementation(
+      async (convId, content, key, connId, tz, onEvent) => {
+        onEvent({ type: 'token', content: '{"summaries":[{"message_id":"m1"}]}' })
+        onEvent({
+          type: 'replace',
+          content: '#### 1. Subject m1',
+        })
+        onEvent(doneEvent(completion))
+      },
+    )
+
+    await ready()
+    await submit()
+
+    expect(await screen.findByText(/Subject m1/)).toBeInTheDocument()
+    expect(
+      screen.queryByText('{"summaries":[{"message_id":"m1"}]}'),
+    ).not.toBeInTheDocument()
+    expect(
+      await screen.findByText(/this response is partial/i),
+    ).toBeInTheDocument()
   })
 })

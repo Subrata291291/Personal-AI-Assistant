@@ -285,10 +285,6 @@ function Connectors() {
       (connection) =>
         connection.id === user?.user_metadata?.default_gmail_connection_id,
     ) || gmailConnections[0] || null
-  const gmailAccountLabel =
-    selectedGmailConnection?.email ||
-    selectedGmailConnection?.account_email ||
-    (gmailConnections.length > 0 ? 'Connected Google account' : 'Not connected')
   const gmailCapabilities = selectedGmailConnection?.capabilities || {}
   const gmailReadGranted =
     gmailCapabilities.gmail_read === true ||
@@ -1032,12 +1028,6 @@ function Connectors() {
                       {service.id === 'gmail'
                         && connectedGoogleConnections.length > 0 && (
                         <div className={`mt-3 grid gap-x-4 gap-y-2 text-xs sm:grid-cols-2 ${colors.muted}`}>
-                          <p>
-                            Connected account:{' '}
-                            <span className={isDark ? 'text-slate-200' : 'text-slate-700'}>
-                              {gmailAccountLabel || 'Not available'}
-                            </span>
-                          </p>
                           <p>
                             Read permission:{' '}
                             {capabilityStatus(gmailReadGranted)}

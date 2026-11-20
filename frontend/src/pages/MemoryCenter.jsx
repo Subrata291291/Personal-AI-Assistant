@@ -991,7 +991,7 @@ function MemoryCenterContent({ userId }) {
 
       {/* Create / Edit Memory Modal */}
       {showForm && (
-        <div className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-black/70 p-4">
+        <div className="scrollbar-hidden fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-black/70 p-4">
           <form
             onSubmit={handleSave}
             className={`w-full max-w-lg space-y-4 rounded-2xl border p-6 ${

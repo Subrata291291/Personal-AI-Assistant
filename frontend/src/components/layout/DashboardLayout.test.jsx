@@ -50,6 +50,7 @@ function renderLayout() {
 
 describe('Dashboard integration navigation', () => {
   beforeEach(() => {
+    localStorage.clear()
     currentUser.value = {
       id: 'user-1',
       email: 'user@example.com',
@@ -150,5 +151,79 @@ describe('Dashboard integration navigation', () => {
     })
     expect(screen.getByRole('link', { name: /Connectors/ }))
       .toHaveTextContent('1')
+  })
+
+  it('drives Tailwind dark variants from the manual theme without creating a document scroll container', () => {
+    localStorage.setItem('dashboard-theme', 'dark')
+    renderLayout()
+
+    const shell = screen.getByTestId('dashboard-shell')
+    expect(shell).toHaveClass('dark')
+    expect(shell).toHaveClass('overflow-x-clip')
+    expect(shell.className).not.toContain('overflow-x-hidden')
+    expect(shell.className).not.toContain('overflow-y-hidden')
+  })
+
+  it('uses a centered success-token pill for the Connectors counter', async () => {
+    api.get.mockImplementation(async (path) => {
+      if (path === '/api/v1/oauth/connections') {
+        return {
+          connections: [
+            { id: 'gmail', provider: 'google', status: 'connected', capabilities: { gmail: true } },
+            { id: 'calendar', provider: 'google', status: 'connected', capabilities: { calendar_events_read: true } },
+            { id: 'contacts', provider: 'google', status: 'connected', capabilities: { contacts_read: true } },
+          ],
+        }
+      }
+      return []
+    })
+
+    renderLayout()
+
+    const badge = screen.getByTestId('connectors-count')
+    await waitFor(() => expect(badge).toHaveTextContent('3'))
+    expect(badge).toHaveAttribute('aria-label', '3 connected services')
+    expect(badge).toHaveClass(
+      'inline-flex',
+      'items-center',
+      'justify-center',
+      'min-w-5',
+      'shrink-0',
+      'rounded-full',
+      'tabular-nums',
+    )
+    expect(badge.className).toContain('bg-emerald-50')
+    expect(badge.className).toContain('text-emerald-700')
+    expect(badge.className).toContain('dark:bg-emerald-500/10')
+  })
+
+  it('uses the original multicolour Calendar navigation icon', () => {
+    localStorage.setItem('dashboard-theme', 'dark')
+    renderLayout()
+
+    const calendarLink = screen.getByRole('link', { name: /Google Calendar/ })
+    const icon = calendarLink.querySelector('[data-testid="google-logo-calendar"]')
+    expect(icon).toBeInTheDocument()
+    expect(icon).toHaveAttribute('src', '/icons/google/calendar.svg')
+    expect(icon).toHaveAttribute('alt', 'Google Calendar logo')
+    expect(icon.className).not.toContain('brightness-0')
+    expect(icon.className).not.toContain('invert')
+  })
+
+  it('switches the manual dark class and persisted theme in both directions', () => {
+    localStorage.setItem('dashboard-theme', 'light')
+    renderLayout()
+
+    const shell = screen.getByTestId('dashboard-shell')
+    const toggle = screen.getByRole('button', { name: 'Toggle theme' })
+    expect(shell).not.toHaveClass('dark')
+
+    fireEvent.click(toggle)
+    expect(shell).toHaveClass('dark')
+    expect(localStorage.getItem('dashboard-theme')).toBe('dark')
+
+    fireEvent.click(toggle)
+    expect(shell).not.toHaveClass('dark')
+    expect(localStorage.getItem('dashboard-theme')).toBe('light')
   })
 })

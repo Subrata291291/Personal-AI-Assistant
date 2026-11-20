@@ -1263,13 +1263,25 @@ def _render_trusted_response(outcome: dict[str, Any]) -> str:
 
 
 def _is_valid_pending_contacts_clarification(
-    pending: Any, *, user_id: str, conversation_id: str, now: datetime
+    pending: Any,
+    *,
+    user_id: str,
+    conversation_id: str,
+    connection_id: str | None = None,
+    now: datetime,
 ) -> bool:
     if not isinstance(pending, dict):
         return False
     if pending.get("version") != 1 or pending.get("type") != "contacts_read_clarification":
         return False
     if str(pending.get("user_id")) != str(user_id) or str(pending.get("conversation_id")) != str(conversation_id):
+        return False
+    pending_connection_id = pending.get("connection_id")
+    if (
+        pending_connection_id is not None
+        and connection_id is not None
+        and str(pending_connection_id) != str(connection_id)
+    ):
         return False
     try:
         expires_at = datetime.fromisoformat(str(pending.get("expires_at")).replace("Z", "+00:00"))
@@ -1571,7 +1583,11 @@ async def _run_contacts_read(
 
     # 1) Follow-up clarification: resolve only against stored trusted candidates.
     if conversation_id and _is_valid_pending_contacts_clarification(
-        pending_clarification, user_id=user_id, conversation_id=conversation_id, now=now
+        pending_clarification,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        connection_id=connection_id,
+        now=now,
     ):
         correction = _extract_correction_followup(message, pending_clarification)
         selected = None
@@ -2087,6 +2103,7 @@ async def _run_contacts_read(
                 "created_at": now.isoformat(),
                 "user_id": str(user_id),
                 "conversation_id": str(conversation_id),
+                "connection_id": str(connection_id),
                 "expires_at": (now + timedelta(seconds=CONTACTS_CLARIFICATION_TTL_SECONDS)).isoformat(),
                 "target_query": intent.target_query,
                 "requested_attribute": intent.requested_attribute,
@@ -2107,6 +2124,7 @@ async def _run_contacts_read(
                 "created_at": base_pending.get("created_at") or now.isoformat(),
                 "user_id": str(user_id),
                 "conversation_id": str(conversation_id),
+                "connection_id": str(connection_id),
                 "expires_at": (now + timedelta(seconds=CONTACTS_CLARIFICATION_TTL_SECONDS)).isoformat(),
                 "target_query": intent.target_query,
                 "requested_attribute": intent.requested_attribute,
@@ -2116,7 +2134,13 @@ async def _run_contacts_read(
                     if isinstance(rn, str) and _RESOURCE_NAME_RE.match(rn)
                 ]),
             }
-            if not _is_valid_pending_contacts_clarification(pending, user_id=str(user_id), conversation_id=str(conversation_id), now=now):
+            if not _is_valid_pending_contacts_clarification(
+                pending,
+                user_id=str(user_id),
+                conversation_id=str(conversation_id),
+                connection_id=str(connection_id),
+                now=now,
+            ):
                 pending = None
         return intent, outcome, pending
 
@@ -2158,7 +2182,11 @@ def generate_contacts_read_response(
         # Do not drop a valid pending clarification on transient/recoverable execution errors.
         keep_pending = pending_clarification if (
             conversation_id and _is_valid_pending_contacts_clarification(
-                pending_clarification, user_id=str(user_id), conversation_id=str(conversation_id), now=now
+                pending_clarification,
+                user_id=str(user_id),
+                conversation_id=str(conversation_id),
+                connection_id=str(connection_id),
+                now=now,
             )
         ) else None
         response = "I couldn't retrieve your Google Contacts right now. Please try again."
@@ -2175,10 +2203,18 @@ def generate_contacts_read_response(
 
     if outcome.get("status") == "error":
         err = str(outcome.get("error") or "Google Contacts request failed.")
-        safe = "I couldn't retrieve your Google Contacts right now. Please try again."
         lowered = err.casefold()
+        error_category = "unavailable"
+        safe = "I couldn't retrieve your Google Contacts right now. Please try again."
         if "permission" in lowered or "scope" in lowered or "not connected" in lowered or "connected apps" in lowered:
-            safe = err
+            error_category = "permission_or_connection"
+            safe = (
+                "Google Contacts access is unavailable or lacks the required "
+                "permission. Check the connected account and try again."
+            )
+        elif "timeout" in lowered or "timed out" in lowered:
+            error_category = "timeout"
+            safe = "Google Contacts took too long to respond. Please try again."
         provenance = {
             "request_id": (_request_id() or None),
             "authenticated_user_ref": _safe_ref(str(user_id)),
@@ -2186,6 +2222,7 @@ def generate_contacts_read_response(
             "conversation_ref": _safe_ref(str(conversation_id)) if conversation_id else None,
             "api_invocation_status": "invoked" if outcome.get("data_source") == "google_people_api" else "unknown",
             "outcome_status": "error",
+            "error_category": error_category,
             "verified_source": False,
         }
         try:
