@@ -29,6 +29,7 @@ from app.api.v1.endpoints.gmail import router as gmail_router
 from app.api.v1.endpoints.calendar import router as calendar_router
 from app.api.v1.endpoints.contacts import router as contacts_router
 from app.api.v1.endpoints.drive import router as drive_router
+from app.api.v1.endpoints.drive_browser import router as drive_browser_router
 from app.api.v1.endpoints.action_approvals import (
     router as action_approvals_router,
 )
@@ -195,6 +196,12 @@ app.include_router(
     drive_router,
     prefix=f"{settings.API_V1_PREFIX}/drive",
     tags=["Google Drive"],
+)
+
+app.include_router(
+    drive_browser_router,
+    prefix=f"{settings.API_V1_PREFIX}/drive-browser",
+    tags=["Google Drive Browser"],
 )
 
 app.include_router(
